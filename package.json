@@ -1,0 +1,26 @@
+{
+  "name": "ntd---navigasi-transportasi-umum-untuk-penyandang-disabilitas",
+  "version": "1.0.0",
+  "description": "",
+  "main": "index.js",
+  "workspaces": ["backend", "frontend"],
+  "scripts": {
+    "dev": "concurrently -n api,web -c blue,green \"npm run dev -w apps/api\" \"npm run dev -w apps/web\"",
+    "build": "npm run build --workspaces --if-present"
+  },
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/pachamat06/NTD---Navigasi-Transportasi-Umum-untuk-Penyandang-Disabilitas.git"
+  },
+  "keywords": [],
+  "author": "",
+  "license": "ISC",
+  "type": "commonjs",
+  "bugs": {
+    "url": "https://github.com/pachamat06/NTD---Navigasi-Transportasi-Umum-untuk-Penyandang-Disabilitas/issues"
+  },
+  "homepage": "https://github.com/pachamat06/NTD---Navigasi-Transportasi-Umum-untuk-Penyandang-Disabilitas#readme",
+  "devDependencies": {
+    "concurrently": "^10.0.5"
+  }
+}
