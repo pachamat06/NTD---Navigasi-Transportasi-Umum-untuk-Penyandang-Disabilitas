@@ -1,26 +1,191 @@
 @import "tailwindcss";
 
+/* Token warna. Status selalu dipasangkan dengan ikon dan teks, tidak hanya warna. */
 :root {
+  --background: #f4f6f8;
+  --surface: #ffffff;
+  --surface-2: #eef2f6;
+  --foreground: #14181f;
+  --muted: #56606e;
+  --border: #cfd6df;
+  --accent: #0a58ca;
+  --accent-soft: #dbe8fb;
+  --ok: #17703c;
+  --ok-soft: #dcf2e4;
+  --warn: #9a5200;
+  --warn-soft: #fff0d6;
+  --bad: #b3261e;
+  --map-bg: #fbfcfd;
+  --hub-fill: #eef3fa;
+  color-scheme: light;
+}
+
+@media (prefers-color-scheme: dark) {
+  :root:not([data-contrast="high"]) {
+    --background: #0f1318;
+    --surface: #171c23;
+    --surface-2: #202731;
+    --foreground: #eef1f5;
+    --muted: #a5afbd;
+    --border: #343d4a;
+    --accent: #6ea8ff;
+    --accent-soft: #1e3352;
+    --ok: #6fd69a;
+    --ok-soft: #173826;
+    --warn: #ffb65c;
+    --warn-soft: #3d2a10;
+    --bad: #ff8a80;
+    --map-bg: #12171d;
+    --hub-fill: #18222f;
+    color-scheme: dark;
+  }
+}
+
+/* Mode kontras tinggi (Pengaturan Tampilan) */
+:root[data-contrast="high"] {
   --background: #ffffff;
-  --foreground: #171717;
+  --surface: #ffffff;
+  --surface-2: #ffffff;
+  --foreground: #000000;
+  --muted: #000000;
+  --border: #000000;
+  --accent: #0033aa;
+  --accent-soft: #ffe600;
+  --ok: #005a1e;
+  --ok-soft: #ffffff;
+  --warn: #7a3d00;
+  --warn-soft: #ffffff;
+  --bad: #9b0000;
+  --map-bg: #ffffff;
+  --hub-fill: #ffffff;
 }
 
 @theme inline {
   --color-background: var(--background);
   --color-foreground: var(--foreground);
-  --font-sans: var(--font-geist-sans);
-  --font-mono: var(--font-geist-mono);
-}
-
-@media (prefers-color-scheme: dark) {
-  :root {
-    --background: #0a0a0a;
-    --foreground: #ededed;
-  }
 }
 
 body {
   background: var(--background);
   color: var(--foreground);
-  font-family: Arial, Helvetica, sans-serif;
+  font-family: system-ui, -apple-system, "Segoe UI", Roboto, Arial, sans-serif;
+  line-height: 1.5;
+}
+
+:focus-visible {
+  outline: 3px solid var(--accent);
+  outline-offset: 2px;
+}
+
+@layer components {
+  .card {
+    @apply rounded-xl border border-[var(--border)] bg-[var(--surface)] p-4;
+  }
+  .card-title {
+    @apply mb-2 text-base font-bold;
+  }
+  .btn {
+    @apply inline-flex min-h-11 items-center justify-center gap-1 rounded-lg px-4 font-semibold;
+  }
+  .btn:disabled {
+    @apply cursor-not-allowed opacity-50;
+  }
+  .btn-primary {
+    @apply bg-[var(--accent)] text-white;
+  }
+  :root[data-contrast="high"] .btn-primary {
+    @apply border-2 border-black;
+  }
+  .btn-secondary {
+    @apply border-2 border-[var(--accent)] bg-[var(--surface)] text-[var(--accent)];
+  }
+  .btn-link {
+    @apply min-h-11 px-1 font-semibold text-[var(--accent)] underline-offset-2 hover:underline;
+  }
+  .icon-btn {
+    @apply grid h-11 min-w-11 place-items-center rounded-lg px-2 font-bold hover:bg-[var(--surface-2)];
+  }
+  .map-btn {
+    @apply grid h-11 w-11 place-items-center rounded-lg border border-[var(--border)] bg-[var(--surface)] text-xl font-bold shadow;
+  }
+  .badge {
+    @apply inline-flex items-center gap-1 whitespace-nowrap rounded-full px-2 py-0.5 text-xs font-bold;
+  }
+  .badge-ok {
+    @apply bg-[var(--ok-soft)] text-[var(--ok)];
+  }
+  .badge-warn {
+    @apply bg-[var(--warn-soft)] text-[var(--warn)];
+  }
+  .badge-unknown {
+    @apply bg-[var(--surface-2)] text-[var(--muted)];
+  }
+  :root[data-contrast="high"] .badge {
+    @apply border border-current;
+  }
+  .banner {
+    @apply rounded-lg p-3 text-sm;
+  }
+  .banner-info {
+    @apply bg-[var(--accent-soft)];
+  }
+  .banner-warn {
+    @apply bg-[var(--warn-soft)] text-[var(--warn)];
+  }
+  .banner-muted {
+    @apply bg-[var(--surface-2)];
+  }
+  .modal {
+    @apply m-auto w-[min(480px,calc(100%-24px))] rounded-xl border border-[var(--border)] bg-[var(--surface)] p-0 text-[var(--foreground)] shadow-2xl;
+  }
+  .modal::backdrop {
+    background: rgb(0 0 0 / 0.45);
+  }
+}
+
+/* Timeline ruas rute */
+.timeline {
+  list-style: none;
+  padding: 0;
+  margin: 0;
+}
+.timeline-item {
+  position: relative;
+  padding-left: 0;
+}
+.timeline-item .leg-body {
+  margin: 4px 0 8px 7px;
+  padding: 6px 0 10px 18px;
+  border-left: 6px solid var(--leg);
+}
+.timeline-item[data-type="TRANSFER"] .leg-body {
+  border-left: 4px dashed var(--muted);
+  margin-left: 8px;
+}
+.stop-dot {
+  display: inline-block;
+  width: 20px;
+  height: 20px;
+  border-radius: 9999px;
+  border: 4px solid var(--foreground);
+  background: var(--surface);
+}
+
+.spin {
+  animation: spin 1s linear infinite;
+}
+@keyframes spin {
+  to {
+    transform: rotate(360deg);
+  }
+}
+:root[data-motion="reduce"] *,
+:root[data-motion="reduce"] *::before {
+  animation: none !important;
+  scroll-behavior: auto !important;
+}
+@media (prefers-reduced-motion: reduce) {
+  .spin {
+    animation: none;
+  }
 }
