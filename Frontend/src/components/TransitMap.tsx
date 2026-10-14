@@ -1,8 +1,8 @@
 "use client";
 
 import { useEffect, useRef, useState } from "react";
-import { HUBS, MAP_ASSET, STATIONS, STOP_POSITIONS, legGeometry, lineById } from "@/lib/dummy-data";
-import { assess } from "@/lib/mock-planner";
+import { MAP_ASSET, STOP_POSITIONS, legGeometry } from "@/lib/map-assets";
+import { useNetwork } from "@/lib/network";
 import type { Route } from "@/lib/types";
 import { AccessBadge } from "./AccessBadge";
 
@@ -27,6 +27,7 @@ const TOUCH_PX = 22; // radius area sentuh di layar (diameter 44 px)
  * memakai indeks posisi (kode stasiun -> x, y). Peta hanya untuk memilih dan menyorot, bukan menghitung rute.
  */
 export function TransitMap({ originId, destinationId, route, onSetOrigin, onSetDestination, onShowDetail }: Props) {
+  const { stations: STATIONS, hubs: HUBS, lineById, assess } = useNetwork();
   const boxRef = useRef<HTMLDivElement>(null);
   const [size, setSize] = useState({ w: 800, h: 520 });
   const [view, setView] = useState<View>({ x: MAP_ASSET.initialView.x, y: MAP_ASSET.initialView.y, w: MAP_ASSET.initialView.width });
@@ -178,7 +179,7 @@ export function TransitMap({ originId, destinationId, route, onSetOrigin, onSetD
                 : leg.stops.map((s) => STOP_POSITIONS[s]).filter(Boolean).map((p) => [p.x, p.y] as [number, number]);
             if (pts.length < 2 || (leg.type === "TRANSFER" && leg.stops[0] === leg.stops[1])) return null;
             const d = pts.map((p) => p.join(",")).join(" ");
-            const color = leg.type === "RIDE" ? lineById(leg.lineId!)!.color : "#111111";
+            const color = leg.type === "RIDE" ? (lineById(leg.lineId!)?.color ?? "#555555") : "#111111";
             return (
               <g key={i}>
                 <polyline points={d} fill="none" stroke="#ffffff" strokeWidth={px(leg.type === "RIDE" ? 16 : 10)} strokeLinecap="round" strokeLinejoin="round" />
@@ -198,7 +199,8 @@ export function TransitMap({ originId, destinationId, route, onSetOrigin, onSetD
           {/* Area hub MVP */}
           {!route &&
             HUBS.map((hub) => {
-              const pts = hub.memberIds.map((id) => STOP_POSITIONS[id]);
+              const pts = hub.memberIds.map((id) => STOP_POSITIONS[id]).filter(Boolean);
+              if (!pts.length) return null;
               const xs = pts.map((p) => p.x);
               const ys = pts.map((p) => p.y);
               return (
@@ -288,7 +290,7 @@ export function TransitMap({ originId, destinationId, route, onSetOrigin, onSetD
               <div>
                 <p className="text-lg font-bold">{popupStation.name}</p>
                 <p className="text-sm text-[var(--muted)]">
-                  {popupStation.lineIds.map((l) => lineById(l)!.name).join(" · ")} · {popupStation.codes.join("/")}
+                  {popupStation.lineIds.map((l) => lineById(l)?.name ?? l).join(" · ")} · {popupStation.codes.join("/")}
                 </p>
               </div>
               <button className="icon-btn" aria-label="Tutup" onClick={() => setPopup(null)} autoFocus>

@@ -1,11 +1,11 @@
 "use client";
 
 import { useEffect, useRef, useState } from "react";
-import { stationById } from "@/lib/dummy-data";
-import { planJourney } from "@/lib/mock-planner";
-import type { Alternative, JourneyPlan } from "@/lib/types";
+import { fetchNotices, planJourney } from "@/lib/api";
+import { useNetwork } from "@/lib/network";
+import type { Alternative, JourneyPlan, Notice } from "@/lib/types";
 import { AboutDialog, SettingsDialog, StationDetail, type DisplaySettings } from "./Dialogs";
-import { ResultPanel } from "./ResultPanel";
+import { NoticeBanner, ResultPanel } from "./ResultPanel";
 import { StationCombobox } from "./StationCombobox";
 import { TransitMap } from "./TransitMap";
 
@@ -15,20 +15,32 @@ type Phase =
   | { kind: "result"; plan: JourneyPlan }
   | { kind: "error"; code: string; message: string };
 
+const ERROR_TITLE: Record<string, string> = {
+  NOT_FOUND: "Rute tidak ditemukan",
+  INVALID: "Input tidak valid",
+  API_DOWN: "Data belum bisa dimuat",
+  NETWORK: "Server tidak dapat dihubungi",
+  RATE_LIMITED: "Terlalu banyak permintaan",
+};
+const RETRYABLE = ["API_DOWN", "NETWORK", "RATE_LIMITED", "INTERNAL"];
+
 const STEPS = ["Mencari rute", "Memeriksa fasilitas stasiun", "Mencari alternatif transfer", "Menyusun ringkasan"];
 const SETTINGS_KEY = "ntd-display";
-const DEFAULT_SETTINGS: DisplaySettings = { textSize: 0, highContrast: false, reduceMotion: false, demoMode: "normal" };
+const DEFAULT_SETTINGS: DisplaySettings = { textSize: 0, highContrast: false, reduceMotion: false };
 
 function loadSettings(): DisplaySettings {
   try {
     const raw = window.localStorage.getItem(SETTINGS_KEY);
-    return raw ? { ...DEFAULT_SETTINGS, ...JSON.parse(raw), demoMode: "normal" } : DEFAULT_SETTINGS;
+    return raw ? { ...DEFAULT_SETTINGS, ...JSON.parse(raw) } : DEFAULT_SETTINGS;
   } catch {
     return DEFAULT_SETTINGS;
   }
 }
 
 export function Planner() {
+  const { stationById, lineById, hubById, meta } = useNetwork();
+  const noticeTarget = (n: Notice) =>
+    n.scope === "station" ? stationById(n.targetId ?? "")?.name : n.scope === "line" ? lineById(n.targetId ?? "")?.name : n.scope === "hub" ? `Hub ${hubById(n.targetId ?? "")?.name ?? n.targetId}` : undefined;
   const [origin, setOrigin] = useState<string | null>(null);
   const [destination, setDestination] = useState<string | null>(null);
   const [phase, setPhase] = useState<Phase>({ kind: "idle" });
@@ -36,6 +48,7 @@ export function Planner() {
   const [aboutOpen, setAboutOpen] = useState(false);
   const [settingsOpen, setSettingsOpen] = useState(false);
   const [settings, setSettings] = useState<DisplaySettings>(DEFAULT_SETTINGS);
+  const [notices, setNotices] = useState<Notice[]>([]);
   const runId = useRef(0);
   const mapRef = useRef<HTMLDivElement>(null);
   const resultRef = useRef<HTMLDivElement>(null);
@@ -44,6 +57,16 @@ export function Planner() {
     const saved = loadSettings();
     if (saved !== DEFAULT_SETTINGS) queueMicrotask(() => setSettings(saved));
   }, []);
+
+  // Pengumuman aktif dari tim NTD, dimuat ulang setiap kembali ke layar awal agar perubahan dari admin cepat terlihat.
+  useEffect(() => {
+    if (phase.kind !== "idle") return;
+    let alive = true;
+    fetchNotices().then((r) => alive && r.status === "ok" && setNotices(r.data));
+    return () => {
+      alive = false;
+    };
+  }, [phase.kind]);
 
   useEffect(() => {
     const html = document.documentElement;
@@ -64,12 +87,17 @@ export function Planner() {
   async function search(avoid: string[] = []) {
     if (!origin || !destination) return;
     const id = ++runId.current;
-    for (let step = 0; step < STEPS.length; step++) {
+    // Permintaan ke Backend berjalan sejak awal; langkah di layar hanya penanda kemajuan.
+    const request = planJourney(origin, destination, { avoid });
+    let done = false;
+    request.finally(() => (done = true));
+    for (let step = 0; step < STEPS.length - 1 && !done; step++) {
       setPhase({ kind: "loading", step });
-      await wait(450);
+      await wait(300);
       if (runId.current !== id) return;
     }
-    const res = await planJourney(origin, destination, { avoid, demoMode: settings.demoMode });
+    setPhase({ kind: "loading", step: STEPS.length - 1 });
+    const res = await request;
     if (runId.current !== id) return;
     setPhase(res.status === "ok" ? { kind: "result", plan: res.data } : { kind: "error", code: res.code, message: res.message });
     requestAnimationFrame(() => resultRef.current?.focus());
@@ -165,6 +193,16 @@ export function Planner() {
         </div>
 
           <div id="hasil" ref={resultRef} tabIndex={-1} aria-live="polite" className="outline-none md:col-start-1 md:row-start-2">
+            {phase.kind === "idle" && notices.length > 0 && (
+              <section aria-label="Pengumuman" className="mb-3 flex flex-col gap-2">
+                {[...notices]
+                  .sort((a, b) => (a.scope === "global" ? 0 : 1) - (b.scope === "global" ? 0 : 1))
+                  .map((n) => (
+                    <NoticeBanner key={n.id} notice={n} target={noticeTarget(n)} />
+                  ))}
+              </section>
+            )}
+
             {phase.kind === "idle" && (
               <p className="banner banner-muted">
                 <span aria-hidden>ⓘ</span> Cakupan saat ini: hub Sudirman–Dukuh Atas–BNI City. Data fasilitas bersifat statis, bukan kondisi
@@ -197,12 +235,12 @@ export function Planner() {
             {phase.kind === "error" && (
               <section className="card border-l-4 border-l-[var(--bad)]" role="alert">
                 <h2 className="text-lg font-bold">
-                  <span aria-hidden>✖</span> {phase.code === "NOT_FOUND" ? "Rute tidak ditemukan" : phase.code === "API_DOWN" ? "Data belum bisa dimuat" : "Input tidak valid"}
+                  <span aria-hidden>✖</span> {ERROR_TITLE[phase.code] ?? "Terjadi kesalahan"}
                 </h2>
                 <p className="mt-1">{phase.message}</p>
                 {phase.code === "NOT_FOUND" && <p className="mt-1 text-sm text-[var(--muted)]">NTD baru mencakup hub Dukuh Atas. Coba stasiun lain di hub yang sama.</p>}
                 <div className="mt-3 flex gap-2">
-                  {phase.code === "API_DOWN" && (
+                  {RETRYABLE.includes(phase.code) && (
                     <button className="btn btn-primary" onClick={() => search()}>
                       Coba lagi
                     </button>
@@ -226,12 +264,39 @@ export function Planner() {
       </main>
 
       <footer className="border-t border-[var(--border)] px-4 py-3 text-center text-xs text-[var(--muted)]">
-        ⚠ Data fasilitas bersifat statis, bukan kondisi real-time · Data © Commute Data API (ODbL-1.0)
+        ⚠ Data fasilitas bersifat statis, bukan kondisi real-time · {meta?.attribution ?? "Data © Commute Data API (ODbL-1.0)"}
       </footer>
 
       <StationDetail stationId={detailId} onClose={() => setDetailId(null)} onSetOrigin={chooseOrigin} onSetDestination={chooseDestination} />
       <AboutDialog open={aboutOpen} onClose={() => setAboutOpen(false)} />
       <SettingsDialog open={settingsOpen} onClose={() => setSettingsOpen(false)} value={settings} onChange={setSettings} />
     </div>
+  );
+}
+
+/** Tampilan sementara saat data jaringan dari Backend sedang dimuat atau gagal dimuat. */
+export function NetworkStatus({ error, retry }: { error?: string; retry: () => void }) {
+  return (
+    <main className="grid min-h-full place-items-center p-4">
+      <section className="card w-full max-w-md text-center" role={error ? "alert" : "status"} aria-live="polite">
+        <p className="mb-2 text-xl font-extrabold">NTD</p>
+        {error ? (
+          <>
+            <p className="font-semibold">Data stasiun belum bisa dimuat.</p>
+            <p className="mt-1 text-sm text-[var(--muted)]">{error}</p>
+            <button className="btn btn-primary mt-3" onClick={retry}>
+              Coba lagi
+            </button>
+          </>
+        ) : (
+          <p>
+            <span aria-hidden className="spin inline-block">
+              ◌
+            </span>{" "}
+            Memuat data stasiun…
+          </p>
+        )}
+      </section>
+    </main>
   );
 }

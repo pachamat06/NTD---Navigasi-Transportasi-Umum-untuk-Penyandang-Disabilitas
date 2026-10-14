@@ -1,8 +1,7 @@
 "use client";
 
 import { useId, useState } from "react";
-import { lineById, stationById } from "@/lib/dummy-data";
-import { searchStations } from "@/lib/mock-planner";
+import { useNetwork } from "@/lib/network";
 
 /** Form Pencarian Stasiun (UC-02): combobox dengan autocomplete, bisa dipakai penuh dengan papan ketik. */
 export function StationCombobox({
@@ -17,6 +16,7 @@ export function StationCombobox({
   onChange: (id: string | null) => void;
 }) {
   const id = useId();
+  const { lineById, stationById, searchStations } = useNetwork();
   const selectedName = value ? stationById(value)?.name ?? "" : "";
   const [draft, setDraft] = useState<string | null>(null);
   const [open, setOpen] = useState(false);
@@ -103,7 +103,7 @@ export function StationCombobox({
             <li className="px-3 py-3 text-sm text-[var(--muted)]">Stasiun tidak ditemukan dalam cakupan NTD saat ini.</li>
           )}
           {results.map((s, i) => {
-            const line = lineById(s.lineIds[0])!;
+            const line = lineById(s.lineIds[0]);
             return (
               <li
                 key={s.id}
@@ -117,11 +117,12 @@ export function StationCombobox({
                 }}
                 onMouseEnter={() => setActive(i)}
               >
-                <span aria-hidden className="h-3 w-3 shrink-0 rounded-full" style={{ background: line.color }} />
+                <span aria-hidden className="h-3 w-3 shrink-0 rounded-full" style={{ background: line?.color ?? "var(--muted)" }} />
                 <span>
                   <span className="block font-medium">{s.name}</span>
                   <span className="block text-sm text-[var(--muted)]">
-                    {line.operator} · {line.name}
+                    {s.operator}
+                    {line && ` · ${line.name}`}
                   </span>
                 </span>
               </li>

@@ -1,5 +1,5 @@
-import { Planner } from "@/components/Planner";
+import { App } from "@/components/App";
 
 export default function Home() {
-  return <Planner />;
+  return <App />;
 }

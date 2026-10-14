@@ -1,8 +1,8 @@
 "use client";
 
-import { STOP_POSITIONS, hubById, lineById, stationById } from "@/lib/dummy-data";
-import { AMENITY_LABEL } from "@/lib/mock-planner";
-import type { Alternative, AmenityType, JourneyPlan } from "@/lib/types";
+import { STOP_POSITIONS } from "@/lib/map-assets";
+import { AMENITY_LABEL, useNetwork } from "@/lib/network";
+import type { Alternative, AmenityType, JourneyPlan, Notice } from "@/lib/types";
 import { AccessBadge } from "./AccessBadge";
 
 const km = (m: number) => `${(m / 1000).toLocaleString("id-ID", { maximumFractionDigits: 1 })} km`;
@@ -20,9 +20,12 @@ export function ResultPanel({
   onUseAlternative: (alt: Alternative) => void;
   onShowMap: () => void;
 }) {
+  const { stationById, lineById } = useNetwork();
   const { route } = plan;
-  const assessmentOf = (id: string) => plan.assessments.find((a) => a.stationId === id)!;
-  const name = (id: string) => stationById(id)!.name;
+  const assessmentOf = (id: string) => plan.assessments.find((a) => a.stationId === id) ?? { stationId: id, score: 0, adequate: false, dataAvailable: false };
+  const name = (id: string) => stationById(id)?.name ?? id;
+  // Backend juga menyalin pengumuman ke `warnings` (untuk klien lama); di sini cukup tampil sebagai pengumuman.
+  const noticeTexts = new Set((plan.notices ?? []).map((n) => `${n.title}${/[.!?:]$/.test(n.title) ? "" : ":"} ${n.message}`));
 
   return (
     <div className="flex flex-col gap-4">
@@ -52,7 +55,18 @@ export function ResultPanel({
         <p className="leading-relaxed">{plan.notification.text}</p>
       </section>
 
-      {plan.warnings.map((w) => (
+      {plan.notices && plan.notices.length > 0 && (
+        <section aria-labelledby="pengumuman" className="flex flex-col gap-2">
+          <h3 id="pengumuman" className="sr-only">
+            Pengumuman
+          </h3>
+          {plan.notices.map((n) => (
+            <NoticeBanner key={n.id} notice={n} />
+          ))}
+        </section>
+      )}
+
+      {plan.warnings.filter((w) => !noticeTexts.has(w)).map((w) => (
         <p key={w} className="banner banner-warn">
           <span aria-hidden>⚠</span> {w}
         </p>
@@ -87,7 +101,7 @@ export function ResultPanel({
                   {leg.type === "RIDE" ? (
                     <>
                       <p className="font-semibold">
-                        {modeIcon(line!.mode)} {line!.operator} · {line!.name}
+                        {modeIcon(line?.mode ?? "RAIL")} {line ? `${line.operator} · ${line.name}` : leg.lineId}
                       </p>
                       <p className="text-sm text-[var(--muted)]">
                         {leg.stops.length - 1} pemberhentian · {km(leg.distanceM)} · {leg.minutes === null ? "waktu tidak tersedia" : `${leg.minutes} mnt`} · {rupiah(leg.fare)}
@@ -137,7 +151,7 @@ export function ResultPanel({
         <p>
           <span aria-hidden>⚠</span> {plan.disclaimer}
         </p>
-        <p className="mt-1">Data © Commute Data API, Shiori Labs (ODbL-1.0).</p>
+        <p className="mt-1">{plan.attribution ?? "Data © Commute Data API, Shiori Labs (ODbL-1.0)."}</p>
       </footer>
     </div>
   );
@@ -155,30 +169,39 @@ function Stat({ icon, label, value }: { icon: string; label: string; value: stri
 }
 
 function StopRow({ id, label, a, onShowDetail }: { id: string; label?: string; a: JourneyPlan["assessments"][number]; onShowDetail: (id: string) => void }) {
+  const stationName = useNetwork().stationById(id)?.name ?? id;
+  // Catatan dari tim NTD, mis. lift sedang tidak berfungsi.
+  const notes = a.dataAvailable ? (a.notes ?? []) : [];
   return (
     <div className="flex flex-wrap items-center gap-x-2 gap-y-1">
       <span className="stop-dot" aria-hidden />
-      <button className="btn-link text-left font-bold" onClick={() => onShowDetail(id)} aria-label={`${stationById(id)!.name}, lihat fasilitas`}>
-        {stationById(id)!.name}
+      <button className="btn-link text-left font-bold" onClick={() => onShowDetail(id)} aria-label={`${stationName}, lihat fasilitas`}>
+        {stationName}
       </button>
       {label && <span className="text-xs uppercase tracking-wide text-[var(--muted)]">{label}</span>}
       <AccessBadge a={a} />
+      {notes.map((n) => (
+        <p key={n} className="w-full text-sm text-[var(--warn)]">
+          <span aria-hidden>ⓘ</span> {n}
+        </p>
+      ))}
     </div>
   );
 }
 
 function AlternativeCard({ alt, weak, onUse }: { alt: Alternative; weak: JourneyPlan["assessments"][number]; onUse: (a: Alternative) => void }) {
-  const via = stationById(alt.viaStationId)!;
-  const weakSt = stationById(alt.replacesStationId)!;
-  const amen = Object.entries(via.amenities) as [AmenityType, string][];
+  const { stationById, hubById } = useNetwork();
+  const via = stationById(alt.viaStationId);
+  const weakSt = stationById(alt.replacesStationId);
+  const amen = Object.entries(via?.amenities ?? {}) as [AmenityType, string][];
   return (
     <div className="mt-2 rounded-lg border-2 border-dashed border-[var(--warn)] p-3">
       <p className="text-sm">
-        <span aria-hidden>⚠</span> Transfer di <b>{weakSt.name}</b> perlu perhatian (skor {weak.score}).
+        <span aria-hidden>⚠</span> Transfer di <b>{weakSt?.name ?? alt.replacesStationId}</b> perlu perhatian (skor {weak.score}).
       </p>
       <p className="mt-2 text-sm font-semibold">Alternatif di Hub {hubById(alt.hubId)?.name}:</p>
       <div className="mt-1 flex flex-wrap items-center gap-2">
-        <span className="font-bold">Via {via.name}</span>
+        <span className="font-bold">Via {via?.name ?? alt.viaStationId}</span>
         <AccessBadge a={alt.assessment} />
       </div>
       <p className="mt-1 text-xs text-[var(--muted)]">
@@ -196,4 +219,28 @@ function AlternativeCard({ alt, weak, onUse }: { alt: Alternative; weak: Journey
 
 function modeIcon(mode: string) {
   return mode === "SUBWAY" ? "🚇" : mode === "TRAM" ? "🚈" : mode === "BUS" ? "🚌" : "🚆";
+}
+
+const NOTICE_STYLE = {
+  info: { cls: "banner-info", icon: "ⓘ" },
+  warning: { cls: "banner-warn", icon: "⚠" },
+  critical: { cls: "banner-warn border-l-4 border-l-[var(--bad)]", icon: "⛔" },
+} as const;
+
+/** Pengumuman dari tim NTD (dikelola lewat halaman admin), mis. lift sedang diperbaiki. */
+export function NoticeBanner({ notice, target }: { notice: Notice; target?: string }) {
+  const st = NOTICE_STYLE[notice.severity];
+  return (
+    <div className={`banner ${st.cls}`} role={notice.severity === "critical" ? "alert" : undefined}>
+      <span aria-hidden>{st.icon}</span>{" "}
+      <span>
+        <b>
+          {notice.title}
+          {/[.!?:]$/.test(notice.title) ? "" : "."}
+        </b>{" "}
+        {notice.message}
+        {target && <span className="block text-sm opacity-80">Berlaku untuk: {target}</span>}
+      </span>
+    </div>
+  );
 }

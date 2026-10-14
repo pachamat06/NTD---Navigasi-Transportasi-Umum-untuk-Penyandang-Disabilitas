@@ -1,10 +1,11 @@
 "use client";
 
-import { useEffect, useRef, type ReactNode } from "react";
-import { hubById, lineById, stationById } from "@/lib/dummy-data";
-import { AMENITY_LABEL, assess, type DemoMode } from "@/lib/mock-planner";
-import type { AmenityType } from "@/lib/types";
+import { useEffect, useRef, useState, type ReactNode } from "react";
+import { fetchStationDetail } from "@/lib/api";
+import { AMENITY_LABEL, useNetwork } from "@/lib/network";
+import type { AmenityType, StationDetailData } from "@/lib/types";
 import { AccessBadge } from "./AccessBadge";
+import { NoticeBanner } from "./ResultPanel";
 
 /** Dialog modal berbasis <dialog> bawaan peramban (fokus terkunci, Esc menutup). */
 export function Modal({ open, title, onClose, children }: { open: boolean; title: string; onClose: () => void; children: ReactNode }) {
@@ -32,11 +33,23 @@ export function Modal({ open, title, onClose, children }: { open: boolean; title
 
 const STATUS_TEXT = {
   available: { icon: "✔", text: "Tersedia", cls: "text-[var(--ok)]" },
-  absent: { icon: "✖", text: "Tidak ada", cls: "text-[var(--bad)]" },
+  absent: { icon: "✖", text: "Tidak tercatat", cls: "text-[var(--bad)]" },
+  out_of_service: { icon: "⚠", text: "Sedang tidak berfungsi", cls: "text-[var(--warn)]" },
   unknown: { icon: "?", text: "Data tidak tersedia", cls: "text-[var(--muted)]" },
 } as const;
 
-/** L6 Detail Stasiun dan Fasilitas (UC-04). */
+const ENTRANCE_FEATURE: Record<string, string> = {
+  lift: "lift",
+  ramp: "ramp",
+  eskalator: "eskalator",
+  tangga: "tangga",
+  datar: "jalan datar",
+  guiding_block: "guiding block",
+};
+
+const INFO_CATEGORY: Record<string, string> = { kontak: "Kontak", jam_operasional: "Jam operasional", layanan: "Layanan", catatan: "Catatan" };
+
+/** L6 Detail Stasiun dan Fasilitas (UC-04), termasuk pintu akses dan info tambahan dari tim NTD. */
 export function StationDetail({
   stationId,
   onClose,
@@ -48,22 +61,44 @@ export function StationDetail({
   onSetOrigin: (id: string) => void;
   onSetDestination: (id: string) => void;
 }) {
-  const st = stationId ? stationById(stationId) : null;
-  const a = stationId ? assess(stationId) : null;
+  const { stationById, lineById, hubById, amenityLabel, meta } = useNetwork();
+  const base = stationId ? stationById(stationId) : undefined;
+  const [detail, setDetail] = useState<{ id: string; data: StationDetailData | null; error?: string } | null>(null);
+
+  useEffect(() => {
+    if (!stationId) return;
+    let alive = true;
+    fetchStationDetail(stationId).then((r) => {
+      if (alive) setDetail({ id: stationId, data: r.status === "ok" ? r.data : null, error: r.status === "error" ? r.message : undefined });
+    });
+    return () => {
+      alive = false;
+    };
+  }, [stationId]);
+
+  // Data dari /api/network tampil lebih dulu; detail lengkap menyusul.
+  const full = detail?.id === stationId ? detail : null;
+  const st = full?.data ?? base;
+  const a = st?.assessment;
+  const details = st?.amenityDetails ?? [];
+  const extras = details.filter((d) => !(d.type in AMENITY_LABEL));
+  const w = meta?.scoring.weights;
+
   return (
     <Modal open={!!st} title={st?.name ?? ""} onClose={onClose}>
       {st && a && (
         <div className="flex flex-col gap-4">
           <p className="text-[var(--muted)]">
-            {st.operator} · {st.lineIds.map((l) => lineById(l)!.name).join(", ")} · {st.codes.join("/")}
-            {st.hubId && ` · Hub ${hubById(st.hubId)!.name}`}
+            {st.operator} · {st.lineIds.map((l) => lineById(l)?.name ?? l).join(", ")} · {st.codes.join("/")}
+            {st.hubId && ` · Hub ${hubById(st.hubId)?.name ?? st.hubId}`}
           </p>
+          {full?.data?.notices.map((n) => <NoticeBanner key={n.id} notice={n} />)}
           <div>
             <p className="text-sm font-semibold">Skor aksesibilitas</p>
             {a.dataAvailable ? (
               <>
                 <div className="mt-1 flex items-center gap-3">
-                  <meter min={0} max={100} low={50} high={70} optimum={100} value={a.score} className="h-3 flex-1" aria-label="Skor aksesibilitas" />
+                  <meter min={0} max={100} low={50} high={meta?.scoring.threshold ?? 70} optimum={100} value={a.score} className="h-3 flex-1" aria-label="Skor aksesibilitas" />
                   <span className="font-bold">{a.score} / 100</span>
                 </div>
                 <div className="mt-2">
@@ -79,19 +114,57 @@ export function StationDetail({
           <div>
             <p className="text-sm font-semibold">Fasilitas</p>
             <ul className="mt-1 divide-y divide-[var(--border)]">
-              {(Object.entries(st.amenities) as [AmenityType, keyof typeof STATUS_TEXT][]).map(([k, v]) => (
-                <li key={k} className="flex min-h-11 items-center justify-between">
-                  <span>{AMENITY_LABEL[k]}</span>
-                  <span className={STATUS_TEXT[v].cls}>
-                    <span aria-hidden>{STATUS_TEXT[v].icon}</span> {STATUS_TEXT[v].text}
-                  </span>
-                </li>
+              {(Object.keys(AMENITY_LABEL) as AmenityType[]).map((k) => {
+                const d = details.find((x) => x.type === k);
+                const v = d?.status === "out_of_service" ? "out_of_service" : st.amenities[k];
+                return <AmenityRow key={k} label={amenityLabel(k)} status={v} note={d?.source === "ntd" ? d.note : undefined} />;
+              })}
+              {extras.map((d) => (
+                <AmenityRow key={d.type} label={amenityLabel(d.type)} status={d.status} note={d.note} />
               ))}
             </ul>
           </div>
+          {full?.data && full.data.entrances.length > 0 && (
+            <div>
+              <p className="text-sm font-semibold">Pintu akses</p>
+              <ul className="mt-1 flex flex-col gap-2">
+                {full.data.entrances.map((e) => (
+                  <li key={e.id} className="rounded-lg bg-[var(--surface-2)] p-3 text-sm">
+                    <p className="font-semibold">
+                      {e.name}{" "}
+                      <span className={e.accessible ? "text-[var(--ok)]" : "text-[var(--warn)]"}>
+                        <span aria-hidden>{e.accessible ? "✔" : "⚠"}</span> {e.accessible ? "Aksesibel" : "Kurang aksesibel"}
+                      </span>
+                    </p>
+                    {e.description && <p>{e.description}</p>}
+                    {e.features.length > 0 && <p className="text-[var(--muted)]">Akses: {e.features.map((f) => ENTRANCE_FEATURE[f] ?? f).join(", ")}</p>}
+                    {e.openHours && <p className="text-[var(--muted)]">Buka: {e.openHours}</p>}
+                    {e.note && <p className="text-[var(--muted)]">{e.note}</p>}
+                  </li>
+                ))}
+              </ul>
+            </div>
+          )}
+          {full?.data && full.data.info.length > 0 && (
+            <div>
+              <p className="text-sm font-semibold">Informasi lain</p>
+              <dl className="mt-1 flex flex-col gap-2 text-sm">
+                {full.data.info.map((i) => (
+                  <div key={i.id}>
+                    <dt className="font-semibold">
+                      {i.title} <span className="font-normal text-[var(--muted)]">· {INFO_CATEGORY[i.category] ?? i.category}</span>
+                    </dt>
+                    <dd className="whitespace-pre-line">{i.body}</dd>
+                  </div>
+                ))}
+              </dl>
+            </div>
+          )}
+          {full?.error && <p className="text-sm text-[var(--muted)]">Detail tambahan belum bisa dimuat: {full.error}</p>}
           <p className="text-sm text-[var(--muted)]">
-            Skor dihitung dari fasilitas yang tercatat di data (bobot sementara: lift 40, toilet aksesibel 25, eskalator 20, ramp 15). &quot;Data tidak
-            tersedia&quot; bukan berarti fasilitas tidak ada. Data bersifat statis, bukan kondisi real-time.
+            Skor dihitung dari fasilitas yang tercatat
+            {w && ` (bobot: lift ${w.lift}, toilet aksesibel ${w.toilet}, eskalator ${w.eskalator}, ramp ${w.ramp})`}. &quot;Data tidak tersedia&quot;
+            bukan berarti fasilitas tidak ada. {meta?.disclaimer ?? "Data bersifat statis, bukan kondisi real-time."}
           </p>
           <div className="grid grid-cols-2 gap-2">
             <button
@@ -119,6 +192,21 @@ export function StationDetail({
   );
 }
 
+function AmenityRow({ label, status, note }: { label: string; status: keyof typeof STATUS_TEXT; note?: string }) {
+  const t = STATUS_TEXT[status];
+  return (
+    <li className="flex min-h-11 flex-col justify-center py-1">
+      <span className="flex items-center justify-between gap-2">
+        <span>{label}</span>
+        <span className={t.cls}>
+          <span aria-hidden>{t.icon}</span> {t.text}
+        </span>
+      </span>
+      {note && <span className="text-sm text-[var(--muted)]">{note}</span>}
+    </li>
+  );
+}
+
 /** L8 Tentang, Sumber Data, Privasi. */
 export function AboutDialog({ open, onClose }: { open: boolean; onClose: () => void }) {
   return (
@@ -131,7 +219,7 @@ export function AboutDialog({ open, onClose }: { open: boolean; onClose: () => v
         <Section title="Cakupan saat ini">Hub Sudirman–Dukuh Atas–BNI City, fokus aksesibilitas mobilitas fisik.</Section>
         <Section title="Sumber data">
           Commute Data API, Shiori Labs (lisensi ODbL-1.0). Peta: Peta Integrasi Transportasi Umum Jakarta © FDTJ (edisi 2026-08c), digunakan
-          dengan izin. Versi GUI basic ini memakai data dummy.
+          dengan izin. Informasi tambahan (pintu akses, kondisi fasilitas, pengumuman) dari tim NTD.
         </Section>
         <Section title="Keterbatasan">Data fasilitas bersifat statis, bukan status real-time. Selalu konfirmasi ke petugas stasiun bila ragu.</Section>
         <Section title="Privasi">NTD tidak meminta akun dan tidak menyimpan identitas atau riwayat lokasi Anda.</Section>
@@ -157,9 +245,9 @@ function Section({ title, children }: { title: string; children: ReactNode }) {
   );
 }
 
-export type DisplaySettings = { textSize: 0 | 1 | 2; highContrast: boolean; reduceMotion: boolean; demoMode: DemoMode };
+export type DisplaySettings = { textSize: 0 | 1 | 2; highContrast: boolean; reduceMotion: boolean };
 
-/** L9 Pengaturan Tampilan [Usulan] + pilihan simulasi kondisi data untuk demo. */
+/** L9 Pengaturan Tampilan [Usulan]. */
 export function SettingsDialog({
   open,
   onClose,
@@ -191,21 +279,6 @@ export function SettingsDialog({
         </fieldset>
         <Toggle label="Kontras tinggi" checked={value.highContrast} onChange={(v) => onChange({ ...value, highContrast: v })} />
         <Toggle label="Kurangi animasi" checked={value.reduceMotion} onChange={(v) => onChange({ ...value, reduceMotion: v })} />
-        <fieldset className="rounded-lg border border-dashed border-[var(--border)] p-3">
-          <legend className="px-1 text-sm font-semibold">Simulasi kondisi data (khusus demo)</legend>
-          {(
-            [
-              ["normal", "Normal"],
-              ["cache", "API tidak bisa dihubungi, pakai cache"],
-              ["down", "API tidak bisa dihubungi, tanpa cache"],
-            ] as const
-          ).map(([k, l]) => (
-            <label key={k} className="flex min-h-11 items-center gap-2">
-              <input type="radio" name="demo" checked={value.demoMode === k} onChange={() => onChange({ ...value, demoMode: k })} className="h-5 w-5" />
-              {l}
-            </label>
-          ))}
-        </fieldset>
       </div>
     </Modal>
   );
