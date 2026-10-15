@@ -4,6 +4,7 @@ import type { LlmClient } from "../src/ai/llm/LlmClient";
 import { createApp } from "../src/app";
 import { loadConfig } from "../src/config";
 import { FixtureCommuteSource } from "../src/data/commute/FixtureCommuteSource";
+import type { CommuteSource } from "../src/data/commute/types";
 import { silentLogger } from "../src/http/middleware";
 import { createServices } from "../src/services";
 import { createMemoryStore } from "../src/store/memory";
@@ -24,10 +25,10 @@ export class FakeLlm implements LlmClient {
   }
 }
 
-export async function makeTestApp(opts: { store?: Store; llm?: LlmClient | null; env?: Record<string, string> } = {}) {
+export async function makeTestApp(opts: { store?: Store; llm?: LlmClient | null; env?: Record<string, string>; source?: CommuteSource } = {}) {
   const store = opts.store ?? createMemoryStore();
   const config = loadConfig({ RATE_LIMIT_MAX: "10000", ADMIN_TOKEN_SECRET: "x".repeat(40), ...opts.env } as NodeJS.ProcessEnv);
-  const source = new FixtureCommuteSource();
+  const source = opts.source ?? new FixtureCommuteSource();
   const services = createServices({ config, store, log: silentLogger, source, llm: opts.llm ?? null });
   if ((await store.admins.count()) === 0) {
     await store.admins.create({ email: ADMIN.email, name: "Admin", role: "admin", passwordHash: await hashPassword(ADMIN.password), active: true });

@@ -45,7 +45,11 @@ Semua variabel lingkungan terdokumentasi di [.env.example](.env.example).
 Sumber data Commute (`COMMUTE_SOURCE`):
 
 - `fixture` (bawaan): data dummy yang sama dengan GUI basic, rute dengan Dijkstra. Berjalan tanpa internet.
-- `http`: Commute Data API sungguhan. **Skema upstream masih tebakan** (akses API diblokir saat pengembangan) dan terisolasi di `src/data/commute/types.ts` dan `HttpCommuteSource.ts`. Verifikasi di NTD-03 lalu sesuaikan dua berkas itu saja. Pemetaan slug GUI ke kode operator ada di `station-index.ts`.
+- `http`: Commute Data API sungguhan (`https://api.commute.shiorilabs.id`, spesifikasi di `/openapi.json`, tanpa kunci API). Adaptornya di `src/data/commute/HttpCommuteSource.ts`. Operator yang dipakai diatur `COMMUTE_OPERATORS` (bawaan semua: KCI, MRTJ, LRTJ, LRTJBDB, APCGK, TJ; rute dari /fares bisa melewati halte TransJakarta) dan wilayah `COMMUTE_REGIONS` (bawaan CGK).
+
+Id stasiun GUI berbentuk slug (mis. `bni-city`) karena posisi di peta dikunci dengan slug. `station-index.ts` mencocokkan slug ke stasiun API lewat operator + nama tampilan atau nama resmi, jadi kode API tidak ditulis tetap. Stasiun di luar tabel memakai id turunan `operator:kode` (mis. `kci:kat`). Slug yang tidak cocok ditampilkan di Ringkasan halaman admin; tambahkan namanya di tabel bila muncul.
+
+Batasan data API: tidak ada jenis fasilitas ramp (status ramp selalu "data tidak tersedia" kecuali diisi tim lewat admin), `TOILET` biasa tidak dihitung sebagai toilet aksesibel, daftar fasilitas kosong berarti data belum ada, dan /hubs tidak memuat jarak jalan kaki antarstasiun.
 
 ### Data tambahan dari admin
 
@@ -76,7 +80,9 @@ Respons sukses `{"status":"ok","data":...}`; gagal `{"status":"error","code","me
 | GET | `/api/network` | Data awal GUI: semua stasiun (fasilitas + skor), lini, dan hub |
 | GET | `/api/lines`, `/api/hubs` | Lini dan hub antarmoda |
 | GET | `/api/notices?stationId=&lineId=&hubId=` | Pengumuman aktif |
-| POST | `/api/plan` | Rencana perjalanan (UC-01). Body `{originId, destinationId, viaStationId?, avoid?, at?}` |
+| POST | `/api/plan` | Rencana perjalanan (UC-01). Body `{originId, destinationId, viaStationId?, avoid?, avoidModes?, at?}`; `avoidModes` berisi moda yang dihindari (`RAIL`, `SUBWAY`, `TRAM`, `BUS`, `MONORAIL`) |
+
+Dengan `avoidModes`, bila rute dataset memakai moda yang dihindari, backend mencari rute sendiri di atas urutan stasiun lini yang diizinkan (`/lines`, termasuk cabang) dan perpindahan di hub, lalu meminta `/fares` untuk tiap ruas naik agar tarif dan jadwalnya tetap dari dataset. Ruas yang tarifnya tidak tersedia disusun dari urutan stasiun lini (tarif 0, waktu kosong) dan diberi peringatan. Bila tidak ada rute yang lolos, rute dataset tetap ditampilkan dengan peringatan.
 
 `POST /api/plan` mengembalikan rute (bentuk sama dengan `Frontend/src/lib/types.ts`), penilaian fasilitas tiap stasiun transit, hingga 3 alternatif via stasiun lain di hub yang sama, pengumuman terkait, narasi notifikasi, peringatan (mis. data dari cache), disclaimer, dan atribusi.
 

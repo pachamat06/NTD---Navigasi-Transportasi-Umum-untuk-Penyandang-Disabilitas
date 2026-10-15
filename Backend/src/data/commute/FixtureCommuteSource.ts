@@ -1,6 +1,6 @@
 // Sumber data OFFLINE yang meniru Commute Data API, dipakai untuk pengembangan, pengujian, dan
-// demo saat API tidak dapat dihubungi. Isinya sama dengan data dummy GUI
-// (Frontend/src/lib/dummy-data.ts): nama dan kode stasiun mengikuti Peta Integrasi FDTJ 2026-08c,
+// demo saat API tidak dapat dihubungi. Isinya sama dengan data dummy GUI basic sebelum terhubung ke
+// backend: nama dan kode stasiun mengikuti Peta Integrasi FDTJ 2026-08c,
 // tetapi jarak, waktu, tarif, dan fasilitas hanyalah ILUSTRASI, bukan data sungguhan.
 
 import type { Mode } from "../../domain/models";

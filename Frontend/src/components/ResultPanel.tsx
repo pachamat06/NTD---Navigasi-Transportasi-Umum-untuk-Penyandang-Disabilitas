@@ -1,6 +1,5 @@
 "use client";
 
-import { STOP_POSITIONS } from "@/lib/map-assets";
 import { AMENITY_LABEL, useNetwork } from "@/lib/network";
 import type { Alternative, AmenityType, JourneyPlan, Notice } from "@/lib/types";
 import { AccessBadge } from "./AccessBadge";
@@ -20,10 +19,10 @@ export function ResultPanel({
   onUseAlternative: (alt: Alternative) => void;
   onShowMap: () => void;
 }) {
-  const { stationById, lineById } = useNetwork();
+  const { stationById, lineById, positionOf } = useNetwork();
   const { route } = plan;
   const assessmentOf = (id: string) => plan.assessments.find((a) => a.stationId === id) ?? { stationId: id, score: 0, adequate: false, dataAvailable: false };
-  const name = (id: string) => stationById(id)?.name ?? id;
+  const name = (id: string) => stationById(id)?.name ?? route.stopNames?.[id] ?? id;
   // Backend juga menyalin pengumuman ke `warnings` (untuk klien lama); di sini cukup tampil sebagai pengumuman.
   const noticeTexts = new Set((plan.notices ?? []).map((n) => `${n.title}${/[.!?:]$/.test(n.title) ? "" : ":"} ${n.message}`));
 
@@ -93,6 +92,7 @@ export function ResultPanel({
               <li key={i} className="timeline-item" style={{ ["--leg" as string]: line?.color ?? "var(--muted)" }} data-type={leg.type}>
                 <StopRow
                   id={start}
+                  name={name(start)}
                   label={i === 0 ? "Berangkat" : leg.type === "TRANSFER" ? "Transfer" : undefined}
                   a={assessmentOf(start)}
                   onShowDetail={onShowDetail}
@@ -101,7 +101,7 @@ export function ResultPanel({
                   {leg.type === "RIDE" ? (
                     <>
                       <p className="font-semibold">
-                        {modeIcon(line?.mode ?? "RAIL")} {line ? `${line.operator} · ${line.name}` : leg.lineId}
+                        {modeIcon(line?.mode ?? leg.mode ?? "RAIL")} {line ? `${line.operator} · ${line.name}` : leg.lineId}
                       </p>
                       <p className="text-sm text-[var(--muted)]">
                         {leg.stops.length - 1} pemberhentian · {km(leg.distanceM)} · {leg.minutes === null ? "waktu tidak tersedia" : `${leg.minutes} mnt`} · {rupiah(leg.fare)}
@@ -131,7 +131,7 @@ export function ResultPanel({
                       )}
                     </p>
                   )}
-                  {leg.stops.some((s) => !STOP_POSITIONS[s]) && (
+                  {leg.stops.some((s) => !positionOf(s)) && (
                     <p className="mt-1 text-xs text-[var(--muted)]">ⓘ Sebagian pemberhentian pada ruas ini belum ada di peta.</p>
                   )}
                   {alts.map((alt) => (
@@ -168,8 +168,8 @@ function Stat({ icon, label, value }: { icon: string; label: string; value: stri
   );
 }
 
-function StopRow({ id, label, a, onShowDetail }: { id: string; label?: string; a: JourneyPlan["assessments"][number]; onShowDetail: (id: string) => void }) {
-  const stationName = useNetwork().stationById(id)?.name ?? id;
+function StopRow({ id, name, label, a, onShowDetail }: { id: string; name?: string; label?: string; a: JourneyPlan["assessments"][number]; onShowDetail: (id: string) => void }) {
+  const stationName = useNetwork().stationById(id)?.name ?? name ?? id;
   // Catatan dari tim NTD, mis. lift sedang tidak berfungsi.
   const notes = a.dataAvailable ? (a.notes ?? []) : [];
   return (

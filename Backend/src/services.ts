@@ -51,7 +51,7 @@ export function createLlm(config: Config): LlmClient | null {
 
 export function createSource(config: Config): CommuteSource {
   return config.commute.source === "http"
-    ? new HttpCommuteSource({ baseUrl: config.commute.baseUrl, apiKey: config.commute.apiKey, timeoutMs: config.commute.timeoutMs })
+    ? new HttpCommuteSource({ baseUrl: config.commute.baseUrl, apiKey: config.commute.apiKey, timeoutMs: config.commute.timeoutMs, operators: config.commute.operators, regions: config.commute.regions })
     : new FixtureCommuteSource();
 }
 

@@ -65,6 +65,9 @@ export interface Station {
   lineIds: string[];
   hubId?: string;
   codes: string[];
+  /** Koordinat dari dataset (bila ada); hanya dipakai backend untuk memilih stasiun transit alternatif. */
+  lat?: number;
+  lng?: number;
 }
 
 export interface Amenity {
@@ -123,6 +126,10 @@ export interface Route {
   timeComplete: boolean;
   totalFare: number;
   transfers: number;
+  /** Nama pemberhentian dari sumber data (dipakai untuk halte/stasiun yang tidak ada di daftar stasiun). */
+  stopNames?: Record<string, string>;
+  /** false = tarif sebagian ruas tidak tersedia di dataset (ruas disusun dari urutan stasiun lini). */
+  fareComplete?: boolean;
 }
 
 export interface Alternative {

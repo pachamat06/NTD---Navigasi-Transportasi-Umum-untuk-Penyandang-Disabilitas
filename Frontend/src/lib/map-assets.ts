@@ -2,6 +2,8 @@
 // Umum Jakarta (FDTJ, edisi 2026-08c). Hanya untuk menggambar; data stasiun, lini, fasilitas, dan
 // rute berasal dari Backend (lihat network.tsx).
 
+import { BUS_STOPS, RAIL_STOPS, TRACKS, type BusStopLabel } from "./map-stops";
+
 type Pt = [number, number];
 
 /** Ukuran Aset Peta Transit (public/peta/fdtj-2026-08c.svg), dalam satuan pt PDF asli. */
@@ -75,4 +77,167 @@ export function legGeometry(lineId: string, from: string, to: string): Pt[] {
   if (i < 0 || j < 0) return [];
   const seg = pts.slice(Math.min(i, j), Math.max(i, j) + 1).map((x) => x.p);
   return i <= j ? seg : seg.reverse();
+}
+
+// ---------------------------------------------------------------------------------------------
+// Posisi untuk stasiun dan halte di luar indeks STOP_POSITIONS (data dari Commute Data API).
+
+export interface PositionedStation {
+  id: string;
+  name: string;
+  codes: string[];
+  lineIds: string[];
+}
+
+const norm = (s: string) =>
+  s
+    .toLowerCase()
+    .normalize("NFKD")
+    .replace(/[̀-ͯ]/g, "")
+    .replace(/[^a-z0-9]+/g, " ")
+    .trim();
+
+/**
+ * Indeks posisi semua stasiun: (1) nomor stasiun yang sama dengan penanda di peta (mis. C12, 1-13),
+ * (2) STOP_POSITIONS yang dikurasi, (3) khusus halte TransJakarta: nama halte di peta, dipersempit dengan
+ * nomor koridor. Stasiun yang tidak ditemukan tidak digambar di peta.
+ */
+export function buildPositions(stations: PositionedStation[]): Map<string, { x: number; y: number }> {
+  const out = new Map<string, { x: number; y: number }>();
+  const busByCode = new Map<string, BusStopLabel>();
+  for (const b of BUS_STOPS) for (const c of b.codes) busByCode.set(c, b);
+  const busNames = BUS_STOPS.filter((b) => b.name).map((b) => ({ b, n: norm(b.name), corridors: b.codes.map((c) => c.split("-")[0]) }));
+  for (const s of stations) {
+    // Penanda di peta lebih dulu, agar titik tepat di lingkaran pemberhentian.
+    const code = s.codes.find((c) => RAIL_STOPS[c] || busByCode.get(c)?.exact) ?? s.codes.find((c) => busByCode.has(c));
+    if (code) {
+      const [x, y] = RAIL_STOPS[code] ?? busByCode.get(code)!.at;
+      out.set(s.id, { x, y });
+      continue;
+    }
+    const fixed = STOP_POSITIONS[s.id];
+    if (fixed) {
+      out.set(s.id, fixed);
+      continue;
+    }
+    const corridors = s.lineIds.filter((l) => l.startsWith("tj:")).map((l) => l.slice(3).toUpperCase());
+    if (!corridors.length) continue;
+    const n = norm(s.name);
+    const cands = busNames.filter((x) => x.n === n || n.startsWith(x.n + " ") || x.n.startsWith(n + " "));
+    const onCorridor = cands.filter((x) => x.corridors.some((c) => corridors.includes(c)));
+    // Nama sama di koridor lain (mis. "8-23 Petojo" untuk halte Petojo Koridor 1) hanya dipakai bila koridornya tidak ada di peta.
+    const corridorOnMap = busNames.some((x) => x.corridors.some((c) => corridors.includes(c)));
+    const pick = onCorridor.length === 1 ? onCorridor[0] : !corridorOnMap && cands.length === 1 ? cands[0] : null;
+    if (pick) out.set(s.id, { x: pick.b.at[0], y: pick.b.at[1] });
+  }
+  return out;
+}
+
+// ---------------------------------------------------------------------------------------------
+// Garis rute yang mengikuti jalur di peta (TRACKS), termasuk lengkungan dan belokan.
+
+type Edge = { to: string; color: [number, number, number]; points: Pt[]; length: number };
+
+const rgb = (hex: string): [number, number, number] => {
+  const h = hex.replace("#", "");
+  const v = parseInt(h.length === 3 ? h.replace(/./g, (c) => c + c) : h, 16);
+  return [(v >> 16) & 255, (v >> 8) & 255, v & 255];
+};
+const colorDiff = (a: [number, number, number], b: [number, number, number]) =>
+  Math.abs(a[0] - b[0]) + Math.abs(a[1] - b[1]) + Math.abs(a[2] - b[2]);
+const dist = (a: Pt, b: Pt) => Math.hypot(a[0] - b[0], a[1] - b[1]);
+const polyLength = (pts: Pt[]) => pts.reduce((sum, p, i) => (i ? sum + dist(pts[i - 1], p) : 0), 0);
+
+let graph: { nodes: [string, Pt][]; edges: Map<string, Edge[]> } | null = null;
+
+function trackGraph() {
+  if (graph) return graph;
+  const nodes = new Map<string, Pt>();
+  for (const [code, at] of Object.entries(RAIL_STOPS)) nodes.set(code, at);
+  for (const b of BUS_STOPS) if (b.exact && b.codes[0]) nodes.set(b.codes[0], b.at);
+  const edges = new Map<string, Edge[]>();
+  const add = (from: string, e: Edge) => {
+    if (!edges.has(from)) edges.set(from, []);
+    edges.get(from)!.push(e);
+  };
+  for (const [key, list] of Object.entries(TRACKS)) {
+    const [a, b] = key.split("|");
+    const pa = nodes.get(a);
+    const pb = nodes.get(b);
+    if (!pa || !pb) continue;
+    for (const t of list) {
+      const points: Pt[] = [pa, ...t.points, pb];
+      const color = rgb(t.color);
+      const length = polyLength(points);
+      add(a, { to: b, color, points, length });
+      add(b, { to: a, color, points: [...points].reverse(), length });
+    }
+  }
+  graph = { nodes: [...nodes.entries()], edges };
+  return graph;
+}
+
+/** Kunci penanda (kode stasiun/halte) yang tepat berada di posisi `p`, bila ada. */
+function nodeAt(p: Pt): string | undefined {
+  let best: string | undefined;
+  let bestD = 4;
+  for (const [key, at] of trackGraph().nodes) {
+    const d = dist(at, p);
+    if (d < bestD) [best, bestD] = [key, d];
+  }
+  return best;
+}
+
+/**
+ * Jalur peta antara dua penanda: Dijkstra di atas ruas TRACKS, panjang ruas diperberat bila warnanya
+ * jauh dari warna lini, dibatasi 3x jarak lurus. null = tidak ada jalur di peta.
+ */
+function trackBetween(a: string, b: string, color: [number, number, number], straight: number): Pt[] | null {
+  const { edges } = trackGraph();
+  const limit = straight * 3 + 200;
+  const best = new Map<string, number>([[a, 0]]);
+  const prev = new Map<string, { from: string; edge: Edge }>();
+  const queue: [number, string][] = [[0, a]];
+  while (queue.length) {
+    queue.sort((x, y) => x[0] - y[0]);
+    const [d, k] = queue.shift()!;
+    if (k === b) break;
+    if (d > (best.get(k) ?? Infinity) || d > limit) continue;
+    for (const e of edges.get(k) ?? []) {
+      const nd = d + e.length * (1 + colorDiff(e.color, color) / 120);
+      if (nd < (best.get(e.to) ?? Infinity)) {
+        best.set(e.to, nd);
+        prev.set(e.to, { from: k, edge: e });
+        queue.push([nd, e.to]);
+      }
+    }
+  }
+  if (!prev.has(b)) return null;
+  const parts: Pt[][] = [];
+  for (let k = b; k !== a; ) {
+    const step = prev.get(k)!;
+    parts.unshift(step.edge.points);
+    k = step.from;
+  }
+  if (polyLength(parts.flat()) > limit) return null;
+  return parts.flatMap((pts, i) => (i ? pts.slice(1) : pts));
+}
+
+/**
+ * Garis untuk satu ruas naik: lewati semua pemberhentian (posisi penanda) berurutan dan, di antara dua
+ * pemberhentian, ikuti jalur di peta. Bila jalurnya tidak terbaca, pakai garis lurus.
+ */
+export function ridePath(stops: { x: number; y: number }[], lineColor: string): Pt[] {
+  const color = rgb(lineColor);
+  const pts: Pt[] = [];
+  stops.forEach((s, i) => {
+    const p: Pt = [s.x, s.y];
+    if (i === 0) return pts.push(p);
+    const q: Pt = [stops[i - 1].x, stops[i - 1].y];
+    const a = nodeAt(q);
+    const b = nodeAt(p);
+    const track = a && b && a !== b ? trackBetween(a, b, color, dist(q, p)) : null;
+    pts.push(...(track ? track.slice(1) : [p]));
+  });
+  return pts;
 }

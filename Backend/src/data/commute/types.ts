@@ -1,9 +1,7 @@
-// Bentuk respons Commute Data API (api.commute.shiorilabs.id) sebagaimana dipakai NTD.
-//
-// PENTING: nama field di bawah disusun dari draf laporan (Bab III, Tabel 3.3: legs RIDE/TRANSFER,
-// stops, distanceM, totalDistanceM, departureAt, arrivalAt, stopTimes, mode operator/lini, amenities)
-// dan BELUM diverifikasi terhadap API sungguhan (kartu NTD-03). Bila hasil verifikasi berbeda,
-// cukup ubah file ini dan pemetaan di HttpCommuteSource.ts; lapisan di atasnya tidak berubah.
+// Kontrak data internal antara sumber data (HttpCommuteSource / FixtureCommuteSource) dan CommuteApiClient.
+// Bentuk respons asli Commute Data API (OpenAPI 3.1, api.commute.shiorilabs.id/openapi.json) ada di
+// HttpCommuteSource.ts dan dipetakan ke tipe di bawah, sehingga lapisan di atasnya tidak bergantung
+// pada format upstream.
 
 import type { Mode } from "../../domain/models";
 
@@ -13,7 +11,7 @@ export interface UpStopRef {
 }
 
 export interface UpAmenity {
-  /** Contoh: ELEVATOR, ESCALATOR, ACCESSIBLE_TOILET, RAMP, TACTILE_PAVING. */
+  /** Contoh upstream: ELEVATOR_PAID, ESCALATOR_UNPAID, TOILET_ACCESSIBLE. */
   type: string;
   name?: string;
   description?: string;
@@ -21,7 +19,9 @@ export interface UpAmenity {
 
 export interface UpStation extends UpStopRef {
   name: string;
-  /** Kode lini (tanpa operator) yang melayani stasiun ini. */
+  /** Nama versi operator (mis. "SUDIRMAN BARU" untuk BNI City); dipakai untuk pencocokan nama. */
+  officialName?: string;
+  /** Lini yang melayani stasiun ini: kode lini milik operator yang sama, atau kunci lengkap `OPERATOR:KODE`. */
   lines?: string[];
   hub?: string | null;
   /** null/kosong = data amenity tidak tersedia (bukan "fasilitas tidak ada"). */
@@ -45,6 +45,13 @@ export interface UpLine {
   color?: string;
   mode?: Mode;
   stations: UpStopRef[];
+  /** Nomor stasiun pada lin ini (sejajar dengan `stations`), mis. "C12" atau "1-13"; dipakai untuk posisi di peta. */
+  stationNumbers?: (string | null)[];
+  /**
+   * Ruas lin berurutan (batang utama dan cabang). `joinsAt` = stasiun tempat cabang berpisah dari batang utama.
+   * Tidak diisi = `stations` adalah satu ruas lurus.
+   */
+  segments?: { stations: UpStopRef[]; joinsAt?: UpStopRef }[];
 }
 
 export interface UpHubTransfer {
@@ -72,6 +79,8 @@ export interface UpLeg {
   operator?: string;
   line?: string;
   stops: UpStopRef[];
+  /** Nama tampilan tiap pemberhentian (sejajar dengan `stops`), bila sumber menyediakannya. */
+  stopNames?: string[];
   distanceM: number;
   fare?: number;
   departureAt?: string | null;
@@ -100,4 +109,9 @@ export interface CommuteSource {
   getOperators(): Promise<UpOperator[]>;
   getLines(): Promise<UpLine[]>;
   getLine(operator: string, lineCode: string): Promise<UpLine | null>;
+  /**
+   * Jenis fasilitas inti yang dapat dinyatakan sumber ini. Jenis di luar daftar berstatus "data tidak tersedia",
+   * bukan "tidak ada" (Tabel 3.4 no. 9). Tidak diisi = semua jenis inti.
+   */
+  readonly amenityCoverage?: readonly string[];
 }

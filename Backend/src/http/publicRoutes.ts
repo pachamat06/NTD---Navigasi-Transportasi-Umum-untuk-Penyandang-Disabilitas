@@ -15,6 +15,7 @@ export const planSchema = z.object({
   destinationId: stationId,
   viaStationId: stationId.optional(),
   avoid: z.array(stationId).max(10).optional(),
+  avoidModes: z.array(z.enum(["RAIL", "SUBWAY", "TRAM", "BUS", "MONORAIL"])).max(5).optional(),
   at: z
     .string()
     .refine((v) => !Number.isNaN(Date.parse(v)), "harus tanggal ISO 8601")

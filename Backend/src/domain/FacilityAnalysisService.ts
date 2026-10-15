@@ -41,7 +41,12 @@ export class FacilityAnalysisService {
     const details = new Map<string, AmenityDetail>();
     if (dataset) {
       const listed = new Set(dataset.map((a) => a.type));
-      for (const t of CORE_AMENITIES) details.set(t, { type: t, status: listed.has(t) ? "available" : "absent", source: "dataset" });
+      // Jenis yang tidak dapat dinyatakan sumber data (mis. ramp pada Commute Data API) tetap "data tidak tersedia".
+      const coverage = this.commute.amenityCoverage;
+      for (const t of CORE_AMENITIES) {
+        if (listed.has(t)) details.set(t, { type: t, status: "available", source: "dataset" });
+        else if (!coverage || coverage.includes(t)) details.set(t, { type: t, status: "absent", source: "dataset" });
+      }
       for (const a of dataset) if (!details.has(a.type)) details.set(a.type, { type: a.type, status: "available", source: "dataset", note: a.description });
     }
     const overrides = snap.facilityOverrides(stationId);

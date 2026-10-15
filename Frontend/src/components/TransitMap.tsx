@@ -1,7 +1,7 @@
 "use client";
 
 import { useEffect, useRef, useState } from "react";
-import { MAP_ASSET, STOP_POSITIONS, legGeometry } from "@/lib/map-assets";
+import { MAP_ASSET, legGeometry, ridePath } from "@/lib/map-assets";
 import { useNetwork } from "@/lib/network";
 import type { Route } from "@/lib/types";
 import { AccessBadge } from "./AccessBadge";
@@ -27,7 +27,7 @@ const TOUCH_PX = 22; // radius area sentuh di layar (diameter 44 px)
  * memakai indeks posisi (kode stasiun -> x, y). Peta hanya untuk memilih dan menyorot, bukan menghitung rute.
  */
 export function TransitMap({ originId, destinationId, route, onSetOrigin, onSetDestination, onShowDetail }: Props) {
-  const { stations: STATIONS, hubs: HUBS, lineById, assess } = useNetwork();
+  const { stations: STATIONS, hubs: HUBS, lineById, assess, positionOf } = useNetwork();
   const boxRef = useRef<HTMLDivElement>(null);
   const [size, setSize] = useState({ w: 800, h: 520 });
   const [view, setView] = useState<View>({ x: MAP_ASSET.initialView.x, y: MAP_ASSET.initialView.y, w: MAP_ASSET.initialView.width });
@@ -84,7 +84,7 @@ export function TransitMap({ originId, destinationId, route, onSetOrigin, onSetD
 
   const fitRoute = () => {
     if (!route) return;
-    const pts = route.legs.flatMap((l) => l.stops).map((s) => STOP_POSITIONS[s]).filter(Boolean);
+    const pts = route.legs.flatMap((l) => l.stops).map((s) => positionOf(s)).filter((p) => !!p);
     const xs = pts.map((p) => p.x);
     const ys = pts.map((p) => p.y);
     const pad = 220;
@@ -173,13 +173,15 @@ export function TransitMap({ originId, destinationId, route, onSetOrigin, onSetD
           {route && <rect x={0} y={0} width={MAP_ASSET.width} height={MAP_ASSET.height} fill="#ffffff" opacity={0.6} />}
 
           {route?.legs.map((leg, i) => {
-            const pts =
-              leg.type === "RIDE"
-                ? legGeometry(leg.lineId!, leg.stops[0], leg.stops[leg.stops.length - 1])
-                : leg.stops.map((s) => STOP_POSITIONS[s]).filter(Boolean).map((p) => [p.x, p.y] as [number, number]);
+            const placed = leg.stops.map((s) => positionOf(s)).filter((p) => !!p);
+            const color = leg.type === "RIDE" ? (lineById(leg.lineId!)?.color ?? "#555555") : "#111111";
+            // Ruas naik mengikuti jalur di peta antar pemberhentian; jalur yang tak terbaca memakai bentuk lini
+            // kurasi, lalu garis lurus. Perpindahan tetap garis lurus.
+            const shaped = leg.type === "RIDE" ? legGeometry(leg.lineId!, leg.stops[0], leg.stops[leg.stops.length - 1]) : [];
+            const traced = leg.type === "RIDE" ? ridePath(placed, color) : placed.map((p) => [p.x, p.y] as [number, number]);
+            const pts = leg.type === "RIDE" && traced.length <= placed.length && shaped.length >= 2 ? shaped : traced;
             if (pts.length < 2 || (leg.type === "TRANSFER" && leg.stops[0] === leg.stops[1])) return null;
             const d = pts.map((p) => p.join(",")).join(" ");
-            const color = leg.type === "RIDE" ? (lineById(leg.lineId!)?.color ?? "#555555") : "#111111";
             return (
               <g key={i}>
                 <polyline points={d} fill="none" stroke="#ffffff" strokeWidth={px(leg.type === "RIDE" ? 16 : 10)} strokeLinecap="round" strokeLinejoin="round" />
@@ -199,10 +201,12 @@ export function TransitMap({ originId, destinationId, route, onSetOrigin, onSetD
           {/* Area hub MVP */}
           {!route &&
             HUBS.map((hub) => {
-              const pts = hub.memberIds.map((id) => STOP_POSITIONS[id]).filter(Boolean);
+              const pts = hub.memberIds.map((id) => positionOf(id)).filter((p) => !!p);
               if (!pts.length) return null;
               const xs = pts.map((p) => p.x);
               const ys = pts.map((p) => p.y);
+              // Hub yang anggotanya berjauhan di peta skematik tidak diberi bingkai.
+              if (Math.max(...xs) - Math.min(...xs) > 700 || Math.max(...ys) - Math.min(...ys) > 700) return null;
               return (
                 <rect
                   key={hub.id}
@@ -221,12 +225,13 @@ export function TransitMap({ originId, destinationId, route, onSetOrigin, onSetD
 
           {/* Stasiun dalam cakupan data: bisa ditekan */}
           {STATIONS.map((s) => {
-            const p = STOP_POSITIONS[s.id];
+            const p = positionOf(s.id);
             if (!p) return null;
             const onRoute = routeStops.has(s.id);
             const isOrigin = s.id === originId;
             const isDest = s.id === destinationId;
             const faded = route && !onRoute;
+            const bus = s.lineIds.some((l) => lineById(l)?.mode === "BUS");
             return (
               <g
                 key={s.id}
@@ -256,7 +261,7 @@ export function TransitMap({ originId, destinationId, route, onSetOrigin, onSetD
                     </text>
                   </>
                 ) : (
-                  <circle cx={p.x} cy={p.y} r={px(13)} fill="none" stroke="var(--accent)" strokeWidth={px(3)} opacity={0.85} />
+                  <circle cx={p.x} cy={p.y} r={px(bus ? 9 : 13)} fill="none" stroke="var(--accent)" strokeWidth={px(bus ? 2 : 3)} opacity={0.85} />
                 )}
               </g>
             );
@@ -267,7 +272,7 @@ export function TransitMap({ originId, destinationId, route, onSetOrigin, onSetD
             { id: originId, label: "A", fill: "#0a58ca" },
             { id: destinationId, label: "B", fill: "#b3261e" },
           ].map(({ id, label, fill }) => {
-            const p = id ? STOP_POSITIONS[id] : null;
+            const p = id ? positionOf(id) : null;
             if (!p) return null;
             return (
               <g key={label} transform={`translate(${p.x} ${p.y}) scale(${1 / scale})`} pointerEvents="none">
@@ -354,7 +359,7 @@ export function TransitMap({ originId, destinationId, route, onSetOrigin, onSetD
 
       <div className="flex flex-wrap items-center gap-x-4 gap-y-1 border-t border-[var(--border)] bg-[var(--surface)] px-3 py-2 text-xs">
         <span className="flex items-center gap-1">
-          <span aria-hidden className="inline-block h-3 w-3 rounded-full border-2 border-[var(--accent)]" /> stasiun dalam cakupan NTD
+          <span aria-hidden className="inline-block h-3 w-3 rounded-full border-2 border-[var(--accent)]" /> stasiun/halte dalam cakupan NTD
         </span>
         <span className="flex items-center gap-1">
           <span aria-hidden className="font-bold text-[var(--ok)]">✔</span> memadai

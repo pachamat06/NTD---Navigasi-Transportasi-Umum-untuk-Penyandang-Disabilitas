@@ -14,6 +14,8 @@ export interface Config {
     baseUrl: string;
     apiKey?: string;
     timeoutMs: number;
+    operators: string[];
+    regions: string[];
   };
   llm: {
     provider: "none" | "claude" | "gpt";
@@ -57,6 +59,8 @@ export function loadConfig(env: NodeJS.ProcessEnv = process.env): Config {
       baseUrl: env.COMMUTE_API_BASE_URL ?? "https://api.commute.shiorilabs.id",
       apiKey: env.COMMUTE_API_KEY || undefined,
       timeoutMs: Number(env.COMMUTE_TIMEOUT_MS) || 8000,
+      operators: list(env.COMMUTE_OPERATORS, []),
+      regions: list(env.COMMUTE_REGIONS, []),
     },
     llm: {
       provider,

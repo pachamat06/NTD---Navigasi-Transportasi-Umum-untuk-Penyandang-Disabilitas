@@ -255,11 +255,16 @@ export function adminRoutes(s: Services): Router {
       s.store.content.pending(),
       s.store.admins.count(),
     ]);
+    // Stasiun pada tabel slug (station-index.ts) yang tidak dikenali pada sumber data: perlu dicek tim.
+    const mapping = await s.commute
+      .index(newContext())
+      .then((idx) => ({ unmatched: idx.unmatched }))
+      .catch((e: Error) => ({ unmatched: [] as string[], error: e.message }));
     ok(res, {
       version: process.env.npm_package_version ?? "1.0.0",
       startedAt: s.startedAt,
       store: { kind: s.store.kind, ok: dbOk },
-      commute: { source: s.commute.sourceName, baseUrl: s.config.commute.source === "http" ? s.config.commute.baseUrl : null, ...upstream },
+      commute: { source: s.commute.sourceName, baseUrl: s.config.commute.source === "http" ? s.config.commute.baseUrl : null, ...upstream, mapping },
       llm: s.llm ? { provider: s.llm.name, model: s.llm.model } : { provider: "none" },
       cache,
       pendingChanges: pending.length,

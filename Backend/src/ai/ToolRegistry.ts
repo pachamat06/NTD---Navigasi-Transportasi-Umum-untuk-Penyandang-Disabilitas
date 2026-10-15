@@ -5,7 +5,7 @@ import type { RequestContext } from "../context";
 import type { AlternativeService } from "../domain/AlternativeService";
 import type { ContentSnapshot } from "../domain/content";
 import type { FacilityAnalysisService } from "../domain/FacilityAnalysisService";
-import type { Alternative, Hub, Route, Station, StationAssessment } from "../domain/models";
+import type { Alternative, Hub, Mode, Route, Station, StationAssessment } from "../domain/models";
 import type { RoutePlannerService } from "../domain/RoutePlannerService";
 import type { StationService } from "../domain/StationService";
 
@@ -17,7 +17,7 @@ export interface ToolSpec {
 
 interface Tools {
   cari_stasiun: { in: { query: string }; out: Station[] };
-  ambil_rute: { in: { fromId: string; toId: string; viaId?: string; at?: string }; out: Route | null };
+  ambil_rute: { in: { fromId: string; toId: string; viaId?: string; at?: string; avoidModes?: Mode[] }; out: Route | null };
   cek_fasilitas: { in: { stationId: string }; out: Awaited<ReturnType<FacilityAnalysisService["assess"]>> };
   cari_alternatif: {
     in: { originId: string; destinationId: string; route: Route; assessments: Map<string, StationAssessment>; hubs: Hub[]; avoid?: string[]; at?: string };
@@ -40,7 +40,15 @@ export class ToolRegistry {
       {
         name: "ambil_rute",
         description: "Mengambil rute dari dataset antara dua stasiun beserta moda, jarak, waktu tempuh, dan tarif tiap ruas.",
-        input_schema: obj({ fromId: { type: "string" }, toId: { type: "string" }, viaId: { type: "string" } }, ["fromId", "toId"]),
+        input_schema: obj(
+          {
+            fromId: { type: "string" },
+            toId: { type: "string" },
+            viaId: { type: "string" },
+            avoidModes: { type: "array", items: { type: "string", enum: ["RAIL", "SUBWAY", "TRAM", "BUS", "MONORAIL"] } },
+          },
+          ["fromId", "toId"],
+        ),
       },
       {
         name: "cek_fasilitas",
@@ -62,7 +70,12 @@ export class ToolRegistry {
         return (await d.stations.search((input as Tools["cari_stasiun"]["in"]).query, ctx)) as Tools[N]["out"];
       case "ambil_rute": {
         const i = input as Tools["ambil_rute"]["in"];
-        return (await (i.viaId ? d.planner.getRouteVia(i.fromId, i.viaId, i.toId, ctx, i.at) : d.planner.getRoute(i.fromId, i.toId, ctx, i.at))) as Tools[N]["out"];
+        const route = i.viaId
+          ? d.planner.getRouteVia(i.fromId, i.viaId, i.toId, ctx, i.at)
+          : i.avoidModes?.length
+            ? d.planner.getRouteAvoiding(i.fromId, i.toId, i.avoidModes, ctx, i.at)
+            : d.planner.getRoute(i.fromId, i.toId, ctx, i.at);
+        return (await route) as Tools[N]["out"];
       }
       case "cek_fasilitas":
         return (await d.facilities.assess((input as Tools["cek_fasilitas"]["in"]).stationId, ctx, snap)) as Tools[N]["out"];

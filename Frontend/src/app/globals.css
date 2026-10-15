@@ -102,6 +102,15 @@ body {
   .btn-link {
     @apply min-h-11 px-1 font-semibold text-[var(--accent)] underline-offset-2 hover:underline;
   }
+  .mode-chip {
+    @apply inline-flex min-h-11 cursor-pointer items-center gap-1 rounded-full border-2 border-[var(--border)] px-3 font-semibold text-[var(--muted)] line-through;
+  }
+  .mode-chip-on {
+    @apply border-[var(--accent)] text-[var(--accent)] no-underline;
+  }
+  .mode-chip:has(:focus-visible) {
+    @apply outline-2 outline-offset-2 outline-[var(--accent)];
+  }
   .icon-btn {
     @apply grid h-11 min-w-11 place-items-center rounded-lg px-2 font-bold hover:bg-[var(--surface-2)];
   }

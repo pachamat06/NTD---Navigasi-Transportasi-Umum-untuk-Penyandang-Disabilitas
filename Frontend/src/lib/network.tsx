@@ -4,6 +4,7 @@
 
 import { createContext, useCallback, useContext, useEffect, useMemo, useState, type ReactNode } from "react";
 import { fetchMeta, fetchNetwork } from "./api";
+import { buildPositions } from "./map-assets";
 import type { AmenityType, Hub, Line, Meta, NetworkStation, StationAssessment } from "./types";
 
 export const AMENITY_LABEL: Record<AmenityType, string> = {
@@ -26,6 +27,8 @@ export interface NetworkValue {
   assess: (id: string) => StationAssessment;
   searchStations: (query: string) => NetworkStation[];
   amenityLabel: (type: string) => string;
+  /** Posisi pada Aset Peta Transit; undefined = tidak ada di peta. */
+  positionOf: (id: string) => { x: number; y: number } | undefined;
 }
 
 type LoadState = { kind: "loading" } | { kind: "error"; message: string } | { kind: "ready"; value: NetworkValue };
@@ -44,6 +47,7 @@ function build(stations: NetworkStation[], lines: Line[], hubs: Hub[], meta: Met
   const st = new Map(stations.map((s) => [s.id, s]));
   const ln = new Map(lines.map((l) => [l.id, l]));
   const hb = new Map(hubs.map((h) => [h.id, h]));
+  const pos = buildPositions(stations);
   return {
     stations,
     lines,
@@ -69,6 +73,7 @@ function build(stations: NetworkStation[], lines: Line[], hubs: Hub[], meta: Met
         .map((x) => x.s);
     },
     amenityLabel: (type) => meta?.amenityLabels[type] ?? AMENITY_LABEL[type as AmenityType] ?? type,
+    positionOf: (id) => pos.get(id),
   };
 }
 

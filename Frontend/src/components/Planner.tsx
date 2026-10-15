@@ -3,7 +3,7 @@
 import { useEffect, useRef, useState } from "react";
 import { fetchNotices, planJourney } from "@/lib/api";
 import { useNetwork } from "@/lib/network";
-import type { Alternative, JourneyPlan, Notice } from "@/lib/types";
+import type { Alternative, JourneyPlan, Mode, Notice } from "@/lib/types";
 import { AboutDialog, SettingsDialog, StationDetail, type DisplaySettings } from "./Dialogs";
 import { NoticeBanner, ResultPanel } from "./ResultPanel";
 import { StationCombobox } from "./StationCombobox";
@@ -37,8 +37,14 @@ function loadSettings(): DisplaySettings {
   }
 }
 
+const MODE_ORDER: Mode[] = ["RAIL", "SUBWAY", "TRAM", "BUS", "MONORAIL"];
+const MODE_LABEL: Record<Mode, string> = { RAIL: "KRL", SUBWAY: "MRT", TRAM: "LRT", BUS: "TransJakarta", MONORAIL: "Kalayang" };
+
 export function Planner() {
-  const { stationById, lineById, hubById, meta } = useNetwork();
+  const { stationById, lineById, hubById, meta, lines } = useNetwork();
+  // Moda yang ada di jaringan, urut tetap agar pilihan tidak berpindah tempat.
+  const modes = MODE_ORDER.filter((m) => lines.some((l) => l.mode === m));
+  const [avoidModes, setAvoidModes] = useState<Mode[]>([]);
   const noticeTarget = (n: Notice) =>
     n.scope === "station" ? stationById(n.targetId ?? "")?.name : n.scope === "line" ? lineById(n.targetId ?? "")?.name : n.scope === "hub" ? `Hub ${hubById(n.targetId ?? "")?.name ?? n.targetId}` : undefined;
   const [origin, setOrigin] = useState<string | null>(null);
@@ -88,7 +94,7 @@ export function Planner() {
     if (!origin || !destination) return;
     const id = ++runId.current;
     // Permintaan ke Backend berjalan sejak awal; langkah di layar hanya penanda kemajuan.
-    const request = planJourney(origin, destination, { avoid });
+    const request = planJourney(origin, destination, { avoid, avoidModes });
     let done = false;
     request.finally(() => (done = true));
     for (let step = 0; step < STEPS.length - 1 && !done; step++) {
@@ -172,6 +178,33 @@ export function Planner() {
                 <p className="text-sm text-[var(--bad)]" role="alert">
                   Asal dan tujuan tidak boleh sama.
                 </p>
+              )}
+              {modes.length > 1 && (
+                <fieldset className="mt-2">
+                  <legend className="mb-1 font-semibold">Moda yang dipakai</legend>
+                  <div className="flex flex-wrap gap-2">
+                    {modes.map((m) => {
+                      const on = !avoidModes.includes(m);
+                      return (
+                        <label key={m} className={`mode-chip ${on ? "mode-chip-on" : ""}`}>
+                          <input
+                            type="checkbox"
+                            className="sr-only"
+                            checked={on}
+                            onChange={() => {
+                              setAvoidModes((cur) => (cur.includes(m) ? cur.filter((x) => x !== m) : [...cur, m]));
+                              if (phase.kind !== "idle") reset();
+                            }}
+                          />
+                          <span aria-hidden>{on ? "✓" : "✕"}</span> {MODE_LABEL[m]}
+                        </label>
+                      );
+                    })}
+                  </div>
+                  {avoidModes.length > 0 && (
+                    <p className="mt-1 text-sm text-[var(--muted)]">Rute akan menghindari {avoidModes.map((m) => MODE_LABEL[m]).join(", ")} bila memungkinkan.</p>
+                  )}
+                </fieldset>
               )}
               <button type="submit" className="btn btn-primary mt-2 min-h-14 text-lg" disabled={!canSearch || phase.kind === "loading"}>
                 Cari Rute

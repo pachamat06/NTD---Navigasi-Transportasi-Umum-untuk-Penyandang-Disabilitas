@@ -5,13 +5,15 @@
 
 import type { RequestContext } from "../context";
 import type { ContentService, ContentSnapshot } from "../domain/content";
-import { routeStationIds, transferStationIds } from "../domain/RoutePlannerService";
-import type { Alternative, JourneyPlan, Line, Notification, Route, Station, StationAssessment, StationDetail } from "../domain/models";
+import { routeStationIds, transferStationIds, usesModes } from "../domain/RoutePlannerService";
+import type { Alternative, JourneyPlan, Line, Mode, Notification, Route, Station, StationAssessment, StationDetail } from "../domain/models";
 import type { StationService } from "../domain/StationService";
 import { AppError } from "../errors";
 import { ATTRIBUTION, factsForPrompt, type GroundingGuard, type PlanFacts } from "./GroundingGuard";
 import type { LlmClient } from "./llm/LlmClient";
 import type { ToolRegistry } from "./ToolRegistry";
+
+export const MODE_LABEL: Record<Mode, string> = { RAIL: "kereta (KRL)", SUBWAY: "MRT", TRAM: "LRT", BUS: "bus TransJakarta", MONORAIL: "kereta layang bandara" };
 
 export interface PlanInput {
   originId: string;
@@ -22,6 +24,8 @@ export interface PlanInput {
   avoid?: string[];
   /** Waktu berangkat (ISO), diteruskan ke /fares sebagai parameter `at`. */
   at?: string;
+  /** Moda yang tidak ingin dipakai pengguna (mis. BUS). */
+  avoidModes?: Mode[];
 }
 
 export interface AgentLogger {
@@ -62,11 +66,18 @@ export class NavigationAgent {
     const warnings: string[] = [];
 
     // 1. Rute dari dataset.
-    let route = await this.tools.call("ambil_rute", { fromId: originId, toId: destinationId, viaId: input.viaStationId, at: input.at }, ctx, snap);
+    const avoidModes = input.avoidModes ?? [];
+    // Alternatif transfer juga tidak boleh memakai moda yang dihindari.
+    const withoutModes = (alts: Alternative[]) => alts.filter((a) => !a.route || !usesModes(a.route, avoidModes));
+    let route = await this.tools.call("ambil_rute", { fromId: originId, toId: destinationId, viaId: input.viaStationId, at: input.at, avoidModes }, ctx, snap);
     if (!route) {
       throw new AppError("NOT_FOUND", `Rute antara ${byId.get(originId)!.name} dan ${byId.get(destinationId)!.name} tidak ditemukan dalam data saat ini.`);
     }
     const hubs = await this.stations.hubs(ctx);
+
+    if (route && usesModes(route, avoidModes)) {
+      warnings.push(`Rute tanpa ${avoidModes.map((m) => MODE_LABEL[m]).join(", ")} tidak ditemukan; ditampilkan rute yang tetap memakainya.`);
+    }
 
     // 2. Pemeriksaan fasilitas setiap stasiun pada rute.
     const assessed = new Map<string, StationAssessment>();
@@ -81,7 +92,7 @@ export class NavigationAgent {
 
     // Permintaan GUI "hindari stasiun X": ganti rute bila titik transfernya termasuk yang dihindari.
     if (avoid.length && transferStationIds(route).some((t) => avoid.includes(t))) {
-      const alts = await this.tools.call("cari_alternatif", { originId, destinationId, route, assessments: assessmentMap(), hubs, avoid, at: input.at }, ctx, snap);
+      const alts = withoutModes(await this.tools.call("cari_alternatif", { originId, destinationId, route, assessments: assessmentMap(), hubs, avoid, at: input.at }, ctx, snap));
       const pick = alts.find((a) => a.route);
       if (pick?.route) {
         route = pick.route;
@@ -95,7 +106,7 @@ export class NavigationAgent {
     let alternatives: Alternative[] = [];
     const weak = transferStationIds(route).filter((id) => id !== originId && id !== destinationId && !assessed.get(id)?.adequate);
     if (weak.length) {
-      alternatives = await this.tools.call("cari_alternatif", { originId, destinationId, route, assessments: assessmentMap(), hubs, avoid, at: input.at }, ctx, snap);
+      alternatives = withoutModes(await this.tools.call("cari_alternatif", { originId, destinationId, route, assessments: assessmentMap(), hubs, avoid, at: input.at }, ctx, snap));
       if (!alternatives.length) warnings.push("Tidak ada alternatif transfer yang lebih aksesibel di hub ini.");
     }
 
@@ -104,6 +115,10 @@ export class NavigationAgent {
     // Stasiun pada rute alternatif ikut dinilai dan dirinci agar GUI dapat menampilkannya.
     const altIds = alternatives.flatMap((a) => (a.route ? routeStationIds(a.route) : [a.viaStationId]));
     await assessIds(altIds);
+    // Pemberhentian di luar daftar stasiun (mis. halte operator yang tidak diaktifkan) memakai nama dari data rute.
+    for (const r of [route, ...alternatives.flatMap((a) => (a.route ? [a.route] : []))])
+      for (const id of routeStationIds(r))
+        if (!byId.has(id)) byId.set(id, { id, name: r.stopNames?.[id] ?? id, operator: "", lineIds: [], codes: [] });
     const lines = await this.stations.lines(ctx);
     const details = new Map<string, StationDetail>();
     for (const id of new Set([...routeIds, ...altIds])) {
@@ -117,6 +132,7 @@ export class NavigationAgent {
     const notices = snap.notices({ stationIds: routeIds, lineIds, hubIds });
 
     if (!route.timeComplete) warnings.push("Sebagian ruas tidak memiliki data waktu tempuh, sehingga total waktu belum lengkap.");
+    if (route.fareComplete === false) warnings.push("Tarif sebagian ruas tidak tersedia di dataset, sehingga total tarif belum lengkap.");
     const noData = assessments.filter((a) => !a.dataAvailable).map((a) => byId.get(a.stationId)!.name);
     if (noData.length) warnings.push(`Data fasilitas belum tersedia untuk: ${noData.join(", ")}.`);
     for (const n of notices) if (n.severity !== "info") warnings.push(noticeText(n));

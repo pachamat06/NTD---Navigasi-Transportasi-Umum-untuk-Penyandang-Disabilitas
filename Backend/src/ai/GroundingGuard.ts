@@ -176,13 +176,13 @@ export function factsForPrompt(f: PlanFacts): unknown {
     totalMenit: f.route.timeComplete ? f.route.totalMinutes : null,
     jumlahTransfer: f.route.transfers,
     stasiun: f.assessments.map((a) => {
-      const s = st(a.stationId)!;
+      const s = st(a.stationId);
       return {
-        nama: s.name,
+        nama: s?.name ?? a.stationId,
         skor: a.score,
         memadai: a.adequate,
         dataTersedia: a.dataAvailable,
-        fasilitas: Object.fromEntries(CORE_AMENITIES.map((t) => [AMENITY_LABEL[t], s.amenities[t]])),
+        fasilitas: Object.fromEntries(CORE_AMENITIES.map((t) => [AMENITY_LABEL[t], s?.amenities[t] ?? "unknown"])),
         catatan: a.notes,
       };
     }),

@@ -111,6 +111,8 @@ export interface StationDetailData extends NetworkStation {
 export interface RouteLeg {
   type: "RIDE" | "TRANSFER";
   lineId?: string;
+  /** Moda ruas naik (dari Backend), juga untuk lini yang tidak ada di daftar lini. */
+  mode?: Mode;
   stops: string[];
   distanceM: number;
   minutes: number | null;
@@ -124,6 +126,8 @@ export interface Route {
   timeComplete: boolean;
   totalFare: number;
   transfers: number;
+  /** Nama pemberhentian dari data rute, untuk halte/stasiun yang tidak ada di daftar stasiun. */
+  stopNames?: Record<string, string>;
 }
 
 export interface Alternative {
