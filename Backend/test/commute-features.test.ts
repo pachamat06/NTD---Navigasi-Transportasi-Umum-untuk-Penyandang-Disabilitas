@@ -1,13 +1,16 @@
 // Fitur dari Commute Data API: jarak/petunjuk transfer, `at` pada /fares, frekuensi (headway) bila jadwal
 // tidak ada, lin paralel (bus gabungan), cache single-flight + stale-while-revalidate, dan penanganan 429.
 
-import { withTransferAccess, accessWarnings } from "../src/ai/NavigationAgent";
+import { accessWarnings, crossingWarnings, gapWarnings, gatePlatforms, withPlatforms, withTransferAccess } from "../src/ai/NavigationAgent";
 import { newContext } from "../src/context";
 import { CommuteApiClient } from "../src/data/commute/CommuteApiClient";
 import { FixtureCommuteSource } from "../src/data/commute/FixtureCommuteSource";
-import { HttpCommuteSource, jakartaDayHour } from "../src/data/commute/HttpCommuteSource";
+import { directionLabel, HttpCommuteSource, jakartaDayHour } from "../src/data/commute/HttpCommuteSource";
 import type { CommuteSource, UpFare, UpHeadway, UpHubTransfer, UpLine, UpStation } from "../src/data/commute/types";
-import type { Route, Station, StationDetail } from "../src/domain/models";
+import type { Entrance, Platform, Route, Station, StationAssessment, StationDetail } from "../src/domain/models";
+import type { ContentSnapshot } from "../src/domain/content";
+import { journeyAssessment } from "../src/domain/FacilityAnalysisService";
+import { mergeEntrances, mergePlatforms } from "../src/domain/StationService";
 import { combinedFrequency, frequencyOf, parallelLines, RoutePlannerService } from "../src/domain/RoutePlannerService";
 import { UpstreamError } from "../src/errors";
 import { createMemoryStore } from "../src/store/memory";
@@ -262,5 +265,114 @@ describe("Fasilitas yang dibutuhkan saat pindah", () => {
     const warn = accessWarnings(out, byId);
     expect(warn).toHaveLength(2);
     expect(warn[0]).toContain("Stasiun B");
+  });
+});
+
+describe("Peron dan gate: dataset lalu isian admin", () => {
+  it("dataset: nomor peron dan arah dari /timetable/grouped, pintu dari /exits", async () => {
+    const urls: string[] = [];
+    const ok = (data: unknown) => new Response(JSON.stringify({ status: 200, data }), { status: 200 });
+    const fetchImpl = (async (u: string | URL) => {
+      const url = String(u);
+      urls.push(url);
+      if (url.includes("/exits")) return ok([{ id: "KCI-SUD:A", ref: "A", name: "Jl. Kendal", signs: [{ text: "MRT" }], source: "FIELD" }]);
+      // Label arah pada API berupa daftar stasiun yang dilewati.
+      return ok([{ line: "KCI:C", timetable: [{ key: "a", label: ["Manggarai", "Jatinegara", "Cikarang"], platformCode: "2" }, { key: "b", label: ["Tanah Abang"], platformCode: null }] }]);
+    }) as unknown as typeof fetch;
+    const src = new HttpCommuteSource({ baseUrl: "https://api.test", timeoutMs: 1000, fetchImpl });
+    expect(await src.getPlatforms("KCI", "SUD")).toEqual([{ operator: "KCI", line: "C", platformCode: "2", direction: "Arah Manggarai – Jatinegara – Cikarang" }]);
+    expect(directionLabel("Arah Manggarai")).toBe("Arah Manggarai");
+    expect(directionLabel([])).toBeUndefined();
+    expect(urls[0]).toBe("https://api.test/stations/KCI/SUD/timetable/grouped?compact=1&from=04:00&to=05:00");
+    expect(await src.getExits("KCI", "SUD")).toEqual([{ ref: "A", name: "Jl. Kendal", signs: ["MRT"], source: "FIELD" }]);
+
+    const client = new CommuteApiClient(new FixtureCommuteSource(), createMemoryStore().cache);
+    const platforms = await client.getPlatforms("sudirman", newContext());
+    expect(platforms.map((p) => [p.code, p.serves[0].lineId, p.serves[0].direction])).toEqual([
+      ["1", "krl-cikarang", "Arah Tanah Abang"],
+      ["2", "krl-cikarang", "Arah Manggarai"],
+    ]);
+  });
+
+  it("isian admin melengkapi peron dataset dengan nomor yang sama; pintu dataset yang sudah dilengkapi tidak ganda", () => {
+    const ds: Platform[] = [{ code: "1", serves: [{ lineId: "l", direction: "Arah A" }], amenities: {}, source: "dataset" }];
+    const ntd: Platform[] = [
+      { code: "1", type: "side", serves: [], amenities: { lift: "absent", eskalator: "available" }, escalators: [{ count: 2, direction: "naik" }], gap: { level: "tangga", steps: 2 }, source: "ntd" },
+      { code: "2", type: "side", serves: [{ lineId: "l", direction: "Arah B" }], amenities: { lift: "available" }, source: "ntd" },
+    ];
+    const merged = mergePlatforms(ds, ntd);
+    expect(merged.map((p) => p.code)).toEqual(["1", "2"]);
+    expect(merged[0]).toMatchObject({ type: "side", serves: [{ lineId: "l", direction: "Arah A" }], escalators: [{ count: 2, direction: "naik" }], source: "ntd" });
+
+    const exit = (ref: string): Entrance => ({ id: `KCI-SUD:${ref}`, stationId: "s", name: `Pintu ${ref}`, accessible: false, features: [], signs: ["MRT"], source: "dataset" });
+    const team: Entrance = { id: "x", stationId: "s", name: "Pintu A (Kendal)", accessible: true, features: ["lift"], exitRef: "A", lift: { count: 1 }, source: "ntd" };
+    const list = mergeEntrances([exit("A"), exit("B")], [team]);
+    expect(list.map((e) => e.name)).toEqual(["Pintu A (Kendal)", "Pintu B"]);
+    expect(list[0].signs).toEqual(["MRT"]);
+  });
+
+  it("status fasilitas pindah memakai peron naik/turun; celah bertangga diperingatkan", () => {
+    const platforms: Platform[] = [
+      { code: "1", serves: [{ lineId: "krl", direction: "Arah Tanah Abang" }], amenities: { lift: "absent" }, gap: { level: "tangga", steps: 2, boardingAid: true }, source: "ntd" },
+      { code: "2", serves: [{ lineId: "krl", direction: "Arah Manggarai" }], amenities: { lift: "available" }, source: "ntd" },
+    ];
+    const d = { id: "sud", name: "Sudirman", amenities: { lift: "available" }, amenityDetails: [], platforms } as unknown as StationDetail;
+    const route: Route = {
+      legs: [
+        { type: "RIDE", lineId: "mrt", stops: ["x", "dka"], distanceM: 1, minutes: 1, fare: 0 },
+        { type: "TRANSFER", stops: ["dka", "sud"], distanceM: 300, minutes: 5, fare: 0 },
+        { type: "RIDE", lineId: "krl", headsign: "Tanah Abang", stops: ["sud", "thb"], distanceM: 1, minutes: 1, fare: 0 },
+      ],
+      totalDistanceM: 302, totalMinutes: 7, timeComplete: true, totalFare: 0, transfers: 1,
+    };
+    const details = new Map([["sud", d]]);
+    const withP = withPlatforms(route, details);
+    expect(withP.legs[2].boardAt?.code).toBe("1");
+    const out = withTransferAccess(withP, ["lift"], details);
+    // Stasiun tercatat punya lift, tetapi peron 1 (arah Tanah Abang) tidak.
+    expect(out.legs[1].access).toEqual([
+      { stationId: "dka", need: "lift", status: "unknown" },
+      { stationId: "sud", need: "lift", status: "absent", platform: "1" },
+    ]);
+    const byId = new Map<string, Station>([["sud", { id: "sud", name: "Sudirman" } as Station]]);
+    expect(accessWarnings(out, byId).some((w) => w.includes("Sudirman (peron 1)"))).toBe(true);
+    expect(gapWarnings(withP, byId)).toEqual(["Naik di Sudirman (peron 1): ada 2 anak tangga antara peron dan kendaraan. Petugas dapat menyediakan pelat/ramp portabel."]);
+  });
+
+  it("skor perjalanan: gate langsung/sebidang ke peron membuat lift dan eskalator tidak dihitung; JPO menghitungnya", () => {
+    const W = { lift: 40, eskalator: 20, toilet: 25, ramp: 15 } as const;
+    const snap = { weight: (t: keyof typeof W) => W[t], settings: { scoring: { threshold: 70 } } } as unknown as ContentSnapshot;
+    const platforms: Platform[] = [
+      { code: "1", serves: [{ lineId: "krl", direction: "Arah Tanah Abang" }], amenities: {}, source: "ntd" },
+      { code: "2", serves: [{ lineId: "krl", direction: "Arah Manggarai" }], amenities: { lift: "absent" }, source: "ntd" },
+    ];
+    const gate = (name: string, accessible: boolean, links: Entrance["platformLinks"]): Entrance => ({ id: name, stationId: "s", name, accessible, features: [], platformLinks: links, source: "ntd" });
+    const entrances = [
+      gate("Gate utara", true, [{ platform: "1", via: "langsung" }, { platform: "2", via: "jpo" }]),
+      gate("Gate selatan", false, [{ platform: "2", via: "sebidang" }]),
+    ];
+    // Stasiun kecil: toilet dan ramp ada, lift dan eskalator tidak; skor stasiun 40.
+    const d = { id: "s", name: "Kecil", amenities: { lift: "absent", eskalator: "absent", toilet: "available", ramp: "available" }, amenityDetails: [], platforms, entrances } as unknown as StationDetail;
+    const a: StationAssessment = { stationId: "s", score: 40, adequate: false, dataAvailable: true };
+
+    const p1 = journeyAssessment(a, d, ["1"], snap);
+    expect(p1).toMatchObject({ score: 100, adequate: true, journey: { level: true, via: "langsung", gate: "Gate utara", excluded: ["lift", "eskalator"], stationScore: 40 } });
+    // Peron 2 hanya lewat JPO dari gate yang aksesibel (gate selatan tidak aksesibel): lift dihitung dan tidak ada.
+    const p2 = journeyAssessment(a, d, ["2"], snap);
+    expect(p2).toMatchObject({ score: 40, adequate: false, journey: { level: false, via: "jpo", lift: "absent", excluded: [] } });
+    // Tanpa data hubungan gate dan peron, skor stasiun dipakai apa adanya.
+    expect(journeyAssessment(a, { ...d, entrances: [] }, ["1"], snap)).toBe(a);
+
+    const byId = new Map<string, Station>([["s", { id: "s", name: "Kecil" } as Station]]);
+    expect(crossingWarnings([p2], byId)).toEqual(["Kecil (peron 2) hanya dapat dicapai lewat JPO, dan lift tidak tercatat."]);
+    const viaRail = journeyAssessment(a, { ...d, entrances: [gate("Gate selatan", true, [{ platform: "2", via: "sebidang" }])] }, ["2"], snap);
+    expect(viaRail.score).toBe(100);
+    expect(crossingWarnings([viaRail], byId)[0]).toContain("pelintasan sebidang");
+
+    const route: Route = {
+      legs: [{ type: "RIDE", lineId: "krl", headsign: "Tanah Abang", stops: ["s", "t"], distanceM: 1, minutes: 1, fare: 0 }],
+      totalDistanceM: 1, totalMinutes: 1, timeComplete: true, totalFare: 0, transfers: 0,
+    };
+    expect([...gatePlatforms(withPlatforms(route, new Map([["s", d]])), new Map([["s", d]]))]).toEqual([["s", ["1"]]]);
   });
 });

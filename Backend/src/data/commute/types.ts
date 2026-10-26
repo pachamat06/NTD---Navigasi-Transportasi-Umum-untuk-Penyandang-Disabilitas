@@ -83,6 +83,21 @@ export interface UpHub {
   transfers?: UpHubTransfer[];
 }
 
+/** Nomor peron untuk satu lin dan arah di satu stasiun (/stations/{op}/{code}/timetable/grouped). */
+export interface UpPlatformService {
+  operator: string;
+  line: string;
+  platformCode: string;
+  /** Label arah seperti di papan keberangkatan, mis. "Arah Manggarai". */
+  direction?: string;
+}
+
+/** Pintu keluar/gate stasiun (/stations/{op}/{code}/exits). */
+export interface UpExit extends UpExitRef {
+  /** FIELD = dicek di lokasi, OPERATOR = peta resmi operator, OSM = OpenStreetMap. */
+  source?: string;
+}
+
 /** Frekuensi kendaraan satu lin di satu pemberhentian (/stations/{op}/{code}/headway). BUKAN jadwal. */
 export interface UpHeadway {
   operator: string;
@@ -115,6 +130,8 @@ export interface UpLeg {
   line?: string;
   /** Tujuan akhir kendaraan pada ruas naik. */
   headsign?: string | null;
+  /** Nomor peron naik, bila diketahui dataset. */
+  platformCode?: string | null;
   /** Lin lain yang berhenti di pemberhentian yang sama sepanjang ruas ini (termasuk lin utama, paling depan). */
   serviceLines?: UpServiceLine[];
   stops: UpStopRef[];
@@ -149,6 +166,10 @@ export interface CommuteSource {
   getTransfers?(operator: string, code: string): Promise<UpHubTransfer[] | null>;
   /** Frekuensi lin di satu pemberhentian pada waktu `at` (default sekarang). Tidak diisi = sumber tidak menyediakan. */
   getHeadways?(operator: string, code: string, at?: string): Promise<UpHeadway[] | null>;
+  /** Nomor peron tiap lin dan arah di satu stasiun. Tidak diisi = sumber tidak menyediakan. */
+  getPlatforms?(operator: string, code: string): Promise<UpPlatformService[] | null>;
+  /** Pintu keluar/gate satu stasiun. Tidak diisi = sumber tidak menyediakan. */
+  getExits?(operator: string, code: string): Promise<UpExit[] | null>;
   getOperators(): Promise<UpOperator[]>;
   getLines(): Promise<UpLine[]>;
   getLine(operator: string, lineCode: string): Promise<UpLine | null>;

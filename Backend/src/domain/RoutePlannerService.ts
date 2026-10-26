@@ -161,6 +161,7 @@ export class RoutePlannerService {
         ...(l.lineId ? { lineId: l.lineId } : {}),
         ...(line ? { lineName: line.name, operator: line.operator } : {}),
         ...(l.headsign ? { headsign: l.headsign } : {}),
+        ...(l.platform ? { platform: l.platform } : {}),
         ...(options ? { options } : {}),
         ...(l.type === "RIDE" && mode ? { mode } : {}),
         stops: l.stops,

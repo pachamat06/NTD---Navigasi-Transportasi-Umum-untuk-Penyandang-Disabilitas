@@ -9,7 +9,7 @@
 
 import { UpstreamError } from "../../errors";
 import type { Mode } from "../../domain/models";
-import type { CommuteSource, UpExitRef, UpFare, UpHeadway, UpHub, UpHubTransfer, UpLeg, UpLine, UpOperator, UpStation, UpStopRef } from "./types";
+import type { CommuteSource, UpExit, UpExitRef, UpFare, UpHeadway, UpHub, UpHubTransfer, UpLeg, UpLine, UpOperator, UpPlatformService, UpStation, UpStopRef } from "./types";
 
 export interface HttpCommuteOptions {
   baseUrl: string;
@@ -73,6 +73,17 @@ type ApiTransfer =
   | { dataType: "INTERNAL"; toStation: ApiStationRef; distanceM: number; notes?: string | null; fromExit?: ApiExitRef; toExit?: ApiExitRef }
   | { dataType: "EXTERNAL"; toStation: { name: string; operatorName: string }; distanceM: number; notes?: string | null; fromExit?: ApiExitRef };
 
+/** /timetable/grouped?compact=1: per lin, kelompok arah dengan nomor peron (bila tercatat). */
+interface ApiGroupedTimetable {
+  line: string;
+  /** Label arah berupa daftar stasiun yang dilewati, mis. ["Manggarai", "Jatinegara", "Cikarang"]. */
+  timetable: { key: string; label?: string[] | string | null; platformCode?: string | null }[];
+}
+
+interface ApiExit extends ApiExitRef {
+  source?: string;
+}
+
 interface ApiHeadway {
   line: string;
   headwayS: number | null;
@@ -108,6 +119,7 @@ type ApiFareLeg =
       distanceM: number;
       headsign?: string | null;
       serviceLines?: { line: string; headsign?: string | null }[];
+      platformCode?: string | null;
       departureAt?: string | null;
       arrivalAt?: string | null;
       /** Jam di tiap pemberhentian, sejajar dengan `stops` (bukan objek). */
@@ -249,6 +261,22 @@ export class HttpCommuteSource implements CommuteSource {
     });
   }
 
+  async getPlatforms(operator: string, code: string): Promise<UpPlatformService[] | null> {
+    // Jendela jam sempit agar respons kecil; pengelompokan arah tetap dihitung dari jadwal sehari penuh.
+    const path = `stations/${encodeURIComponent(operator)}/${encodeURIComponent(code)}/timetable/grouped?compact=1&from=04:00&to=05:00`;
+    const rows = await this.get<ApiGroupedTimetable[]>(path);
+    if (!rows) return null;
+    return rows.flatMap((r) => {
+      const [op, line] = r.line.includes(":") ? r.line.split(":", 2) : [operator, r.line];
+      return r.timetable.flatMap((g) => (g.platformCode ? [{ operator: op, line, platformCode: g.platformCode, ...(directionLabel(g.label) ? { direction: directionLabel(g.label) } : {}) }] : []));
+    });
+  }
+
+  async getExits(operator: string, code: string): Promise<UpExit[] | null> {
+    const rows = await this.get<ApiExit[]>(`stations/${encodeURIComponent(operator)}/${encodeURIComponent(code)}/exits`);
+    return rows ? rows.map((e) => ({ ...mapExit(e), ...(e.source ? { source: e.source } : {}) })) : null;
+  }
+
   async getHubs(): Promise<UpHub[]> {
     const hubs = ((await this.get<ApiHub[]>("hubs")) ?? [])
       .map((h) => ({
@@ -373,6 +401,7 @@ function mapFare(f: ApiFare): UpFare {
       operator: lineOp,
       line: lineCode,
       headsign: l.headsign ?? null,
+      ...(l.platformCode ? { platformCode: l.platformCode } : {}),
       ...(serviceLines.length > 1 ? { serviceLines } : {}),
       stops: stops.map((s) => refOfId(s.id)),
       stopNames: stops.map((s) => s.name ?? s.id),
@@ -403,6 +432,14 @@ function mapExit(e: ApiExitRef): UpExitRef {
 }
 
 /** Hari layanan (WD/SAT/SUN) dan jam menurut waktu Jakarta (UTC+7, tanpa DST). */
+/** Label arah dari /timetable/grouped (daftar stasiun yang dilewati) menjadi teks, mis. "Arah Manggarai – Jatinegara – Cikarang". */
+export function directionLabel(label: unknown): string | undefined {
+  const parts = (Array.isArray(label) ? label : [label]).filter((x): x is string => typeof x === "string" && x.trim() !== "").map((x) => x.trim());
+  if (!parts.length) return undefined;
+  const text = /^arah\b/i.test(parts[0]) ? parts.join(" – ") : `Arah ${parts.join(" – ")}`;
+  return text.length > 120 ? `${text.slice(0, 119)}…` : text;
+}
+
 export function jakartaDayHour(d: Date): { day: "WD" | "SAT" | "SUN"; hour: number } {
   const local = new Date(d.getTime() + 7 * 3600_000);
   const dow = local.getUTCDay();

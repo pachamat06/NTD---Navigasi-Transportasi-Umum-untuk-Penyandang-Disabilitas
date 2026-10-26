@@ -76,14 +76,23 @@ export class GroundingGuard {
           // Nomor koridor/lin (mis. "13E", "4D") boleh disebut.
           for (const n of `${o.lineId} ${o.lineName ?? ""}`.match(/\d+/g) ?? []) nums.add(n);
         }
-        for (const n of `${l.lineId ?? ""} ${l.lineName ?? ""} ${l.notes ?? ""}`.match(/\d+/g) ?? []) nums.add(n);
+        for (const n of `${l.lineId ?? ""} ${l.lineName ?? ""} ${l.notes ?? ""} ${l.platform ?? ""} ${l.boardAt?.code ?? ""}`.match(/\d+/g) ?? []) nums.add(n);
+        const g = l.boardAt?.gap;
+        for (const n of [g?.steps, g?.horizontalCm, g?.verticalCm, ...(l.boardAt?.escalators ?? []).map((e) => e.count), l.boardAt?.lift?.count]) add(n);
+        for (const a of l.access ?? []) for (const n of (a.platform ?? "").match(/\d+/g) ?? []) nums.add(n);
         add(Number((l.distanceM / 1000).toFixed(1)));
         nums.add((l.distanceM / 1000).toFixed(1).replace(".", ","));
       }
     };
     addRoute(f.route);
     for (const a of f.alternatives) if (a.route) addRoute(a.route);
-    for (const a of [...f.assessments, ...f.alternatives.map((x) => x.assessment)]) add(a.score);
+    for (const a of [...f.assessments, ...f.alternatives.map((x) => x.assessment)]) {
+      add(a.score);
+      if (a.journey) {
+        add(a.journey.stationScore);
+        for (const p of a.journey.platforms) nums.add(p.replace(/\D/g, ""));
+      }
+    }
     for (const s of f.stations.values()) for (const c of s.codes) nums.add(c.replace(/\D/g, ""));
     return nums;
   }
@@ -191,7 +200,20 @@ export function factsForPrompt(f: PlanFacts): unknown {
       ...(l.options && l.options.length > 1 ? { pilihanLin: l.options.map((o) => o.lineName ?? o.lineId) } : {}),
       ...(l.frequency ? { frekuensiMenit: l.frequency.headwayMinutes } : {}),
       ...(l.notes ? { petunjuk: l.notes } : {}),
-      ...(l.access?.length ? { aksesPindah: l.access.map((a) => ({ stasiun: st(a.stationId)?.name ?? a.stationId, fasilitas: AMENITY_LABEL[a.need], status: a.status })) } : {}),
+      ...(l.boardAt
+        ? {
+            peronNaik: {
+              nomor: l.boardAt.code,
+              jenis: l.boardAt.type,
+              celahDenganKendaraan: l.boardAt.gap,
+              eskalator: l.boardAt.escalators,
+              lift: l.boardAt.lift,
+            },
+          }
+        : l.platform
+          ? { peronNaik: { nomor: l.platform } }
+          : {}),
+      ...(l.access?.length ? { aksesPindah: l.access.map((a) => ({ stasiun: st(a.stationId)?.name ?? a.stationId, ...(a.platform ? { peron: a.platform } : {}), fasilitas: AMENITY_LABEL[a.need], status: a.status })) } : {}),
     })),
     totalTarif: f.route.totalFare,
     totalMenit: f.route.timeComplete ? f.route.totalMinutes : null,
@@ -205,6 +227,7 @@ export function factsForPrompt(f: PlanFacts): unknown {
         dataTersedia: a.dataAvailable,
         fasilitas: Object.fromEntries(CORE_AMENITIES.map((t) => [AMENITY_LABEL[t], s?.amenities[t] ?? "unknown"])),
         catatan: a.notes,
+        ...(a.journey ? { jalurGatePeron: { peron: a.journey.platforms, lewat: a.journey.via, tanpaPindahLantai: a.journey.level, tidakDihitung: a.journey.excluded.map((t) => AMENITY_LABEL[t]) } } : {}),
       };
     }),
     alternatif: f.alternatives.map((a) => ({ melalui: st(a.viaStationId)?.name, menggantikan: st(a.replacesStationId)?.name, skor: a.assessment.score })),

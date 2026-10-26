@@ -6,10 +6,13 @@ import type { CommuteApiClient } from "../data/commute/CommuteApiClient";
 import type { ContentSnapshot } from "./content";
 import {
   CORE_AMENITIES,
+  LEVEL_CONNECTIONS,
   type AmenityDetail,
   type AmenityStatus,
   type AmenityType,
+  type PlatformConnection,
   type StationAssessment,
+  type StationDetail,
 } from "./models";
 
 export const AMENITY_LABEL: Record<string, string> = {
@@ -89,4 +92,58 @@ export class FacilityAnalysisService {
       facilities: f,
     };
   }
+}
+
+/** Jalur gate ke peron, dari yang paling mudah. */
+const VIA_RANK: Record<PlatformConnection, number> = { langsung: 0, crosswalk: 1, sebidang: 2, jpo: 3, terowongan: 3 };
+export const VIA_LABEL: Record<PlatformConnection, string> = {
+  langsung: "langsung dari gate",
+  crosswalk: "lewat penyeberangan jalan (crosswalk)",
+  sebidang: "lewat pelintasan sebidang (menyeberang rel)",
+  jpo: "lewat JPO",
+  terowongan: "lewat terowongan",
+};
+const VERTICAL: AmenityType[] = ["lift", "eskalator"];
+
+/**
+ * Skor stasiun untuk satu perjalanan. Bila semua peron yang dipakai dapat dicapai dari gate tanpa pindah lantai
+ * (langsung, crosswalk, pelintasan sebidang), lift dan eskalator tidak dibutuhkan sehingga tidak ikut dihitung.
+ * Bila peron hanya dapat dicapai lewat JPO/terowongan, lift dan eskalator menentukan skor, memakai fasilitas peron
+ * itu bila tim sudah mengisinya. Tanpa data hubungan gate dengan peron, skor stasiun dipakai apa adanya.
+ */
+export function journeyAssessment(a: StationAssessment, d: StationDetail, codes: string[], snap: ContentSnapshot): StationAssessment {
+  if (!codes.length) return a;
+  const best: { code: string; via: PlatformConnection; gate: string }[] = [];
+  for (const code of codes) {
+    const links = d.entrances.flatMap((e) => (e.platformLinks ?? []).filter((l) => l.platform === code).map((l) => ({ e, l })));
+    if (!links.length) return a;
+    // Gate yang tidak aksesibel dari jalan hanya dipakai bila tidak ada gate lain menuju peron ini.
+    const usable = links.some((x) => x.e.accessible) ? links.filter((x) => x.e.accessible) : links;
+    const pick = usable.reduce((x, y) => (VIA_RANK[y.l.via] < VIA_RANK[x.l.via] ? y : x));
+    best.push({ code, via: pick.l.via, gate: pick.e.name });
+  }
+  const worst = best.reduce((x, y) => (VIA_RANK[y.via] > VIA_RANK[x.via] ? y : x));
+  const level = LEVEL_CONNECTIONS.includes(worst.via);
+  const excluded = level ? VERTICAL : [];
+  const platforms = codes.map((c) => d.platforms.find((p) => p.code === c));
+  const statusOf = (t: AmenityType): AmenityStatus => {
+    const own = platforms.map((p) => p?.amenities[t]);
+    // Fasilitas peron dipakai bila tersedia untuk semua peron yang dipakai; status terburuk yang dihitung.
+    if (own.every((x) => x)) return own.some((x) => x !== "available") ? (own.includes("unknown") ? "unknown" : "absent") : "available";
+    return d.amenities[t];
+  };
+  const counted = CORE_AMENITIES.filter((t) => !excluded.includes(t));
+  const total = counted.reduce((sum, t) => sum + snap.weight(t), 0) || 1;
+  const score = Math.round((counted.reduce((sum, t) => sum + (statusOf(t) === "available" ? snap.weight(t) : 0), 0) / total) * 100);
+  const where = best.length === 1 ? `peron ${worst.code}` : `peron ${codes.join(", ")}`;
+  const note = level
+    ? `Skor perjalanan: ${where} dicapai ${VIA_LABEL[worst.via]} (${worst.gate}), jadi lift dan eskalator tidak dihitung.`
+    : `Skor perjalanan: ${where} hanya dicapai ${VIA_LABEL[worst.via]} (${worst.gate}), jadi lift dan eskalator menentukan skor.`;
+  return {
+    ...a,
+    score,
+    adequate: a.dataAvailable && score >= snap.settings.scoring.threshold,
+    notes: [...(a.notes ?? []), note],
+    journey: { platforms: codes, level, via: worst.via, gate: worst.gate, excluded, ...(level ? {} : { lift: statusOf("lift") }), stationScore: a.score },
+  };
 }

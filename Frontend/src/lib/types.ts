@@ -109,6 +109,16 @@ export interface StationAssessment {
   adequate: boolean;
   dataAvailable: boolean;
   notes?: string[];
+  /** Skor untuk perjalanan ini: jalur gate ke peron menentukan perlu tidaknya lift/eskalator. */
+  journey?: {
+    platforms: string[];
+    level: boolean;
+    via: PlatformConnection;
+    gate?: string;
+    excluded: AmenityType[];
+    lift?: AmenityStatus;
+    stationScore: number;
+  };
 }
 
 export interface Notice {
@@ -131,6 +141,58 @@ export interface Entrance {
   features: string[];
   openHours?: string;
   note?: string;
+  escalators?: EscalatorGroup[];
+  lift?: LiftInfo;
+  /** Isi papan petunjuk pintu (dataset). */
+  signs?: string[];
+  /** "dataset" = pintu dari Commute (/exits), "ntd" = isian tim. */
+  source?: "dataset" | "ntd";
+  /** Peron yang dicapai dari gate ini dan cara mencapainya. */
+  platformLinks?: { platform: string; via: PlatformConnection; note?: string }[];
+}
+
+/** langsung/crosswalk/sebidang tidak pindah lantai; jpo/terowongan naik atau turun lantai. */
+export type PlatformConnection = "langsung" | "crosswalk" | "sebidang" | "jpo" | "terowongan";
+
+export type DetailStatus = AmenityStatus | "out_of_service";
+
+/** Sekelompok eskalator di satu tempat; arah dilihat dari lantai bawah. */
+export interface EscalatorGroup {
+  count: number;
+  direction: "naik" | "turun" | "bergantian";
+  connects?: string;
+  status?: DetailStatus;
+}
+
+export interface LiftInfo {
+  count: number;
+  connects?: string;
+  status?: DetailStatus;
+}
+
+/** Celah peron dengan kendaraan. */
+export interface PlatformGap {
+  level: "sejajar" | "sedikit" | "tangga";
+  steps?: number;
+  horizontalCm?: number;
+  verticalCm?: number;
+  boardingAid?: boolean;
+  note?: string;
+}
+
+/** Peron: nomor dan arah dari dataset, fasilitas per peron dan celah dari survei tim NTD. */
+export interface Platform {
+  code: string;
+  name?: string;
+  type?: "island" | "side" | "bay";
+  tracks?: string[];
+  serves: { lineId: string; direction?: string }[];
+  amenities: Partial<Record<"lift" | "eskalator" | "toilet" | "ramp", DetailStatus>>;
+  escalators?: EscalatorGroup[];
+  lift?: LiftInfo;
+  gap?: PlatformGap;
+  note?: string;
+  source: "dataset" | "ntd";
 }
 
 export interface StationInfo {
@@ -143,6 +205,7 @@ export interface StationInfo {
 
 /** Detail stasiun dari GET /api/stations/:id. */
 export interface StationDetailData extends NetworkStation {
+  platforms?: Platform[];
   entrances: Entrance[];
   info: StationInfo[];
   notices: Notice[];
@@ -159,6 +222,10 @@ export interface RouteLeg {
   fare: number;
   /** Arah/tujuan akhir kendaraan. */
   headsign?: string;
+  /** Nomor peron naik dari dataset. */
+  platform?: string;
+  /** Peron naik beserta fasilitas dan celahnya, bila dapat dipastikan. */
+  boardAt?: Platform;
   /** Frekuensi gabungan bila jadwal tidak tersedia (bukan jadwal). */
   frequency?: Frequency;
   /** Lin paralel yang melayani pemberhentian dan tarif yang sama; boleh naik yang mana saja. */
@@ -190,6 +257,8 @@ export interface TransferAccess {
   stationId: string;
   need: TransferNeed;
   status: AmenityStatus | "out_of_service";
+  /** Status diambil dari peron ini. */
+  platform?: string;
 }
 
 export interface Route {

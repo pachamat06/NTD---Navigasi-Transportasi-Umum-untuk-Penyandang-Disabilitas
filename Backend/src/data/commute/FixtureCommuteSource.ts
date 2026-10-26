@@ -6,7 +6,7 @@
 import type { Mode } from "../../domain/models";
 import { UpstreamError } from "../../errors";
 import { LINE_INDEX, lineIdOf, refsOf, stationIdOf } from "./station-index";
-import type { CommuteSource, UpFare, UpHub, UpHubTransfer, UpLeg, UpLine, UpOperator, UpStation, UpStopRef } from "./types";
+import type { CommuteSource, UpFare, UpHub, UpHubTransfer, UpLeg, UpLine, UpOperator, UpPlatformService, UpStation, UpStopRef } from "./types";
 
 type A = "y" | "n" | "?";
 
@@ -192,6 +192,17 @@ export class FixtureCommuteSource implements CommuteSource {
       const other = f === id ? t : t === id ? f : null;
       return other ? [{ from: { operator, code }, to: refFor(other), distanceM: d, durationS: min === null ? null : min * 60 }] : [];
     });
+  }
+
+  /** Peron Sudirman seperti di Commute (PLATFORM_CODES, dicek di lapangan): 1 arah BNI City, 2 arah Manggarai. */
+  async getPlatforms(operator: string, code: string): Promise<UpPlatformService[] | null> {
+    this.check();
+    if (stationIdOf({ operator, code }) !== "sudirman") return [];
+    const line = lineCode("krl-cikarang");
+    return [
+      { operator, line, platformCode: "1", direction: "Arah Tanah Abang" },
+      { operator, line, platformCode: "2", direction: "Arah Manggarai" },
+    ];
   }
 
   async getFare(from: UpStopRef, to: UpStopRef, at?: string): Promise<UpFare | null> {

@@ -13,11 +13,11 @@ import type { ContentItem, ContentKind } from "../store/types";
 import type { Services } from "../services";
 import { ok, parse, rateLimit, requireAdmin } from "./middleware";
 
-const kindSchema = z.enum(["facility", "entrance", "notice", "station_info", "map_stop", "map_track"]);
+const kindSchema = z.enum(["facility", "entrance", "notice", "station_info", "platform", "map_stop", "map_track"]);
 const idParam = z.string().min(1).max(80);
 
 /** Item yang terikat stasiun wajib punya stationId yang dikenal; pengumuman memakai targetId. */
-const STATION_BOUND: ContentKind[] = ["facility", "entrance", "station_info", "map_stop"];
+const STATION_BOUND: ContentKind[] = ["facility", "entrance", "station_info", "platform", "map_stop"];
 
 function itemView(i: ContentItem) {
   const state = i.draftDeleted ? "akan_dihapus" : i.published === null ? "baru" : i.draft !== null ? "diubah" : "terbit";
@@ -88,7 +88,7 @@ export function adminRoutes(s: Services): Router {
       stations.map((st) => {
         const mine = items.filter((i) => i.stationId === st.id);
         const count = (k: ContentKind) => mine.filter((i) => i.kind === k && !i.draftDeleted).length;
-        return { ...st, facilities: count("facility"), entrances: count("entrance"), info: count("station_info"), pending: mine.filter((i) => i.draft !== null || i.draftDeleted).length };
+        return { ...st, facilities: count("facility"), entrances: count("entrance"), platforms: count("platform"), info: count("station_info"), pending: mine.filter((i) => i.draft !== null || i.draftDeleted).length };
       }),
     );
   });
@@ -120,6 +120,11 @@ export function adminRoutes(s: Services): Router {
       if (!stationId || !known.has(stationId)) throw new AppError("INVALID", "stationId wajib diisi dengan stasiun yang dikenal.");
     }
     if (kind === "notice" && parsed.scope === "station" && !known.has(String(parsed.targetId))) throw new AppError("INVALID", "targetId harus id stasiun yang dikenal.");
+    if (kind === "platform") {
+      const lines = new Set((await s.stations.lines(newContext({ preview: true }))).map((l) => l.id));
+      const unknown = ((parsed.serves as { lineId: string }[] | undefined) ?? []).filter((x) => !lines.has(x.lineId));
+      if (unknown.length) throw new AppError("INVALID", `lineId tidak dikenal: ${unknown.map((x) => x.lineId).join(", ")}.`);
+    }
     if (kind === "map_track") {
       if (!known.has(String(parsed.fromStationId)) || !known.has(String(parsed.toStationId))) throw new AppError("INVALID", "fromStationId dan toStationId harus id stasiun yang dikenal.");
       const lines = new Set((await s.stations.lines(newContext({ preview: true }))).map((l) => l.id));

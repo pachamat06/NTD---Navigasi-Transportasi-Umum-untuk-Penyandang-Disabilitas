@@ -3,6 +3,7 @@
 import { AMENITY_LABEL, useNetwork } from "@/lib/network";
 import type { Alternative, AmenityType, ExitRef, Frequency, JourneyPlan, Notice, RouteLeg } from "@/lib/types";
 import { AccessBadge } from "./AccessBadge";
+import { PlatformDetails, VIA_TEXT } from "./PlatformInfo";
 
 const km = (m: number) => `${(m / 1000).toLocaleString("id-ID", { maximumFractionDigits: 1 })} km`;
 const rupiah = (n: number) => `Rp ${n.toLocaleString("id-ID")}`;
@@ -107,6 +108,14 @@ export function ResultPanel({
                       <p className="text-sm text-[var(--muted)]">
                         {leg.stops.length - 1} pemberhentian · {km(leg.distanceM)} · {leg.minutes === null ? "waktu tidak tersedia" : `${leg.minutes} mnt`} · {rupiah(leg.fare)}
                       </p>
+                      {(leg.boardAt || leg.platform) && (
+                        <div className="mt-1 text-sm">
+                          <p>
+                            <span aria-hidden>🚉</span> Naik dari <b>{leg.boardAt?.name || `peron ${leg.boardAt?.code ?? leg.platform}`}</b>
+                          </p>
+                          {leg.boardAt && <PlatformDetails p={leg.boardAt} compact />}
+                        </div>
+                      )}
                       <RideChoices leg={leg} />
                       {leg.stops.length > 2 && (
                         <details className="mt-1 text-sm">
@@ -217,8 +226,9 @@ function TransferHints({ leg, name }: { leg: RouteLeg; name: (id: string) => str
       {leg.access && leg.access.length > 0 && (
         <ul className="mt-1" aria-label="Fasilitas untuk pindah">
           {leg.access.map((a) => (
-            <li key={`${a.stationId}-${a.need}`} className={a.status === "available" ? "" : "text-[var(--warn)]"}>
-              <span aria-hidden>{a.status === "available" ? "✔" : "⚠"}</span> {AMENITY_LABEL[a.need]} di {name(a.stationId)}: {ACCESS_TEXT[a.status]}
+            <li key={`${a.stationId}-${a.need}-${a.platform ?? ""}`} className={a.status === "available" ? "" : "text-[var(--warn)]"}>
+              <span aria-hidden>{a.status === "available" ? "✔" : "⚠"}</span> {AMENITY_LABEL[a.need]} di {name(a.stationId)}
+              {a.platform ? ` (peron ${a.platform})` : ""}: {ACCESS_TEXT[a.status]}
             </li>
           ))}
         </ul>
@@ -241,7 +251,8 @@ function Stat({ icon, label, value }: { icon: string; label: string; value: stri
 function StopRow({ id, name, label, a, onShowDetail }: { id: string; name?: string; label?: string; a: JourneyPlan["assessments"][number]; onShowDetail: (id: string) => void }) {
   const stationName = useNetwork().stationById(id)?.name ?? name ?? id;
   // Catatan dari tim NTD, mis. lift sedang tidak berfungsi.
-  const notes = a.dataAvailable ? (a.notes ?? []) : [];
+  const notes = a.dataAvailable ? (a.notes ?? []).filter((n) => !(a.journey && n.startsWith("Skor perjalanan"))) : [];
+  const j = a.journey;
   return (
     <div className="flex flex-wrap items-center gap-x-2 gap-y-1">
       <span className="stop-dot" aria-hidden />
@@ -250,6 +261,13 @@ function StopRow({ id, name, label, a, onShowDetail }: { id: string; name?: stri
       </button>
       {label && <span className="text-xs uppercase tracking-wide text-[var(--muted)]">{label}</span>}
       <AccessBadge a={a} />
+      {j && (
+        <p className={`w-full text-sm ${j.level ? "text-[var(--muted)]" : "text-[var(--warn)]"}`}>
+          <span aria-hidden>{j.level ? "↔" : "↕"}</span> Peron {j.platforms.join(", ")} {VIA_TEXT[j.via]}
+          {j.gate ? ` (${j.gate})` : ""}
+          {j.level ? ", lift dan eskalator tidak dibutuhkan" : ", lift dan eskalator dibutuhkan"} · skor stasiun {j.stationScore}
+        </p>
+      )}
       {notes.map((n) => (
         <p key={n} className="w-full text-sm text-[var(--warn)]">
           <span aria-hidden>ⓘ</span> {n}

@@ -7,10 +7,10 @@
 // - memetakan respons upstream ke model internal (id NTD dari station-index).
 
 import { markStale, type RequestContext } from "../../context";
-import type { Amenity, AnyAmenityType, ExitRef, Hub, HubWalk, Line, Mode, Operator, Station } from "../../domain/models";
+import type { Amenity, AnyAmenityType, Entrance, ExitRef, Hub, HubWalk, Line, Mode, Operator, Platform, Station } from "../../domain/models";
 import { UpstreamError } from "../../errors";
 import type { CacheRepository } from "../../store/types";
-import { jakartaDayHour } from "./HttpCommuteSource";
+import { directionLabel, jakartaDayHour } from "./HttpCommuteSource";
 import { buildStationIndex, lineIdOf, liveIdsOf, type StationIndex } from "./station-index";
 import type { CommuteSource, UpAmenity, UpExitRef, UpHubTransfer, UpLeg, UpStation } from "./types";
 
@@ -33,6 +33,8 @@ export interface FareLeg {
   lineId?: string;
   operator?: string;
   headsign?: string;
+  /** Nomor peron naik dari dataset. */
+  platform?: string;
   /** Lin paralel pada ruas yang sama (termasuk lin utama, paling depan). */
   serviceLines?: { lineId: string; headsign?: string }[];
   stops: string[];
@@ -357,6 +359,49 @@ export class CommuteApiClient {
     return out;
   }
 
+  /**
+   * Peron menurut dataset: nomor peron dan lin/arah yang dilayaninya. Dataset belum memuat jenis peron,
+   * fasilitas per peron, atau celah peron; itu diisi tim lewat admin. [] = dataset tidak mencatat.
+   */
+  async getPlatforms(stationId: string, ctx: RequestContext): Promise<Platform[]> {
+    const getPlatforms = this.source.getPlatforms?.bind(this.source);
+    if (!getPlatforms) return [];
+    const idx = await this.index(ctx);
+    const byCode = new Map<string, Platform>();
+    for (const r of idx.refsOf(stationId)) {
+      const rows = await this.cached(`platforms:${r.operator}:${r.code}`, ctx, this.ttl(ctx), () => getPlatforms(r.operator, r.code)).catch(supplementary);
+      for (const p of rows ?? []) {
+        const pl = byCode.get(p.platformCode) ?? { code: p.platformCode, serves: [], amenities: {}, source: "dataset" as const };
+        pl.serves.push({ lineId: lineIdOf(p.operator, p.line), ...(directionLabel(p.direction) ? { direction: directionLabel(p.direction) } : {}) });
+        byCode.set(p.platformCode, pl);
+      }
+    }
+    return [...byCode.values()].sort((a, b) => a.code.localeCompare(b.code, "id", { numeric: true }));
+  }
+
+  /** Pintu keluar/gate menurut dataset (/exits). [] = belum dicatat, bukan berarti tidak ada pintu. */
+  async getExits(stationId: string, ctx: RequestContext): Promise<Entrance[]> {
+    const getExits = this.source.getExits?.bind(this.source);
+    if (!getExits) return [];
+    const idx = await this.index(ctx);
+    const out: Entrance[] = [];
+    for (const r of idx.refsOf(stationId)) {
+      const rows = await this.cached(`exits:${r.operator}:${r.code}`, ctx, this.ttl(ctx), () => getExits(r.operator, r.code)).catch(supplementary);
+      for (const e of rows ?? [])
+        out.push({
+          id: `${r.operator}-${r.code}:${e.ref}`,
+          stationId,
+          name: e.name ? `Pintu ${e.ref} (${e.name})` : `Pintu ${e.ref}`,
+          // Dataset tidak menyatakan aksesibilitas pintu; tim melengkapinya lewat admin.
+          accessible: false,
+          features: [],
+          ...(e.signs?.length ? { signs: e.signs } : {}),
+          source: "dataset",
+        });
+    }
+    return out;
+  }
+
   /** Rute dari dataset. null = rute tidak ditemukan. */
   async getFare(fromId: string, toId: string, ctx: RequestContext, at?: string): Promise<FareResult | null> {
     const idx = await this.index(ctx);
@@ -405,6 +450,7 @@ function mapLeg(l: UpLeg, idx: StationIndex): FareLeg {
     lineId: l.line && l.operator ? lineIdOf(l.operator, l.line) : undefined,
     operator: l.operator,
     ...(l.headsign ? { headsign: l.headsign } : {}),
+    ...(l.platformCode ? { platform: l.platformCode } : {}),
     ...(l.serviceLines?.length ? { serviceLines: l.serviceLines.map((x) => ({ lineId: lineIdOf(x.operator, x.line), ...(x.headsign ? { headsign: x.headsign } : {}) })) } : {}),
     stops: l.stops.map((r) => idx.idOf(r)),
     distanceM: l.distanceM,
@@ -412,6 +458,12 @@ function mapLeg(l: UpLeg, idx: StationIndex): FareLeg {
     departureAt: l.departureAt ?? firstTime?.departureAt ?? firstTime?.arrivalAt ?? undefined,
     arrivalAt: l.arrivalAt ?? lastTime?.arrivalAt ?? lastTime?.departureAt ?? undefined,
   };
+}
+
+/** Data pelengkap: galat API tidak menggagalkan permintaan, data dianggap belum ada. */
+function supplementary(e: unknown): null {
+  if (e instanceof UpstreamError) return null;
+  throw e;
 }
 
 function mapExit(e: UpExitRef): ExitRef {

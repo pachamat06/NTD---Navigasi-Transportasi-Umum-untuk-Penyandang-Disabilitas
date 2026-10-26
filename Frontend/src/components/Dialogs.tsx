@@ -5,6 +5,7 @@ import { fetchStationDetail } from "@/lib/api";
 import { AMENITY_LABEL, useNetwork } from "@/lib/network";
 import type { AmenityType, StationDetailData } from "@/lib/types";
 import { AccessBadge } from "./AccessBadge";
+import { PlatformList, VIA_TEXT, verticalText } from "./PlatformInfo";
 import { NoticeBanner } from "./ResultPanel";
 
 /** Dialog modal berbasis <dialog> bawaan peramban (fokus terkunci, Esc menutup). */
@@ -124,6 +125,12 @@ export function StationDetail({
               ))}
             </ul>
           </div>
+          {full?.data?.platforms && full.data.platforms.length > 0 && (
+            <div>
+              <p className="text-sm font-semibold">Peron ({full.data.platforms.length})</p>
+              <PlatformList platforms={full.data.platforms} entrances={full.data.entrances} />
+            </div>
+          )}
           {full?.data && full.data.entrances.length > 0 && (
             <div>
               <p className="text-sm font-semibold">Pintu akses</p>
@@ -138,6 +145,11 @@ export function StationDetail({
                     </p>
                     {e.description && <p>{e.description}</p>}
                     {e.features.length > 0 && <p className="text-[var(--muted)]">Akses: {e.features.map((f) => ENTRANCE_FEATURE[f] ?? f).join(", ")}</p>}
+                    {verticalText(e.escalators, e.lift).length > 0 && <p className="text-[var(--muted)]">{verticalText(e.escalators, e.lift).join(" · ")}</p>}
+                    {e.platformLinks && e.platformLinks.length > 0 && (
+                      <p>Ke peron: {e.platformLinks.map((l) => `${l.platform} ${VIA_TEXT[l.via]}${l.note ? ` (${l.note})` : ""}`).join(" · ")}</p>
+                    )}
+                    {e.signs && e.signs.length > 0 && <p className="text-[var(--muted)]">Papan petunjuk: {e.signs.join(", ")}</p>}
                     {e.openHours && <p className="text-[var(--muted)]">Buka: {e.openHours}</p>}
                     {e.note && <p className="text-[var(--muted)]">{e.note}</p>}
                   </li>

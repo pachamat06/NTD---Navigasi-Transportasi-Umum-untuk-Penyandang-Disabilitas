@@ -56,7 +56,8 @@ Batasan data API: tidak ada jenis fasilitas ramp (status ramp selalu "data tidak
 Dataset tidak memuat semua informasi aksesibilitas, jadi tim melengkapinya lewat halaman admin (proyek terpisah, closed source). Jenis konten (`content_items.kind`):
 
 - `facility`: koreksi status lift, eskalator, toilet aksesibel, ramp, dll. (`available`, `absent`, `out_of_service` dengan `until`, `unknown`). Menimpa dataset untuk jenis yang sama.
-- `entrance`: pintu akses stasiun (nama, lokasi, fitur seperti lift/ramp/guiding block, jam buka).
+- `entrance`: pintu akses/gate stasiun (nama, lokasi, fitur seperti lift/ramp/guiding block, jam buka, jumlah dan arah eskalator, lift). Dengan `exitRef`, isian tim melengkapi pintu dataset yang sama (`/exits` Commute) dan mewarisi papan petunjuknya. `platformLinks` mencatat peron yang dicapai dari gate itu dan caranya (`langsung`, `crosswalk`, `sebidang`, `jpo`, `terowongan`).
+- `platform`: peron hasil survei (`code`, jenis `island`/`side`/`bay`, nomor jalur, lin dan arah yang dilayani, fasilitas per peron, eskalator `{count, direction: naik|turun|bergantian, connects}`, lift, dan celah peron dengan kendaraan `{level: sejajar|sedikit|tangga, steps, horizontalCm, verticalCm, boardingAid}`). Nomor peron dan arah diambil dari dataset (`/timetable/grouped`); isian tim menimpa dataset untuk nomor peron yang sama. Butuh migrasi `003_platforms.sql`.
 - `station_info`: info lain (kontak layanan, layanan pendampingan, dll.).
 - `notice`: pengumuman/notifikasi untuk stasiun, lini, hub, atau global, dengan periode aktif dan tingkat (`info`, `warning`, `critical`).
 - `map_stop`: posisi pemberhentian pada Aset Peta Transit (`{x, y}`, satuan pt peta FDTJ), menang atas posisi otomatis.
@@ -66,6 +67,8 @@ Dataset tidak memuat semua informasi aksesibilitas, jadi tim melengkapinya lewat
 Setiap konten punya versi **draft** dan **terbit**. Pengguna hanya melihat versi terbit. Admin bisa melihat hasil API dengan draft memakai header `X-NTD-Preview: 1` plus token admin. Publikasi menyalin draft ke terbit dan (opsional) menjalankan semua kasus uji API terlebih dahulu.
 
 Skor aksesibilitas = jumlah bobot fasilitas yang tersedia, dinormalisasi 0 sampai 100 (bawaan: lift 40, eskalator 20, toilet 25, ramp 15; ambang 70). Stasiun "memadai" bila datanya ada dan skornya mencapai ambang.
+
+Pada `POST /api/plan`, skor stasiun asal, tujuan, dan ujung perpindahan yang keluar stasiun disesuaikan dengan jalur gate ke peron yang dipakai (`assessment.journey`). Bila semua peron itu dapat dicapai tanpa pindah lantai (langsung, crosswalk, pelintasan sebidang), lift dan eskalator tidak ikut dihitung. Bila hanya lewat JPO/terowongan, lift dan eskalator menentukan skor, memakai fasilitas peron bila sudah diisi. Tanpa data `platformLinks`, skor stasiun dipakai apa adanya. Penyeberangan sebidang, crosswalk, dan JPO/terowongan tanpa lift diberi peringatan.
 
 ## API
 
@@ -78,7 +81,7 @@ Respons sukses `{"status":"ok","data":...}`; gagal `{"status":"error","code","me
 | GET | `/health` | Cek hidup |
 | GET | `/api/meta` | Disclaimer, atribusi, bobot skor, label fasilitas, sumber data |
 | GET | `/api/stations?q=&limit=` | Daftar stasiun, atau pencarian untuk autocomplete |
-| GET | `/api/stations/:id` | Detail stasiun: fasilitas tergabung, skor, pintu akses, info, pengumuman |
+| GET | `/api/stations/:id` | Detail stasiun: fasilitas tergabung, skor, peron (`platforms`), pintu akses, info, pengumuman |
 | GET | `/api/network` | Data awal GUI: semua stasiun (fasilitas + skor, `commuteIds` untuk posisi peta), lini, hub, dan `map` (posisi stop dan bentuk jalur dari admin) |
 | GET | `/api/map` | Posisi stop dan bentuk jalur dari admin saja |
 | GET | `/api/lines`, `/api/hubs` | Lini dan hub antarmoda |
@@ -90,6 +93,8 @@ Dengan `avoidModes`, bila rute dataset memakai moda yang dihindari, backend menc
 Dengan `needs`, tiap ruas pindah memuat `access` (status tiap fasilitas di kedua ujung), titik pindah yang tidak memenuhi dicarikan alternatif di hub yang sama, jalan kaki diberi bobot lebih berat, dan peringatan ditambahkan bila fasilitas tidak tercatat, rusak, atau belum ada datanya.
 
 Rute dilengkapi dari Commute: jarak, petunjuk, dan pintu keluar jalan kaki saat pindah (`/stations/{op}/{code}/transfers`); lin paralel yang berhenti di pemberhentian yang sama dengan tarif sama sebagai `options` (mis. TJ 4, 4D, 5, 5C dari Matraman ke Kesatrian; dari `serviceLines` /fares, atau urutan halte lin operator yang sama); dan `frequency` (headway gabungan, `/stations/{op}/{code}/headway`) karena /fares tidak memberi jam keberangkatan. `at` diteruskan ke /fares untuk tarif peak/off-peak.
+
+Ruas naik memuat `platform` (nomor peron dari /fares) dan `boardAt` (peron beserta fasilitas dan celahnya) bila peron dapat dipastikan. Pengecekan `needs` memakai fasilitas peron tempat naik/turun bila tim sudah mengisinya, dan peringatan ditambahkan bila naik kendaraan perlu menaiki anak tangga.
 
 `POST /api/plan` mengembalikan rute (bentuk sama dengan `Frontend/src/lib/types.ts`), penilaian fasilitas tiap stasiun transit, hingga 3 alternatif via stasiun lain di hub yang sama, pengumuman terkait, narasi notifikasi, peringatan (mis. data dari cache), disclaimer, dan atribusi.
 
