@@ -1,22 +1,40 @@
 // CommuteApiClient (Tabel 3.8): satu-satunya titik akses ke Commute Data API.
 // - cache-first ber-TTL untuk data yang jarang berubah (stasiun, fasilitas, hub, lini, operator);
+// - satu permintaan per kunci cache pada satu waktu (single-flight), dan data kedaluwarsa disajikan sambil
+//   diperbarui di latar belakang (stale-while-revalidate) agar cache kosong tidak memicu ratusan permintaan;
 // - rute/tarif selalu diminta langsung (tarif bergantung pada waktu `at`), tetapi salinan terakhir
 //   disimpan sebagai cadangan bila API tidak dapat dihubungi (UC-01 E2);
 // - memetakan respons upstream ke model internal (id NTD dari station-index).
 
 import { markStale, type RequestContext } from "../../context";
-import type { Amenity, AnyAmenityType, Hub, Line, Mode, Operator, Station } from "../../domain/models";
+import type { Amenity, AnyAmenityType, ExitRef, Hub, HubWalk, Line, Mode, Operator, Station } from "../../domain/models";
 import { UpstreamError } from "../../errors";
 import type { CacheRepository } from "../../store/types";
-import { buildStationIndex, lineIdOf, type StationIndex } from "./station-index";
-import type { CommuteSource, UpAmenity, UpLeg, UpStation } from "./types";
+import { jakartaDayHour } from "./HttpCommuteSource";
+import { buildStationIndex, lineIdOf, liveIdsOf, type StationIndex } from "./station-index";
+import type { CommuteSource, UpAmenity, UpExitRef, UpHubTransfer, UpLeg, UpStation } from "./types";
 
 export const DEFAULT_TTL_SECONDS = 24 * 3600;
+/** Data kedaluwarsa masih disajikan (sambil diperbarui) sampai umur ini; lebih tua dari itu ditunggu. */
+export const MAX_STALE_SECONDS = 7 * 24 * 3600;
+/** Frekuensi bergantung jam, jadi di-cache singkat (sama dengan Commute Data API: 10 menit). */
+const HEADWAY_TTL_SECONDS = 600;
+
+export interface LineHeadway {
+  lineId: string;
+  headwayMinutes: number | null;
+  boundFor?: string;
+  source: "STOP" | "LINE";
+  serviceHours?: string;
+}
 
 export interface FareLeg {
   type: "RIDE" | "TRANSFER";
   lineId?: string;
   operator?: string;
+  headsign?: string;
+  /** Lin paralel pada ruas yang sama (termasuk lin utama, paling depan). */
+  serviceLines?: { lineId: string; headsign?: string }[];
   stops: string[];
   distanceM: number;
   fare: number;
@@ -106,15 +124,41 @@ export class CommuteApiClient {
     return this.cached("stations", ctx, this.ttl(ctx), () => this.source.getStations());
   }
 
-  /** Ambil dari cache bila masih segar; bila tidak, panggil API; bila API gagal, pakai cache kedaluwarsa. */
+  /** Permintaan ke sumber data yang sedang berjalan, per kunci cache (single-flight). */
+  private inflight = new Map<string, Promise<unknown>>();
+
+  /** Panggil `load` sekali untuk semua pemanggil kunci yang sama, lalu simpan hasilnya. */
+  private refresh<T>(key: string, ttlSeconds: number, load: () => Promise<T>): Promise<T> {
+    const running = this.inflight.get(key) as Promise<T> | undefined;
+    if (running) return running;
+    const p = (async () => {
+      try {
+        const value = await load();
+        // null (404) tidak di-cache lama agar data baru segera terlihat.
+        await this.cache.put(this.prefix + key, value, value === null ? 300 : ttlSeconds);
+        return value;
+      } finally {
+        this.inflight.delete(key);
+      }
+    })();
+    this.inflight.set(key, p);
+    return p;
+  }
+
+  /**
+   * Ambil dari cache bila masih segar. Bila kedaluwarsa tetapi belum terlalu tua, sajikan salinan itu dan
+   * perbarui di latar belakang. Bila tidak ada salinan, tunggu API; bila API gagal, pakai cache kedaluwarsa.
+   */
   private async cached<T>(key: string, ctx: RequestContext, ttlSeconds: number, load: () => Promise<T>): Promise<T> {
     const hit = await this.cache.get<T>(this.prefix + key);
     if (hit && hit.expiresAt > ctx.now) return hit.value;
+    if (hit && ctx.now.getTime() - hit.expiresAt.getTime() < MAX_STALE_SECONDS * 1000) {
+      // Galat pembaruan latar belakang diabaikan: salinan lama tetap dipakai sampai pembaruan berhasil.
+      this.refresh(key, ttlSeconds, load).catch(() => {});
+      return hit.value;
+    }
     try {
-      const value = await load();
-      // null (404) tidak di-cache lama agar data baru segera terlihat.
-      await this.cache.put(this.prefix + key, value, value === null ? 300 : ttlSeconds);
-      return value;
+      return await this.refresh(key, ttlSeconds, load);
     } catch (e) {
       if (e instanceof UpstreamError && hit) {
         markStale(ctx, new Date(hit.storedAt));
@@ -217,6 +261,7 @@ export class CommuteApiClient {
           lineIds: dedupe(lineIds),
           hubId: s.hub ?? undefined,
           codes,
+          commuteIds: commuteIdsOf(id, idx),
           ...(typeof s.lat === "number" && typeof s.lng === "number" ? { lat: s.lat, lng: s.lng } : {}),
         });
       } else {
@@ -263,14 +308,53 @@ export class CommuteApiClient {
     return hubs.map((h) => ({
       id: h.id,
       name: h.name,
+      ...(h.kind ? { kind: h.kind } : {}),
       memberIds: dedupe(h.stations.map((r) => idx.idOf(r))),
-      walks: (h.transfers ?? []).map((t) => ({
-        from: idx.idOf(t.from),
-        to: idx.idOf(t.to),
-        distanceM: t.distanceM,
-        minutes: t.durationS === null || t.durationS === undefined ? null : Math.round(t.durationS / 60),
-      })),
+      // Satu stasiun NTD bisa memuat beberapa kode operator; jalan "ke dirinya sendiri" tidak dipakai.
+      walks: (h.transfers ?? []).map((t) => mapWalk(t, idx)).filter((w) => w.from !== w.to),
     }));
+  }
+
+  /**
+   * Jalan kaki dari stasiun `fromId` ke `toId` menurut dataset (jarak, petunjuk, pintu keluar), dari
+   * /stations/{op}/{code}/transfers. undefined = dataset tidak mencatat perpindahan itu.
+   */
+  async getWalk(fromId: string, toId: string, ctx: RequestContext): Promise<HubWalk | undefined> {
+    const getTransfers = this.source.getTransfers?.bind(this.source);
+    if (!getTransfers || fromId === toId) return undefined;
+    const idx = await this.index(ctx);
+    for (const r of idx.refsOf(fromId)) {
+      const list = await this.cached(`transfers:${r.operator}:${r.code}`, ctx, this.ttl(ctx), () => getTransfers(r.operator, r.code));
+      const hit = (list ?? []).map((t) => mapWalk(t, idx)).find((w) => w.to === toId);
+      if (hit) return hit;
+    }
+    return undefined;
+  }
+
+  /** Frekuensi tiap lin di pemberhentian `stationId` pada waktu `at`. [] = dataset tidak menyediakan. */
+  async getHeadways(stationId: string, ctx: RequestContext, at?: string): Promise<LineHeadway[]> {
+    const getHeadways = this.source.getHeadways?.bind(this.source);
+    if (!getHeadways) return [];
+    const idx = await this.index(ctx);
+    const when = at ?? ctx.now.toISOString();
+    const { day, hour } = jakartaDayHour(new Date(when));
+    const out: LineHeadway[] = [];
+    for (const r of idx.refsOf(stationId)) {
+      const rows = await this.cached(`headway:${r.operator}:${r.code}:${day}:${hour}`, ctx, HEADWAY_TTL_SECONDS, () => getHeadways(r.operator, r.code, when)).catch((e) => {
+        // Frekuensi hanya pelengkap; rute tetap ditampilkan tanpa frekuensi bila API gagal.
+        if (e instanceof UpstreamError) return null;
+        throw e;
+      });
+      for (const h of rows ?? [])
+        out.push({
+          lineId: lineIdOf(h.operator, h.line),
+          headwayMinutes: h.headwayS === null ? null : Math.max(1, Math.round(h.headwayS / 60)),
+          ...(h.boundFor ? { boundFor: h.boundFor } : {}),
+          source: h.source ?? "LINE",
+          ...(h.serviceHours ? { serviceHours: "allDay" in h.serviceHours ? "24 jam" : `${h.serviceHours.start}–${h.serviceHours.end}` } : {}),
+        });
+    }
+    return out;
   }
 
   /** Rute dari dataset. null = rute tidak ditemukan. */
@@ -320,12 +404,36 @@ function mapLeg(l: UpLeg, idx: StationIndex): FareLeg {
     type: l.type,
     lineId: l.line && l.operator ? lineIdOf(l.operator, l.line) : undefined,
     operator: l.operator,
+    ...(l.headsign ? { headsign: l.headsign } : {}),
+    ...(l.serviceLines?.length ? { serviceLines: l.serviceLines.map((x) => ({ lineId: lineIdOf(x.operator, x.line), ...(x.headsign ? { headsign: x.headsign } : {}) })) } : {}),
     stops: l.stops.map((r) => idx.idOf(r)),
     distanceM: l.distanceM,
     fare: l.fare ?? 0,
     departureAt: l.departureAt ?? firstTime?.departureAt ?? firstTime?.arrivalAt ?? undefined,
     arrivalAt: l.arrivalAt ?? lastTime?.arrivalAt ?? lastTime?.departureAt ?? undefined,
   };
+}
+
+function mapExit(e: UpExitRef): ExitRef {
+  return { ref: e.ref, ...(e.name ? { name: e.name } : {}), ...(e.signs?.length ? { signs: e.signs } : {}) };
+}
+
+function mapWalk(t: UpHubTransfer, idx: StationIndex): HubWalk {
+  return {
+    from: idx.idOf(t.from),
+    to: idx.idOf(t.to),
+    distanceM: t.distanceM,
+    minutes: t.durationS === null || t.durationS === undefined ? null : Math.round(t.durationS / 60),
+    ...(t.notes ? { notes: t.notes } : {}),
+    ...(t.fromExit ? { fromExit: mapExit(t.fromExit) } : {}),
+    ...(t.toExit ? { toExit: mapExit(t.toExit) } : {}),
+  };
+}
+
+/** Id Commute Data API sebuah stasiun NTD: kode dari sumber data, ditambah id yang dikurasi di station-index. */
+function commuteIdsOf(stationId: string, idx: StationIndex): string[] {
+  const live = liveIdsOf(stationId);
+  return live.length ? live : dedupe(idx.refsOf(stationId).map((r) => `${r.operator}-${r.code}`));
 }
 
 function dedupe<T>(xs: T[]): T[] {

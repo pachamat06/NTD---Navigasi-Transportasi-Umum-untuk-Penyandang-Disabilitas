@@ -23,6 +23,8 @@ export interface Station {
   lineIds: string[];
   codes: string[];
   hubId?: string;
+  /** Station id Commute (mis. "KCI-SUDB"), dipakai untuk posisi pada peta. */
+  commuteIds?: string[];
 }
 
 /** Rincian fasilitas, termasuk informasi tim NTD yang tidak ada di dataset. */
@@ -42,17 +44,55 @@ export interface NetworkStation extends Station {
   assessment: StationAssessment;
 }
 
+export interface ExitRef {
+  ref: string;
+  name?: string;
+  signs?: string[];
+}
+
+export interface HubWalk {
+  from: string;
+  to: string;
+  distanceM: number;
+  minutes: number | null;
+  notes?: string;
+  fromExit?: ExitRef;
+  toExit?: ExitRef;
+}
+
 export interface Hub {
   id: string;
   name: string;
   memberIds: string[];
-  walks: { from: string; to: string; distanceM: number; minutes: number | null }[];
+  kind?: "hub" | "integrated";
+  walks: HubWalk[];
+}
+
+/** Posisi pemberhentian yang ditetapkan admin, dalam koordinat peta (pt). */
+export interface MapStop {
+  stationId: string;
+  x: number;
+  y: number;
+}
+
+/** Bentuk jalur antara dua pemberhentian berurutan pada satu lini, ditetapkan admin. */
+export interface MapTrack {
+  lineId: string;
+  fromStationId: string;
+  toStationId: string;
+  points: [number, number][];
+}
+
+export interface MapOverrides {
+  stops: MapStop[];
+  tracks: MapTrack[];
 }
 
 export interface Network {
   stations: NetworkStation[];
   lines: Line[];
   hubs: Hub[];
+  map?: MapOverrides;
 }
 
 export interface Meta {
@@ -117,6 +157,39 @@ export interface RouteLeg {
   distanceM: number;
   minutes: number | null;
   fare: number;
+  /** Arah/tujuan akhir kendaraan. */
+  headsign?: string;
+  /** Frekuensi gabungan bila jadwal tidak tersedia (bukan jadwal). */
+  frequency?: Frequency;
+  /** Lin paralel yang melayani pemberhentian dan tarif yang sama; boleh naik yang mana saja. */
+  options?: RideOption[];
+  /** Petunjuk jalan kaki saat pindah. */
+  notes?: string;
+  fromExit?: ExitRef;
+  toExit?: ExitRef;
+  /** Status fasilitas yang dibutuhkan pengguna di kedua ujung perpindahan. */
+  access?: TransferAccess[];
+}
+
+export type TransferNeed = "lift" | "eskalator" | "ramp";
+
+export interface Frequency {
+  headwayMinutes: number;
+  source: "STOP" | "LINE";
+  serviceHours?: string;
+}
+
+export interface RideOption {
+  lineId: string;
+  lineName?: string;
+  headsign?: string;
+  frequency?: Frequency;
+}
+
+export interface TransferAccess {
+  stationId: string;
+  need: TransferNeed;
+  status: AmenityStatus | "out_of_service";
 }
 
 export interface Route {

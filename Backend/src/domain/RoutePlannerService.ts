@@ -3,8 +3,8 @@
 // ditandai null dan TIDAK diperkirakan dari jarak (Tabel 3.4 no. 3, UC-01 E5).
 
 import type { RequestContext } from "../context";
-import type { CommuteApiClient, FareResult } from "../data/commute/CommuteApiClient";
-import type { Hub, Line, Mode, Route, RouteLeg, Station } from "./models";
+import type { CommuteApiClient, FareResult, LineHeadway } from "../data/commute/CommuteApiClient";
+import type { Frequency, Hub, Line, Mode, RideOption, Route, RouteLeg, Station } from "./models";
 
 /** Moda menurut kode operator, untuk ruas yang lininya tidak ada di daftar lini (mis. operator dikeluarkan). */
 const OPERATOR_MODE: Record<string, Mode> = { KCI: "RAIL", RLK: "RAIL", MRTJ: "SUBWAY", LRTJ: "TRAM", LRTJBDB: "TRAM", TJ: "BUS", APCGK: "MONORAIL" };
@@ -16,6 +16,11 @@ export function usesModes(route: Route, modes: readonly Mode[]): boolean {
 
 /** Biaya pindah lini (setara km) dalam pencarian rute topologi; berjalan antar stasiun hub ditambah jaraknya. */
 const TRANSFER_COST_KM = 2;
+/**
+ * Pengali jarak jalan kaki terhadap jarak naik kendaraan. 2 = rata-rata; pengguna yang butuh lift/ramp/eskalator
+ * memakai 4 agar perpindahan jauh kalah dari satu kali naik tambahan (meniru preferensi jalan kaki Commute).
+ */
+export const WALK_WEIGHT = { AVERAGE: 2, SLOW: 4 } as const;
 /** Jarak antar stasiun bila koordinat tidak tersedia (hanya untuk membandingkan rute, tidak ditampilkan). */
 const UNKNOWN_HOP_KM = 1;
 
@@ -40,7 +45,7 @@ export class RoutePlannerService {
    * agar tarif dan jadwalnya tetap dari dataset. Tidak ada rute yang lolos = rute dataset dikembalikan apa
    * adanya (pemanggil memberi peringatan).
    */
-  async getRouteAvoiding(fromId: string, toId: string, avoidModes: readonly Mode[], ctx: RequestContext, at?: string): Promise<Route | null> {
+  async getRouteAvoiding(fromId: string, toId: string, avoidModes: readonly Mode[], ctx: RequestContext, at?: string, walkWeight: number = WALK_WEIGHT.AVERAGE): Promise<Route | null> {
     const direct = await this.getRoute(fromId, toId, ctx, at);
     if (direct && !usesModes(direct, avoidModes)) return direct;
     const [stations, lines, hubs, sequences] = await Promise.all([
@@ -54,7 +59,7 @@ export class RoutePlannerService {
       const mode = lineById.get(s.lineId)?.mode;
       return !mode || !avoidModes.includes(mode);
     });
-    const rides = findRides(fromId, toId, allowed, hubs, new Map(stations.map((s) => [s.id, s])));
+    const rides = findRides(fromId, toId, allowed, hubs, new Map(stations.map((s) => [s.id, s])), walkWeight);
     if (!rides) return direct;
     const walksOf = hubs.flatMap((h) => h.walks);
     const parts = await Promise.all(
@@ -62,7 +67,18 @@ export class RoutePlannerService {
         if (r.lineId) return this.rideRoute(r, avoidModes, lineById, stations, ctx, at);
         const [a, b] = r.stops;
         const walk = walksOf.find((w) => (w.from === a && w.to === b) || (w.from === b && w.to === a));
-        return Promise.resolve(totals([{ type: "TRANSFER", stops: [a, b], distanceM: walk?.distanceM ?? 0, minutes: walk?.minutes ?? null, fare: 0 }]));
+        return Promise.resolve(
+          totals([
+            {
+              type: "TRANSFER",
+              stops: [a, b],
+              distanceM: walk?.distanceM ?? 0,
+              minutes: walk?.minutes ?? null,
+              fare: 0,
+              ...(walk?.notes ? { notes: walk.notes } : {}),
+            },
+          ]),
+        );
       }),
     );
     const legs: RouteLeg[] = [];
@@ -133,10 +149,19 @@ export class RoutePlannerService {
       const line = l.lineId ? lines.find((x) => x.id === l.lineId) : undefined;
       const mode = line?.mode ?? (l.operator ? OPERATOR_MODE[l.operator.toUpperCase()] : undefined);
       const minutes = l.departureAt && l.arrivalAt ? Math.round((Date.parse(l.arrivalAt) - Date.parse(l.departureAt)) / 60_000) : null;
+      const options: RideOption[] | undefined =
+        l.serviceLines && l.serviceLines.length > 1
+          ? l.serviceLines.map((x) => {
+              const ln = lines.find((y) => y.id === x.lineId);
+              return { lineId: x.lineId, ...(ln ? { lineName: ln.name } : {}), ...(x.headsign ? { headsign: x.headsign } : {}) };
+            })
+          : undefined;
       return {
         type: l.type,
         ...(l.lineId ? { lineId: l.lineId } : {}),
         ...(line ? { lineName: line.name, operator: line.operator } : {}),
+        ...(l.headsign ? { headsign: l.headsign } : {}),
+        ...(options ? { options } : {}),
         ...(l.type === "RIDE" && mode ? { mode } : {}),
         stops: l.stops,
         distanceM: l.distanceM,
@@ -149,6 +174,94 @@ export class RoutePlannerService {
     const route = totals(legs, fare.totalFare, fare.totalDistanceM);
     return Object.keys(fare.stopNames ?? {}).length ? { ...route, stopNames: fare.stopNames } : route;
   }
+
+  /**
+   * Melengkapi rute untuk ditampilkan:
+   * - ruas pindah antarstasiun: jarak, petunjuk jalan, dan pintu keluar dari /transfers;
+   * - ruas naik yang dilayani beberapa lin paralel tetapi belum punya pilihan (mis. ruas yang disusun sendiri):
+   *   lin lain dari operator yang sama yang berhenti di semua pemberhentian ruas itu berurutan;
+   * - ruas naik tanpa jadwal: frekuensi lin di pemberhentian naik (gabungan bila ada beberapa pilihan).
+   */
+  async annotate(route: Route, ctx: RequestContext, at?: string): Promise<Route> {
+    const needsParallel = route.legs.some((l) => l.type === "RIDE" && !l.options && l.lineId);
+    const [lines, sequences] = await Promise.all([this.commute.getLines(ctx), needsParallel ? this.commute.getLineSequences(ctx) : Promise.resolve([])]);
+    const lineById = new Map(lines.map((l) => [l.id, l]));
+    const legs = await Promise.all(
+      route.legs.map(async (leg): Promise<RouteLeg> => {
+        if (leg.type === "TRANSFER") {
+          const [a, b] = [leg.stops[0], leg.stops[leg.stops.length - 1]];
+          if (a === b) return leg;
+          const walk = await this.commute.getWalk(a, b, ctx).catch(() => undefined);
+          if (!walk) return leg;
+          return {
+            ...leg,
+            distanceM: leg.distanceM || walk.distanceM,
+            ...(leg.minutes === null && walk.minutes !== null ? { minutes: walk.minutes } : {}),
+            ...(walk.notes ? { notes: walk.notes } : {}),
+            ...(walk.fromExit ? { fromExit: walk.fromExit } : {}),
+            ...(walk.toExit ? { toExit: walk.toExit } : {}),
+          };
+        }
+        let out = leg;
+        if (!out.options && out.lineId) {
+          const operator = lineById.get(out.lineId)?.operator;
+          const parallel = parallelLines(out.stops, out.lineId, sequences, (id) => lineById.get(id)?.operator === operator);
+          if (parallel.length > 1) out = { ...out, options: parallel.map((id) => ({ lineId: id, ...(lineById.get(id) ? { lineName: lineById.get(id)!.name } : {}) })) };
+        }
+        // Waktu tempuh bukan jadwal: frekuensi tetap dicari selama jam berangkat tidak diketahui.
+        if (out.departureAt) return out;
+        const rows = await this.commute.getHeadways(out.stops[0], ctx, at);
+        if (!rows.length) return out;
+        const choices = out.options ?? [{ lineId: out.lineId ?? "", ...(out.headsign ? { headsign: out.headsign } : {}) }];
+        const options = choices.map((o) => {
+          // Lin utama memakai tujuan akhir ruas bila pilihan itu sendiri tidak membawanya.
+          const f = frequencyOf(rows, o.lineId, o.headsign ?? (o.lineId === out.lineId ? out.headsign : undefined));
+          return f ? { ...o, frequency: f } : o;
+        });
+        const frequency = combinedFrequency(options.map((o) => o.frequency));
+        return { ...out, ...(out.options ? { options } : {}), ...(frequency ? { frequency } : {}) };
+      }),
+    );
+    const next = { ...route, legs };
+    return { ...next, totalDistanceM: route.totalDistanceM || legs.reduce((s, l) => s + l.distanceM, 0) };
+  }
+}
+
+/** Frekuensi satu lin dari baris /headway; arah dipilih lewat tujuan akhir bila frekuensi dua arah berbeda. */
+export function frequencyOf(rows: LineHeadway[], lineId: string, headsign?: string): Frequency | undefined {
+  const mine = rows.filter((r) => r.lineId === lineId && r.headwayMinutes !== null);
+  if (!mine.length) return undefined;
+  const norm = (x: string) => x.toLowerCase().replace(/[^a-z0-9]+/g, " ").trim();
+  const byDir = headsign ? mine.find((r) => r.boundFor && (norm(r.boundFor).includes(norm(headsign)) || norm(headsign).includes(norm(r.boundFor)))) : undefined;
+  // Arah tidak diketahui: ambil yang paling jarang agar waktu tunggu tidak terlihat lebih singkat dari kenyataan.
+  const pick = byDir ?? mine.reduce((a, b) => (b.headwayMinutes! > a.headwayMinutes! ? b : a));
+  return { headwayMinutes: pick.headwayMinutes!, source: pick.source, ...(pick.serviceHours ? { serviceHours: pick.serviceHours } : {}) };
+}
+
+/** Frekuensi gabungan beberapa lin paralel: kendaraan lin mana pun yang datang lebih dulu bisa dinaiki. */
+export function combinedFrequency(list: (Frequency | undefined)[]): Frequency | undefined {
+  const known = list.filter((f): f is Frequency => !!f);
+  if (!known.length) return undefined;
+  if (known.length === 1) return known[0];
+  const perMinute = known.reduce((s, f) => s + 1 / f.headwayMinutes, 0);
+  return { headwayMinutes: Math.max(1, Math.round(1 / perMinute)), source: known.every((f) => f.source === "STOP") ? "STOP" : "LINE" };
+}
+
+/**
+ * Lin (memenuhi `same`) yang berhenti di SEMUA pemberhentian `stops` secara berurutan tanpa melewati
+ * pemberhentian lain di antaranya, ke arah mana pun. Lin `primary` paling depan.
+ */
+export function parallelLines(stops: string[], primary: string, sequences: { lineId: string; sequences: string[][] }[], same: (lineId: string) => boolean): string[] {
+  if (stops.length < 2) return [primary];
+  const covers = (seq: string[]) => {
+    for (const dir of [seq, [...seq].reverse()]) {
+      const i = dir.indexOf(stops[0]);
+      if (i >= 0 && stops.every((s, k) => dir[i + k] === s)) return true;
+    }
+    return false;
+  };
+  const found = sequences.filter((l) => l.lineId !== primary && same(l.lineId) && l.sequences.some(covers)).map((l) => l.lineId);
+  return [primary, ...new Set(found)];
 }
 
 export function totals(legs: RouteLeg[], totalFare?: number, totalDistanceM?: number): Route {
@@ -207,6 +320,7 @@ export function findRides(
   sequences: { lineId: string; sequences: string[][] }[],
   hubs: Hub[],
   stations: Map<string, Station>,
+  walkWeight: number = WALK_WEIGHT.AVERAGE,
 ): Ride[] | null {
   const hop = (a: string, b: string) => {
     const p = stations.get(a);
@@ -234,7 +348,7 @@ export function findRides(
   const addWalk = (a: string, b: string, m?: number) => {
     if (a === b) return;
     if (!walks.has(a)) walks.set(a, []);
-    walks.get(a)!.push({ to: b, cost: TRANSFER_COST_KM + (m !== undefined ? m / 1000 : hop(a, b)) * 2 });
+    walks.get(a)!.push({ to: b, cost: TRANSFER_COST_KM + (m !== undefined ? m / 1000 : hop(a, b)) * walkWeight });
   };
   for (const h of hubs) {
     if (h.walks.length) for (const w of h.walks) (addWalk(w.from, w.to, w.distanceM), addWalk(w.to, w.from, w.distanceM));

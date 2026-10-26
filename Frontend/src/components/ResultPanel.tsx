@@ -1,7 +1,7 @@
 "use client";
 
 import { AMENITY_LABEL, useNetwork } from "@/lib/network";
-import type { Alternative, AmenityType, JourneyPlan, Notice } from "@/lib/types";
+import type { Alternative, AmenityType, ExitRef, Frequency, JourneyPlan, Notice, RouteLeg } from "@/lib/types";
 import { AccessBadge } from "./AccessBadge";
 
 const km = (m: number) => `${(m / 1000).toLocaleString("id-ID", { maximumFractionDigits: 1 })} km`;
@@ -103,9 +103,11 @@ export function ResultPanel({
                       <p className="font-semibold">
                         {modeIcon(line?.mode ?? leg.mode ?? "RAIL")} {line ? `${line.operator} · ${line.name}` : leg.lineId}
                       </p>
+                      {leg.headsign && <p className="text-sm">Arah {leg.headsign}</p>}
                       <p className="text-sm text-[var(--muted)]">
                         {leg.stops.length - 1} pemberhentian · {km(leg.distanceM)} · {leg.minutes === null ? "waktu tidak tersedia" : `${leg.minutes} mnt`} · {rupiah(leg.fare)}
                       </p>
+                      <RideChoices leg={leg} />
                       {leg.stops.length > 2 && (
                         <details className="mt-1 text-sm">
                           <summary className="cursor-pointer">Lewati {leg.stops.length - 2} stasiun</summary>
@@ -131,6 +133,7 @@ export function ResultPanel({
                       )}
                     </p>
                   )}
+                  {leg.type === "TRANSFER" && <TransferHints leg={leg} name={name} />}
                   {leg.stops.some((s) => !positionOf(s)) && (
                     <p className="mt-1 text-xs text-[var(--muted)]">ⓘ Sebagian pemberhentian pada ruas ini belum ada di peta.</p>
                   )}
@@ -153,6 +156,73 @@ export function ResultPanel({
         </p>
         <p className="mt-1">{plan.attribution ?? "Data © Commute Data API, Shiori Labs (ODbL-1.0)."}</p>
       </footer>
+    </div>
+  );
+}
+
+const freqText = (f: Frequency) => `biasanya tiap ±${f.headwayMinutes} mnt${f.serviceHours ? ` (beroperasi ${f.serviceHours})` : ""}`;
+
+/** Lin paralel yang bisa dinaiki (pemberhentian dan tarif sama) dan frekuensi bila jadwal tidak tersedia. */
+function RideChoices({ leg }: { leg: RouteLeg }) {
+  const { lineById } = useNetwork();
+  const options = leg.options && leg.options.length > 1 ? leg.options : null;
+  if (!options && !leg.frequency) return null;
+  return (
+    <div className="mt-1 text-sm">
+      {options && (
+        <>
+          <p className="font-semibold">Naik yang datang lebih dulu:</p>
+          <ul className="mt-1 flex flex-wrap gap-2" aria-label="Pilihan lin">
+            {options.map((o) => {
+              const line = lineById(o.lineId);
+              return (
+                <li key={o.lineId} className="rounded-md border-2 px-2 py-0.5" style={{ borderColor: line?.color ?? "var(--muted)" }}>
+                  <b>{line?.name ?? o.lineName ?? o.lineId}</b>
+                  {o.headsign && <span className="text-[var(--muted)]"> · arah {o.headsign}</span>}
+                  {o.frequency && <span className="text-[var(--muted)]"> · ±{o.frequency.headwayMinutes} mnt</span>}
+                </li>
+              );
+            })}
+          </ul>
+        </>
+      )}
+      {leg.frequency && (
+        <p className="mt-1 text-[var(--muted)]">
+          <span aria-hidden>🕒</span> Jadwal tetap tidak tersedia; {options ? "gabungan semua pilihan " : ""}
+          {freqText(leg.frequency)}. Bukan jadwal pasti.
+        </p>
+      )}
+    </div>
+  );
+}
+
+const exitText = (e: ExitRef) => `${e.name ?? e.ref}${e.signs?.length ? ` (ikuti tanda ${e.signs.join(", ")})` : ""}`;
+const ACCESS_TEXT = { available: "tersedia", absent: "tidak tercatat", unknown: "belum ada data", out_of_service: "tidak berfungsi" } as const;
+
+/** Petunjuk jalan kaki dan status fasilitas yang dibutuhkan pengguna di titik pindah. */
+function TransferHints({ leg, name }: { leg: RouteLeg; name: (id: string) => string }) {
+  const lines = [
+    leg.fromExit && `Keluar lewat ${exitText(leg.fromExit)}.`,
+    leg.notes,
+    leg.toExit && `Masuk lewat ${exitText(leg.toExit)}.`,
+  ].filter((x): x is string => !!x);
+  if (!lines.length && !leg.access?.length) return null;
+  return (
+    <div className="mt-1 text-sm">
+      {lines.map((l) => (
+        <p key={l} className="text-[var(--muted)]">
+          <span aria-hidden>➜</span> {l}
+        </p>
+      ))}
+      {leg.access && leg.access.length > 0 && (
+        <ul className="mt-1" aria-label="Fasilitas untuk pindah">
+          {leg.access.map((a) => (
+            <li key={`${a.stationId}-${a.need}`} className={a.status === "available" ? "" : "text-[var(--warn)]"}>
+              <span aria-hidden>{a.status === "available" ? "✔" : "⚠"}</span> {AMENITY_LABEL[a.need]} di {name(a.stationId)}: {ACCESS_TEXT[a.status]}
+            </li>
+          ))}
+        </ul>
+      )}
     </div>
   );
 }

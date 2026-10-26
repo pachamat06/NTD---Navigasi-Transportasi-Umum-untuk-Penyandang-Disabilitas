@@ -265,3 +265,40 @@ describe("API admin", () => {
     expect((await request(app).post("/api/admin/auth/login").send({ email: "baru@ntd.test", password: "cukup-panjang-1" })).status).toBe(401);
   });
 });
+
+describe("Fasilitas saat pindah dan posisi peta", () => {
+  it("needs: status lift di titik pindah, peringatan, dan alternatif yang punya lift", async () => {
+    const { app } = await makeTestApp();
+    const d = (await plan(app, { originId: "jakarta-kota", destinationId: "dukuh-atas-mrt", needs: ["lift"] })).body.data;
+    const transfer = d.route.legs.find((l: { type: string; stops: string[] }) => l.type === "TRANSFER" && l.stops.includes("sudirman"));
+    expect(transfer.access).toEqual(expect.arrayContaining([{ stationId: "sudirman", need: "lift", status: "absent" }]));
+    expect(d.warnings.some((w: string) => w.includes("Lift tidak tercatat di Sudirman"))).toBe(true);
+    expect(d.alternatives[0]).toMatchObject({ viaStationId: "bni-city" });
+    expect((await plan(app, { originId: "jakarta-kota", destinationId: "dukuh-atas-mrt", needs: ["teleport"] })).body.code).toBe("INVALID");
+  });
+
+  it("admin menetapkan posisi stop dan bentuk jalur; terlihat di /api/map setelah terbit", async () => {
+    const { app, login } = await makeTestApp();
+    const auth = { Authorization: `Bearer ${await login()}` };
+    const stop = await request(app).post("/api/admin/content").set(auth).send({ kind: "map_stop", stationId: "bni-city", data: { x: 3586, y: 3695 } });
+    expect(stop.status).toBe(201);
+    const track = await request(app)
+      .post("/api/admin/content")
+      .set(auth)
+      .send({ kind: "map_track", stationId: "bni-city", data: { lineId: "krl-cikarang", fromStationId: "tanah-abang", toStationId: "bni-city", points: [[2962, 3610], [3030, 3676]] } });
+    expect(track.status).toBe(201);
+    expect(track.body.data.stationId).toBeNull();
+    // Validasi: lini dan stasiun harus dikenal, ujung tidak boleh sama, stop wajib punya stasiun.
+    expect((await request(app).post("/api/admin/content").set(auth).send({ kind: "map_track", data: { lineId: "zzz", fromStationId: "tanah-abang", toStationId: "bni-city", points: [] } })).status).toBe(400);
+    expect((await request(app).post("/api/admin/content").set(auth).send({ kind: "map_track", data: { lineId: "krl-cikarang", fromStationId: "bni-city", toStationId: "bni-city", points: [] } })).status).toBe(400);
+    expect((await request(app).post("/api/admin/content").set(auth).send({ kind: "map_stop", data: { x: 1, y: 1 } })).status).toBe(400);
+
+    expect((await request(app).get("/api/map")).body.data).toEqual({ stops: [], tracks: [] });
+    const preview = (await request(app).get("/api/map").set(auth).set("X-NTD-Preview", "1")).body.data;
+    expect(preview.stops).toEqual([expect.objectContaining({ stationId: "bni-city", x: 3586, y: 3695 })]);
+    await request(app).post("/api/admin/publish").set(auth).send({});
+    const net = (await request(app).get("/api/network")).body.data;
+    expect(net.map.stops).toHaveLength(1);
+    expect(net.map.tracks[0]).toMatchObject({ lineId: "krl-cikarang", fromStationId: "tanah-abang", toStationId: "bni-city", points: [[2962, 3610], [3030, 3676]] });
+  });
+});

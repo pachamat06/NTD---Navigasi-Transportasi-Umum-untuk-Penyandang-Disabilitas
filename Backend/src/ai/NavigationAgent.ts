@@ -6,7 +6,8 @@
 import type { RequestContext } from "../context";
 import type { ContentService, ContentSnapshot } from "../domain/content";
 import { routeStationIds, transferStationIds, usesModes } from "../domain/RoutePlannerService";
-import type { Alternative, JourneyPlan, Line, Mode, Notification, Route, Station, StationAssessment, StationDetail } from "../domain/models";
+import { AMENITY_LABEL } from "../domain/FacilityAnalysisService";
+import type { Alternative, JourneyPlan, Line, Mode, Notification, Route, Station, StationAssessment, StationDetail, TransferAccess, TransferNeed } from "../domain/models";
 import type { StationService } from "../domain/StationService";
 import { AppError } from "../errors";
 import { ATTRIBUTION, factsForPrompt, type GroundingGuard, type PlanFacts } from "./GroundingGuard";
@@ -26,6 +27,8 @@ export interface PlanInput {
   at?: string;
   /** Moda yang tidak ingin dipakai pengguna (mis. BUS). */
   avoidModes?: Mode[];
+  /** Fasilitas yang wajib ada di stasiun tempat pindah (mis. lift untuk pengguna kursi roda). */
+  needs?: TransferNeed[];
 }
 
 export interface AgentLogger {
@@ -39,6 +42,9 @@ Aturan:
 - Bila "dataTersedia" bernilai false, katakan data fasilitas stasiun itu belum tersedia; jangan menyimpulkan fasilitasnya tidak ada.
 - Status fasilitas "absent" berarti tidak tercatat pada data, bukan pasti tidak ada.
 - Sebutkan titik transfer yang perlu diperhatikan dan alternatif bila ada. Sebutkan pengumuman penting bila ada.
+- Bila ruas punya "pilihanLin", sebutkan bahwa lin mana pun dari daftar itu bisa dinaiki.
+- "frekuensiMenit" adalah rata-rata jarak antarkendaraan, BUKAN jadwal: tulis "biasanya tiap sekitar N menit", jangan menyebut jam berangkat.
+- Bila "aksesPindah" memuat fasilitas yang dibutuhkan berstatus selain "available", sebutkan dengan jelas.
 - Jangan menulis disclaimer; sistem menambahkannya sendiri.`;
 
 export class NavigationAgent {
@@ -69,7 +75,8 @@ export class NavigationAgent {
     const avoidModes = input.avoidModes ?? [];
     // Alternatif transfer juga tidak boleh memakai moda yang dihindari.
     const withoutModes = (alts: Alternative[]) => alts.filter((a) => !a.route || !usesModes(a.route, avoidModes));
-    let route = await this.tools.call("ambil_rute", { fromId: originId, toId: destinationId, viaId: input.viaStationId, at: input.at, avoidModes }, ctx, snap);
+    const needs = [...new Set(input.needs ?? [])];
+    let route = await this.tools.call("ambil_rute", { fromId: originId, toId: destinationId, viaId: input.viaStationId, at: input.at, avoidModes, needs }, ctx, snap);
     if (!route) {
       throw new AppError("NOT_FOUND", `Rute antara ${byId.get(originId)!.name} dan ${byId.get(destinationId)!.name} tidak ditemukan dalam data saat ini.`);
     }
@@ -92,7 +99,7 @@ export class NavigationAgent {
 
     // Permintaan GUI "hindari stasiun X": ganti rute bila titik transfernya termasuk yang dihindari.
     if (avoid.length && transferStationIds(route).some((t) => avoid.includes(t))) {
-      const alts = withoutModes(await this.tools.call("cari_alternatif", { originId, destinationId, route, assessments: assessmentMap(), hubs, avoid, at: input.at }, ctx, snap));
+      const alts = withoutModes(await this.tools.call("cari_alternatif", { originId, destinationId, route, assessments: assessmentMap(), hubs, avoid, at: input.at, needs }, ctx, snap));
       const pick = alts.find((a) => a.route);
       if (pick?.route) {
         route = pick.route;
@@ -102,13 +109,26 @@ export class NavigationAgent {
       }
     }
 
-    // 3. Transfer alternatif bila ada titik transfer yang tidak memadai.
+    // 3. Transfer alternatif bila ada titik transfer yang tidak memadai atau tidak punya fasilitas yang dibutuhkan.
     let alternatives: Alternative[] = [];
-    const weak = transferStationIds(route).filter((id) => id !== originId && id !== destinationId && !assessed.get(id)?.adequate);
+    const lacking = async (id: string) => {
+      if (!needs.length) return false;
+      const d = await this.stations.detail(id, ctx, snap, byId.get(id));
+      return !d || needs.some((n) => d.amenities[n] !== "available");
+    };
+    const weak: string[] = [];
+    for (const id of transferStationIds(route)) {
+      if (id === originId || id === destinationId) continue;
+      if (!assessed.get(id)?.adequate || (await lacking(id))) weak.push(id);
+    }
     if (weak.length) {
-      alternatives = withoutModes(await this.tools.call("cari_alternatif", { originId, destinationId, route, assessments: assessmentMap(), hubs, avoid, at: input.at }, ctx, snap));
+      alternatives = withoutModes(await this.tools.call("cari_alternatif", { originId, destinationId, route, assessments: assessmentMap(), hubs, avoid, at: input.at, needs }, ctx, snap));
       if (!alternatives.length) warnings.push("Tidak ada alternatif transfer yang lebih aksesibel di hub ini.");
     }
+
+    // 4. Lengkapi rute: jalan kaki saat pindah, lin paralel, dan frekuensi bila jadwal tidak tersedia.
+    route = await this.tools.call("lengkapi_rute", { route, at: input.at }, ctx, snap);
+    alternatives = await Promise.all(alternatives.map(async (a) => (a.route ? { ...a, route: await this.tools.call("lengkapi_rute", { route: a.route, at: input.at }, ctx, snap) } : a)));
 
     const routeIds = routeStationIds(route);
     const assessments = routeIds.map((id) => assessed.get(id)!);
@@ -126,6 +146,13 @@ export class NavigationAgent {
       if (d) details.set(id, d);
     }
 
+    // Fasilitas yang dibutuhkan pengguna di setiap stasiun tempat pindah.
+    if (needs.length) {
+      route = withTransferAccess(route, needs, details);
+      for (const a of alternatives) if (a.route) a.route = withTransferAccess(a.route, needs, details);
+      warnings.push(...accessWarnings(route, byId));
+    }
+
     // Pengumuman aktif untuk stasiun, lini, dan hub pada rute.
     const lineIds = [...new Set(route.legs.flatMap((l) => (l.lineId ? [l.lineId] : [])))];
     const hubIds = [...new Set(routeIds.map((id) => byId.get(id)?.hubId).filter((x): x is string => !!x))];
@@ -137,7 +164,7 @@ export class NavigationAgent {
     if (noData.length) warnings.push(`Data fasilitas belum tersedia untuk: ${noData.join(", ")}.`);
     for (const n of notices) if (n.severity !== "info") warnings.push(noticeText(n));
 
-    // 4. Notifikasi: LLM bila aktif, divalidasi Grounding Guard; cadangan template statis.
+    // 5. Notifikasi: LLM bila aktif, divalidasi Grounding Guard; cadangan template statis.
     const facts: PlanFacts = { route, assessments, alternatives, stations: details, knownStationNames: nameIndex(all), notices };
     const notification = await this.susunNotifikasi(facts, lines, snap, ctx.skipLlm === true);
 
@@ -181,6 +208,37 @@ export class NavigationAgent {
     }
     return template();
   }
+}
+
+/** Status fasilitas yang dibutuhkan di kedua ujung setiap ruas pindah (termasuk pindah lini di stasiun yang sama). */
+export function withTransferAccess(route: Route, needs: TransferNeed[], details: Map<string, StationDetail>): Route {
+  const legs = route.legs.map((leg) => {
+    if (leg.type !== "TRANSFER") return leg;
+    const ids = [...new Set([leg.stops[0], leg.stops[leg.stops.length - 1]])];
+    const access: TransferAccess[] = ids.flatMap((stationId) =>
+      needs.map((need) => {
+        const d = details.get(stationId);
+        const ntd = d?.amenityDetails.find((x) => x.type === need && x.source === "ntd");
+        return { stationId, need, status: ntd?.status === "out_of_service" ? "out_of_service" : (d?.amenities[need] ?? "unknown") };
+      }),
+    );
+    return { ...leg, access };
+  });
+  return { ...route, legs };
+}
+
+/** Peringatan untuk fasilitas yang dibutuhkan tetapi tidak tercatat, rusak, atau belum ada datanya. */
+export function accessWarnings(route: Route, byId: Map<string, Station>): string[] {
+  const out = new Set<string>();
+  for (const leg of route.legs)
+    for (const a of leg.access ?? []) {
+      const name = byId.get(a.stationId)?.name ?? route.stopNames?.[a.stationId] ?? a.stationId;
+      const label = AMENITY_LABEL[a.need] ?? a.need;
+      if (a.status === "out_of_service") out.add(`${label} di ${name} dilaporkan sedang tidak berfungsi; perpindahan di sini mungkin tidak bisa dilakukan.`);
+      else if (a.status === "absent") out.add(`${label} tidak tercatat di ${name}, padahal Anda membutuhkannya untuk pindah. Pertimbangkan alternatif atau minta bantuan petugas.`);
+      else if (a.status === "unknown") out.add(`Data ${label.toLowerCase()} di ${name} belum tersedia; belum bisa dipastikan perpindahan di sini dapat dilakukan.`);
+    }
+  return [...out];
 }
 
 function nameIndex(stations: Station[]): Map<string, string> {

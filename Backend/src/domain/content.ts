@@ -1,6 +1,6 @@
 // Konten yang tidak disediakan dataset dan dikelola tim lewat halaman admin:
 // koreksi/tambahan fasilitas, pintu akses stasiun, pengumuman (sumber notifikasi), info lain,
-// serta pengaturan skor dan disclaimer. Validasi skema di sini dipakai bersama oleh endpoint admin.
+// posisi pemberhentian dan bentuk jalur pada peta, serta pengaturan skor dan disclaimer. Validasi skema di sini dipakai bersama oleh endpoint admin.
 
 import { z } from "zod";
 import type { RequestContext } from "../context";
@@ -47,6 +47,30 @@ export const stationInfoSchema = z.object({
   body: z.string().min(1).max(2000),
 });
 
+/** Titik pada Aset Peta Transit (satuan pt peta FDTJ 2026-08c, 9513.57 x 6726.88). */
+const mapPoint = z.tuple([z.number().min(-500).max(10_500), z.number().min(-500).max(7_500)]);
+
+/** Posisi titik pemberhentian yang ditetapkan admin; menang atas posisi otomatis. */
+export const mapStopSchema = z.object({
+  x: z.number().min(-500).max(10_500),
+  y: z.number().min(-500).max(7_500),
+  note: z.string().max(500).optional(),
+});
+
+/** Bentuk jalur satu lini antara dua pemberhentian bersebelahan (titik belok di antaranya, urut dari `fromStationId`). */
+export const mapTrackSchema = z
+  .object({
+    lineId: z.string().min(1).max(80),
+    fromStationId: z.string().min(1).max(80),
+    toStationId: z.string().min(1).max(80),
+    points: z.array(mapPoint).max(300),
+    note: z.string().max(500).optional(),
+  })
+  .refine((t) => t.fromStationId !== t.toStationId, { message: "fromStationId dan toStationId harus berbeda", path: ["toStationId"] });
+
+export type MapStop = z.infer<typeof mapStopSchema> & { stationId: string };
+export type MapTrack = z.infer<typeof mapTrackSchema> & { id: string };
+
 export const DEFAULT_DISCLAIMER =
   "Informasi fasilitas berasal dari data statis dan bisa berbeda dengan kondisi di lapangan. Bukan status real-time.";
 
@@ -80,6 +104,8 @@ export const SCHEMAS: Record<Exclude<ContentKind, "settings">, z.ZodType> = {
   entrance: entranceSchema,
   notice: noticeSchema,
   station_info: stationInfoSchema,
+  map_stop: mapStopSchema,
+  map_track: mapTrackSchema,
 };
 
 /** Konten yang terlihat: published untuk pengguna; draft (bila ada) untuk mode pratinjau admin. */
@@ -94,6 +120,8 @@ export class ContentSnapshot {
   private entrances = new Map<string, Entrance[]>();
   private info = new Map<string, StationInfo[]>();
   private noticeList: Notice[] = [];
+  private stops = new Map<string, MapStop>();
+  private tracks: MapTrack[] = [];
   readonly settings: Settings;
 
   constructor(items: ContentItem[], preview: boolean, now: Date) {
@@ -127,6 +155,13 @@ export class ContentSnapshot {
           this.noticeList.push({ ...n, id: it.id });
           break;
         }
+        case "map_stop":
+          // Satu posisi per pemberhentian; entri terbaru menang.
+          this.stops.set(sid, { ...(v as z.infer<typeof mapStopSchema>), stationId: sid });
+          break;
+        case "map_track":
+          this.tracks.push({ ...(v as z.infer<typeof mapTrackSchema>), id: it.id });
+          break;
         case "settings":
           settings = { ...DEFAULT_SETTINGS, ...(v as Partial<Settings>) };
           break;
@@ -159,6 +194,11 @@ export class ContentSnapshot {
           (n.scope === "hub" && scope.hubIds?.includes(n.targetId!)),
       )
       .sort((a, b) => rank[a.severity] - rank[b.severity]);
+  }
+
+  /** Posisi dan bentuk jalur yang ditetapkan admin pada peta. */
+  mapOverrides(): { stops: MapStop[]; tracks: MapTrack[] } {
+    return { stops: [...this.stops.values()], tracks: [...this.tracks] };
   }
 
   allNotices(): Notice[] {

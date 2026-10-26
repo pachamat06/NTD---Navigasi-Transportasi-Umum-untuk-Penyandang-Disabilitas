@@ -4,6 +4,7 @@ import { Router } from "express";
 import { z } from "zod";
 import { ATTRIBUTION } from "../ai/GroundingGuard";
 import { AMENITY_LABEL } from "../domain/FacilityAnalysisService";
+import { TRANSFER_NEEDS } from "../domain/models";
 import { AppError } from "../errors";
 import type { Services } from "../services";
 import { ok, parse } from "./middleware";
@@ -16,6 +17,8 @@ export const planSchema = z.object({
   viaStationId: stationId.optional(),
   avoid: z.array(stationId).max(10).optional(),
   avoidModes: z.array(z.enum(["RAIL", "SUBWAY", "TRAM", "BUS", "MONORAIL"])).max(5).optional(),
+  /** Fasilitas yang wajib ada di stasiun tempat pindah, mis. ["lift"] untuk pengguna kursi roda. */
+  needs: z.array(z.enum(TRANSFER_NEEDS)).max(3).optional(),
   at: z
     .string()
     .refine((v) => !Number.isNaN(Date.parse(v)), "harus tanggal ISO 8601")
@@ -69,8 +72,11 @@ export function publicRoutes(s: Services): Router {
         return { ...st, ...facilities, assessment };
       }),
     );
-    ok(res, { stations, lines, hubs });
+    ok(res, { stations, lines, hubs, map: snap.mapOverrides() });
   });
+
+  // Posisi pemberhentian dan bentuk jalur yang ditetapkan admin pada Aset Peta Transit.
+  r.get("/map", async (req, res) => ok(res, (await s.content.snapshot(req.ctx)).mapOverrides()));
 
   r.get("/lines", async (req, res) => ok(res, await s.stations.lines(req.ctx)));
   r.get("/hubs", async (req, res) => ok(res, await s.stations.hubs(req.ctx)));

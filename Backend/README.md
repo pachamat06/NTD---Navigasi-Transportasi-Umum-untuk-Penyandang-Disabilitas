@@ -39,7 +39,7 @@ Semua variabel lingkungan terdokumentasi di [.env.example](.env.example).
 | Layanan domain | `src/domain/StationService.ts`, `RoutePlannerService.ts`, `FacilityAnalysisService.ts`, `AlternativeService.ts` |
 | Grounding Guard | `src/ai/GroundingGuard.ts`: cek nama stasiun, angka, dan klaim fasilitas; gagal berarti template statis. Disclaimer ditambahkan sistem |
 | Klien LLM | `src/ai/llm/` (`ClaudeClient`, `GptClient`, antarmuka `LlmClient`) |
-| CommuteApiClient + cache | `src/data/commute/CommuteApiClient.ts`: cache-first dengan TTL; tarif selalu segar dengan cadangan cache basi (UC-01 E2) |
+| CommuteApiClient + cache | `src/data/commute/CommuteApiClient.ts`: cache-first dengan TTL, satu permintaan per kunci (single-flight), salinan kedaluwarsa < 7 hari disajikan sambil diperbarui di latar belakang; tarif selalu segar dengan cadangan cache basi (UC-01 E2). HTTP 429 dari Commute menahan permintaan sampai `Retry-After` |
 | Basis data | `src/store/pg.ts` + `migrations/`; alternatif memori `src/store/memory.ts` |
 
 Sumber data Commute (`COMMUTE_SOURCE`):
@@ -59,6 +59,8 @@ Dataset tidak memuat semua informasi aksesibilitas, jadi tim melengkapinya lewat
 - `entrance`: pintu akses stasiun (nama, lokasi, fitur seperti lift/ramp/guiding block, jam buka).
 - `station_info`: info lain (kontak layanan, layanan pendampingan, dll.).
 - `notice`: pengumuman/notifikasi untuk stasiun, lini, hub, atau global, dengan periode aktif dan tingkat (`info`, `warning`, `critical`).
+- `map_stop`: posisi pemberhentian pada Aset Peta Transit (`{x, y}`, satuan pt peta FDTJ), menang atas posisi otomatis.
+- `map_track`: bentuk jalur satu lini antara dua pemberhentian bersebelahan (`{lineId, fromStationId, toStationId, points}`).
 - `settings`: bobot skor aksesibilitas, ambang memadai, disclaimer, LLM on/off, TTL cache, wajib lulus uji sebelum publikasi.
 
 Setiap konten punya versi **draft** dan **terbit**. Pengguna hanya melihat versi terbit. Admin bisa melihat hasil API dengan draft memakai header `X-NTD-Preview: 1` plus token admin. Publikasi menyalin draft ke terbit dan (opsional) menjalankan semua kasus uji API terlebih dahulu.
@@ -77,12 +79,17 @@ Respons sukses `{"status":"ok","data":...}`; gagal `{"status":"error","code","me
 | GET | `/api/meta` | Disclaimer, atribusi, bobot skor, label fasilitas, sumber data |
 | GET | `/api/stations?q=&limit=` | Daftar stasiun, atau pencarian untuk autocomplete |
 | GET | `/api/stations/:id` | Detail stasiun: fasilitas tergabung, skor, pintu akses, info, pengumuman |
-| GET | `/api/network` | Data awal GUI: semua stasiun (fasilitas + skor), lini, dan hub |
+| GET | `/api/network` | Data awal GUI: semua stasiun (fasilitas + skor, `commuteIds` untuk posisi peta), lini, hub, dan `map` (posisi stop dan bentuk jalur dari admin) |
+| GET | `/api/map` | Posisi stop dan bentuk jalur dari admin saja |
 | GET | `/api/lines`, `/api/hubs` | Lini dan hub antarmoda |
 | GET | `/api/notices?stationId=&lineId=&hubId=` | Pengumuman aktif |
-| POST | `/api/plan` | Rencana perjalanan (UC-01). Body `{originId, destinationId, viaStationId?, avoid?, avoidModes?, at?}`; `avoidModes` berisi moda yang dihindari (`RAIL`, `SUBWAY`, `TRAM`, `BUS`, `MONORAIL`) |
+| POST | `/api/plan` | Rencana perjalanan (UC-01). Body `{originId, destinationId, viaStationId?, avoid?, avoidModes?, needs?, at?}`; `avoidModes` berisi moda yang dihindari (`RAIL`, `SUBWAY`, `TRAM`, `BUS`, `MONORAIL`); `needs` berisi fasilitas yang wajib ada saat pindah (`lift`, `eskalator`, `ramp`) |
 
 Dengan `avoidModes`, bila rute dataset memakai moda yang dihindari, backend mencari rute sendiri di atas urutan stasiun lini yang diizinkan (`/lines`, termasuk cabang) dan perpindahan di hub, lalu meminta `/fares` untuk tiap ruas naik agar tarif dan jadwalnya tetap dari dataset. Ruas yang tarifnya tidak tersedia disusun dari urutan stasiun lini (tarif 0, waktu kosong) dan diberi peringatan. Bila tidak ada rute yang lolos, rute dataset tetap ditampilkan dengan peringatan.
+
+Dengan `needs`, tiap ruas pindah memuat `access` (status tiap fasilitas di kedua ujung), titik pindah yang tidak memenuhi dicarikan alternatif di hub yang sama, jalan kaki diberi bobot lebih berat, dan peringatan ditambahkan bila fasilitas tidak tercatat, rusak, atau belum ada datanya.
+
+Rute dilengkapi dari Commute: jarak, petunjuk, dan pintu keluar jalan kaki saat pindah (`/stations/{op}/{code}/transfers`); lin paralel yang berhenti di pemberhentian yang sama dengan tarif sama sebagai `options` (mis. TJ 4, 4D, 5, 5C dari Matraman ke Kesatrian; dari `serviceLines` /fares, atau urutan halte lin operator yang sama); dan `frequency` (headway gabungan, `/stations/{op}/{code}/headway`) karena /fares tidak memberi jam keberangkatan. `at` diteruskan ke /fares untuk tarif peak/off-peak.
 
 `POST /api/plan` mengembalikan rute (bentuk sama dengan `Frontend/src/lib/types.ts`), penilaian fasilitas tiap stasiun transit, hingga 3 alternatif via stasiun lain di hub yang sama, pengumuman terkait, narasi notifikasi, peringatan (mis. data dari cache), disclaimer, dan atribusi.
 

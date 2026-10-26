@@ -54,18 +54,46 @@ export interface UpLine {
   segments?: { stations: UpStopRef[]; joinsAt?: UpStopRef }[];
 }
 
+/** Pintu keluar stasiun (/stations/{op}/{code}/exits, rujukan pada transfer). */
+export interface UpExitRef {
+  /** Nama pintu persis seperti papan petunjuk, mis. "B". */
+  ref: string;
+  name?: string | null;
+  /** Isi papan petunjuk pintu itu, urut seperti tercetak. */
+  signs?: string[];
+}
+
 export interface UpHubTransfer {
   from: UpStopRef;
   to: UpStopRef;
   distanceM: number;
   durationS?: number | null;
+  /** Petunjuk jalan dari sumber data, mis. "Keluar lewat pintu B, lalu ...". */
+  notes?: string | null;
+  fromExit?: UpExitRef;
+  toExit?: UpExitRef;
 }
 
 export interface UpHub {
   id: string;
   name: string;
+  /** "integrated" = bagi penumpang satu tempat; "hub" = beberapa stasiun dalam satu kompleks. */
+  kind?: "hub" | "integrated";
   stations: UpStopRef[];
   transfers?: UpHubTransfer[];
+}
+
+/** Frekuensi kendaraan satu lin di satu pemberhentian (/stations/{op}/{code}/headway). BUKAN jadwal. */
+export interface UpHeadway {
+  operator: string;
+  line: string;
+  /** Rata-rata jarak antarkendaraan (detik); null = lin tidak jalan pada hari itu. */
+  headwayS: number | null;
+  /** Tujuan akhir arah ini, bila dua arah berbeda frekuensinya. */
+  boundFor?: string;
+  /** "STOP" = diukur di pemberhentian ini, "LINE" = rata-rata se-lin. */
+  source?: "STOP" | "LINE";
+  serviceHours?: { start: string; end: string } | { allDay: true };
 }
 
 export interface UpStopTime {
@@ -74,10 +102,21 @@ export interface UpStopTime {
   departureAt?: string | null;
 }
 
+/** Lin yang melayani ruas yang sama (jalur dipakai bersama), mis. TJ 4, 4D, 5, 5C dari Matraman ke Kesatrian. */
+export interface UpServiceLine {
+  operator: string;
+  line: string;
+  headsign?: string | null;
+}
+
 export interface UpLeg {
   type: "RIDE" | "TRANSFER";
   operator?: string;
   line?: string;
+  /** Tujuan akhir kendaraan pada ruas naik. */
+  headsign?: string | null;
+  /** Lin lain yang berhenti di pemberhentian yang sama sepanjang ruas ini (termasuk lin utama, paling depan). */
+  serviceLines?: UpServiceLine[];
   stops: UpStopRef[];
   /** Nama tampilan tiap pemberhentian (sejajar dengan `stops`), bila sumber menyediakannya. */
   stopNames?: string[];
@@ -106,6 +145,10 @@ export interface CommuteSource {
   /** null bila rute tidak ditemukan. */
   getFare(from: UpStopRef, to: UpStopRef, at?: string): Promise<UpFare | null>;
   getHubs(): Promise<UpHub[]>;
+  /** Transfer jalan kaki dari satu stasiun (jarak, petunjuk, pintu). Tidak diisi = sumber tidak menyediakan. */
+  getTransfers?(operator: string, code: string): Promise<UpHubTransfer[] | null>;
+  /** Frekuensi lin di satu pemberhentian pada waktu `at` (default sekarang). Tidak diisi = sumber tidak menyediakan. */
+  getHeadways?(operator: string, code: string, at?: string): Promise<UpHeadway[] | null>;
   getOperators(): Promise<UpOperator[]>;
   getLines(): Promise<UpLine[]>;
   getLine(operator: string, lineCode: string): Promise<UpLine | null>;

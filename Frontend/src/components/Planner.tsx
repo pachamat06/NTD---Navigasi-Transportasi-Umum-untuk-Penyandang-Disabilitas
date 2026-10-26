@@ -3,7 +3,7 @@
 import { useEffect, useRef, useState } from "react";
 import { fetchNotices, planJourney } from "@/lib/api";
 import { useNetwork } from "@/lib/network";
-import type { Alternative, JourneyPlan, Mode, Notice } from "@/lib/types";
+import type { Alternative, JourneyPlan, Mode, Notice, TransferNeed } from "@/lib/types";
 import { AboutDialog, SettingsDialog, StationDetail, type DisplaySettings } from "./Dialogs";
 import { NoticeBanner, ResultPanel } from "./ResultPanel";
 import { StationCombobox } from "./StationCombobox";
@@ -39,12 +39,15 @@ function loadSettings(): DisplaySettings {
 
 const MODE_ORDER: Mode[] = ["RAIL", "SUBWAY", "TRAM", "BUS", "MONORAIL"];
 const MODE_LABEL: Record<Mode, string> = { RAIL: "KRL", SUBWAY: "MRT", TRAM: "LRT", BUS: "TransJakarta", MONORAIL: "Kalayang" };
+const NEED_LABEL: Record<TransferNeed, string> = { lift: "Lift", eskalator: "Eskalator", ramp: "Ramp" };
 
 export function Planner() {
   const { stationById, lineById, hubById, meta, lines } = useNetwork();
   // Moda yang ada di jaringan, urut tetap agar pilihan tidak berpindah tempat.
   const modes = MODE_ORDER.filter((m) => lines.some((l) => l.mode === m));
   const [avoidModes, setAvoidModes] = useState<Mode[]>([]);
+  // Fasilitas yang wajib ada di titik pindah; Backend mencari transfer lain bila tidak terpenuhi.
+  const [needs, setNeeds] = useState<TransferNeed[]>([]);
   const noticeTarget = (n: Notice) =>
     n.scope === "station" ? stationById(n.targetId ?? "")?.name : n.scope === "line" ? lineById(n.targetId ?? "")?.name : n.scope === "hub" ? `Hub ${hubById(n.targetId ?? "")?.name ?? n.targetId}` : undefined;
   const [origin, setOrigin] = useState<string | null>(null);
@@ -94,7 +97,7 @@ export function Planner() {
     if (!origin || !destination) return;
     const id = ++runId.current;
     // Permintaan ke Backend berjalan sejak awal; langkah di layar hanya penanda kemajuan.
-    const request = planJourney(origin, destination, { avoid, avoidModes });
+    const request = planJourney(origin, destination, { avoid, avoidModes, needs });
     let done = false;
     request.finally(() => (done = true));
     for (let step = 0; step < STEPS.length - 1 && !done; step++) {
@@ -206,6 +209,33 @@ export function Planner() {
                   )}
                 </fieldset>
               )}
+              <fieldset className="mt-2">
+                <legend className="mb-1 font-semibold">Butuh fasilitas saat pindah</legend>
+                <div className="flex flex-wrap gap-2">
+                  {(Object.keys(NEED_LABEL) as TransferNeed[]).map((n) => {
+                    const on = needs.includes(n);
+                    return (
+                      <label key={n} className={`mode-chip ${on ? "mode-chip-on" : ""}`}>
+                        <input
+                          type="checkbox"
+                          className="sr-only"
+                          checked={on}
+                          onChange={() => {
+                            setNeeds((cur) => (cur.includes(n) ? cur.filter((x) => x !== n) : [...cur, n]));
+                            if (phase.kind !== "idle") reset();
+                          }}
+                        />
+                        <span aria-hidden>{on ? "✓" : "+"}</span> {NEED_LABEL[n]}
+                      </label>
+                    );
+                  })}
+                </div>
+                {needs.length > 0 && (
+                  <p className="mt-1 text-sm text-[var(--muted)]">
+                    Titik pindah dipilih yang punya {needs.map((n) => NEED_LABEL[n].toLowerCase()).join(" dan ")} bila memungkinkan.
+                  </p>
+                )}
+              </fieldset>
               <button type="submit" className="btn btn-primary mt-2 min-h-14 text-lg" disabled={!canSearch || phase.kind === "loading"}>
                 Cari Rute
               </button>

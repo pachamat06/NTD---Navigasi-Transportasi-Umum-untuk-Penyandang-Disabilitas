@@ -159,7 +159,7 @@ describe("HttpCommuteSource (bentuk Commute Data API asli)", () => {
     expect(net.hubs).toEqual([expect.objectContaining({ id: "dukuh-atas", memberIds: ["sudirman", "bni-city", "dukuh-atas-mrt", "dukuh-atas-lrt"] })]);
     expect(net.stations.find((s: { id: string }) => s.id === "sudirman")).toMatchObject({ hubId: "dukuh-atas", lineIds: ["krl-cikarang"] });
     // Amenity dibaca dari daftar stasiun, tanpa panggilan per stasiun.
-    expect(api.calls.filter((c) => /^stations\/.+/.test(c))).toEqual([]);
+    expect(api.calls.filter((c) => /^stations\/[^/]+\/[^/]+$/.test(c))).toEqual([]);
   });
 
   it("rencana perjalanan memakai /fares/{OP-KODE}/{OP-KODE}", async () => {

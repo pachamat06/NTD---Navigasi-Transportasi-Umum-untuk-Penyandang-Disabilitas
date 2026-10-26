@@ -6,7 +6,7 @@
 import type { Mode } from "../../domain/models";
 import { UpstreamError } from "../../errors";
 import { LINE_INDEX, lineIdOf, refsOf, stationIdOf } from "./station-index";
-import type { CommuteSource, UpFare, UpHub, UpLeg, UpLine, UpOperator, UpStation, UpStopRef } from "./types";
+import type { CommuteSource, UpFare, UpHub, UpHubTransfer, UpLeg, UpLine, UpOperator, UpStation, UpStopRef } from "./types";
 
 type A = "y" | "n" | "?";
 
@@ -182,6 +182,16 @@ export class FixtureCommuteSource implements CommuteSource {
         transfers: HUB.walks.map(([f, t, d, min]) => ({ from: refFor(f), to: refFor(t), distanceM: d, durationS: min === null ? null : min * 60 })),
       },
     ];
+  }
+
+  async getTransfers(operator: string, code: string): Promise<UpHubTransfer[] | null> {
+    this.check();
+    const id = stationIdOf({ operator, code });
+    if (!STATIONS.some((s) => s.id === id)) return null;
+    return HUB.walks.flatMap(([f, t, d, min]) => {
+      const other = f === id ? t : t === id ? f : null;
+      return other ? [{ from: { operator, code }, to: refFor(other), distanceM: d, durationS: min === null ? null : min * 60 }] : [];
+    });
   }
 
   async getFare(from: UpStopRef, to: UpStopRef, at?: string): Promise<UpFare | null> {

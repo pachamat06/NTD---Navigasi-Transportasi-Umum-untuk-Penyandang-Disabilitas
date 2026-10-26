@@ -27,7 +27,7 @@ const TOUCH_PX = 22; // radius area sentuh di layar (diameter 44 px)
  * memakai indeks posisi (kode stasiun -> x, y). Peta hanya untuk memilih dan menyorot, bukan menghitung rute.
  */
 export function TransitMap({ originId, destinationId, route, onSetOrigin, onSetDestination, onShowDetail }: Props) {
-  const { stations: STATIONS, hubs: HUBS, lineById, assess, positionOf } = useNetwork();
+  const { stations: STATIONS, hubs: HUBS, lineById, assess, positionOf, mapTracks } = useNetwork();
   const boxRef = useRef<HTMLDivElement>(null);
   const [size, setSize] = useState({ w: 800, h: 520 });
   const [view, setView] = useState<View>({ x: MAP_ASSET.initialView.x, y: MAP_ASSET.initialView.y, w: MAP_ASSET.initialView.width });
@@ -173,12 +173,15 @@ export function TransitMap({ originId, destinationId, route, onSetOrigin, onSetD
           {route && <rect x={0} y={0} width={MAP_ASSET.width} height={MAP_ASSET.height} fill="#ffffff" opacity={0.6} />}
 
           {route?.legs.map((leg, i) => {
-            const placed = leg.stops.map((s) => positionOf(s)).filter((p) => !!p);
+            const placed = leg.stops.flatMap((id) => {
+              const p = positionOf(id);
+              return p ? [{ id, ...p }] : [];
+            });
             const color = leg.type === "RIDE" ? (lineById(leg.lineId!)?.color ?? "#555555") : "#111111";
-            // Ruas naik mengikuti jalur di peta antar pemberhentian; jalur yang tak terbaca memakai bentuk lini
-            // kurasi, lalu garis lurus. Perpindahan tetap garis lurus.
+            // Ruas naik mengikuti bentuk jalur dari admin atau jalur di peta antar pemberhentian; jalur yang tak
+            // terbaca memakai bentuk lini kurasi, lalu garis lurus. Perpindahan tetap garis lurus.
             const shaped = leg.type === "RIDE" ? legGeometry(leg.lineId!, leg.stops[0], leg.stops[leg.stops.length - 1]) : [];
-            const traced = leg.type === "RIDE" ? ridePath(placed, color) : placed.map((p) => [p.x, p.y] as [number, number]);
+            const traced = leg.type === "RIDE" ? ridePath(placed, color, { lineId: leg.lineId, tracks: mapTracks }) : placed.map((p) => [p.x, p.y] as [number, number]);
             const pts = leg.type === "RIDE" && traced.length <= placed.length && shaped.length >= 2 ? shaped : traced;
             if (pts.length < 2 || (leg.type === "TRANSFER" && leg.stops[0] === leg.stops[1])) return null;
             const d = pts.map((p) => p.join(",")).join(" ");

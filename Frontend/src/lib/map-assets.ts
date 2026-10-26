@@ -2,7 +2,9 @@
 // Umum Jakarta (FDTJ, edisi 2026-08c). Hanya untuk menggambar; data stasiun, lini, fasilitas, dan
 // rute berasal dari Backend (lihat network.tsx).
 
+import COMMUTE_POINTS from "../data/commute-map-points.json";
 import { BUS_STOPS, RAIL_STOPS, TRACKS, type BusStopLabel } from "./map-stops";
+import type { MapStop, MapTrack } from "./types";
 
 type Pt = [number, number];
 
@@ -87,7 +89,12 @@ export interface PositionedStation {
   name: string;
   codes: string[];
   lineIds: string[];
+  /** Station id Commute (mis. "KCI-SUDB"), kunci posisi pada points.json Commute. */
+  commuteIds?: string[];
 }
+
+/** Posisi stasiun pada peta FDTJ yang sama, dari Commute (station id -> titik tengah penanda). */
+const COMMUTE_AT = COMMUTE_POINTS.points as unknown as Record<string, Pt>;
 
 const norm = (s: string) =>
   s
@@ -98,20 +105,40 @@ const norm = (s: string) =>
     .trim();
 
 /**
- * Indeks posisi semua stasiun: (1) nomor stasiun yang sama dengan penanda di peta (mis. C12, 1-13),
- * (2) STOP_POSITIONS yang dikurasi, (3) khusus halte TransJakarta: nama halte di peta, dipersempit dengan
- * nomor koridor. Stasiun yang tidak ditemukan tidak digambar di peta.
+ * Indeks posisi semua stasiun: (1) posisi yang ditetapkan admin, (2) nomor stasiun yang sama dengan
+ * penanda di peta (mis. C12, 1-13), (3) station id Commute pada points.json Commute, (4) STOP_POSITIONS
+ * yang dikurasi, (5) khusus halte TransJakarta: nama halte di peta, dipersempit dengan nomor koridor.
+ * Stasiun yang tidak ditemukan tidak digambar di peta.
  */
-export function buildPositions(stations: PositionedStation[]): Map<string, { x: number; y: number }> {
+export function buildPositions(stations: PositionedStation[], overrides: MapStop[] = []): Map<string, { x: number; y: number }> {
   const out = new Map<string, { x: number; y: number }>();
+  const manual = new Map(overrides.map((o) => [o.stationId, { x: o.x, y: o.y }]));
   const busByCode = new Map<string, BusStopLabel>();
   for (const b of BUS_STOPS) for (const c of b.codes) busByCode.set(c, b);
   const busNames = BUS_STOPS.filter((b) => b.name).map((b) => ({ b, n: norm(b.name), corridors: b.codes.map((c) => c.split("-")[0]) }));
   for (const s of stations) {
-    // Penanda di peta lebih dulu, agar titik tepat di lingkaran pemberhentian.
-    const code = s.codes.find((c) => RAIL_STOPS[c] || busByCode.get(c)?.exact) ?? s.codes.find((c) => busByCode.has(c));
+    const set = manual.get(s.id);
+    if (set) {
+      out.set(s.id, set);
+      continue;
+    }
+    // Penanda di peta lebih dulu, agar titik tepat di lingkaran pemberhentian lini tersebut.
+    const code = s.codes.find((c) => RAIL_STOPS[c] || busByCode.get(c)?.exact);
     if (code) {
       const [x, y] = RAIL_STOPS[code] ?? busByCode.get(code)!.at;
+      out.set(s.id, { x, y });
+      continue;
+    }
+    // Commute memakai peta FDTJ yang sama, jadi station id-nya kunci yang stabil (tanpa mencocokkan nama).
+    const live = s.commuteIds?.find((c) => COMMUTE_AT[c]);
+    if (live) {
+      const [x, y] = COMMUTE_AT[live];
+      out.set(s.id, { x, y });
+      continue;
+    }
+    const label = s.codes.find((c) => busByCode.has(c));
+    if (label) {
+      const [x, y] = busByCode.get(label)!.at;
       out.set(s.id, { x, y });
       continue;
     }
@@ -177,10 +204,13 @@ function trackGraph() {
   return graph;
 }
 
-/** Kunci penanda (kode stasiun/halte) yang tepat berada di posisi `p`, bila ada. */
+/**
+ * Kunci penanda (kode stasiun/halte) terdekat dari posisi `p`, bila ada. Toleransinya selebar penanda,
+ * karena posisi dari Commute atau admin bisa sedikit bergeser dari pusat lingkaran.
+ */
 function nodeAt(p: Pt): string | undefined {
   let best: string | undefined;
-  let bestD = 4;
+  let bestD = 12;
   for (const [key, at] of trackGraph().nodes) {
     const d = dist(at, p);
     if (d < bestD) [best, bestD] = [key, d];
@@ -223,16 +253,30 @@ function trackBetween(a: string, b: string, color: [number, number, number], str
   return parts.flatMap((pts, i) => (i ? pts.slice(1) : pts));
 }
 
+/** Bentuk jalur dari admin untuk lini `lineId` dari `from` ke `to` (dibalik bila tersimpan terbalik). */
+function manualTrack(tracks: MapTrack[], lineId: string | undefined, from: string, to: string): Pt[] | null {
+  if (!lineId) return null;
+  for (const t of tracks) {
+    if (t.lineId !== lineId) continue;
+    if (t.fromStationId === from && t.toStationId === to) return t.points;
+    if (t.fromStationId === to && t.toStationId === from) return [...t.points].reverse();
+  }
+  return null;
+}
+
 /**
  * Garis untuk satu ruas naik: lewati semua pemberhentian (posisi penanda) berurutan dan, di antara dua
- * pemberhentian, ikuti jalur di peta. Bila jalurnya tidak terbaca, pakai garis lurus.
+ * pemberhentian, pakai bentuk jalur dari admin bila ada, lalu jalur di peta. Bila keduanya tidak ada,
+ * pakai garis lurus.
  */
-export function ridePath(stops: { x: number; y: number }[], lineColor: string): Pt[] {
+export function ridePath(stops: { id: string; x: number; y: number }[], lineColor: string, opts: { lineId?: string; tracks?: MapTrack[] } = {}): Pt[] {
   const color = rgb(lineColor);
   const pts: Pt[] = [];
   stops.forEach((s, i) => {
     const p: Pt = [s.x, s.y];
     if (i === 0) return pts.push(p);
+    const manual = manualTrack(opts.tracks ?? [], opts.lineId, stops[i - 1].id, s.id);
+    if (manual) return pts.push(...manual, p);
     const q: Pt = [stops[i - 1].x, stops[i - 1].y];
     const a = nodeAt(q);
     const b = nodeAt(p);

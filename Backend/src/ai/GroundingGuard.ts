@@ -70,6 +70,13 @@ export class GroundingGuard {
         add(l.fare);
         add(l.distanceM);
         add(l.minutes);
+        add(l.frequency?.headwayMinutes);
+        for (const o of l.options ?? []) {
+          add(o.frequency?.headwayMinutes);
+          // Nomor koridor/lin (mis. "13E", "4D") boleh disebut.
+          for (const n of `${o.lineId} ${o.lineName ?? ""}`.match(/\d+/g) ?? []) nums.add(n);
+        }
+        for (const n of `${l.lineId ?? ""} ${l.lineName ?? ""} ${l.notes ?? ""}`.match(/\d+/g) ?? []) nums.add(n);
         add(Number((l.distanceM / 1000).toFixed(1)));
         nums.add((l.distanceM / 1000).toFixed(1).replace(".", ","));
       }
@@ -129,7 +136,10 @@ export class GroundingGuard {
       if (leg.type === "RIDE") {
         const line = leg.lineId ? lineName(leg.lineId) : undefined;
         const what = line ? `${line.operator} ${line.name}` : (leg.lineName ?? "kereta");
-        parts.push(`${i === 0 ? "Naik" : "lalu naik"} ${what} dari ${name(leg.stops[0])} ke ${name(leg.stops[leg.stops.length - 1])}`);
+        const choices = leg.options && leg.options.length > 1 ? leg.options.map((o) => lineName(o.lineId)?.name ?? o.lineName ?? o.lineId) : null;
+        const pick = choices ? ` (bisa juga ${choices.slice(1).join(", ")})` : "";
+        const freq = leg.frequency ? `, biasanya tiap sekitar ${leg.frequency.headwayMinutes} menit` : "";
+        parts.push(`${i === 0 ? "Naik" : "lalu naik"} ${what}${pick} dari ${name(leg.stops[0])} ke ${name(leg.stops[leg.stops.length - 1])}${freq}`);
       } else {
         parts.push(
           leg.stops[0] === leg.stops[1] ? `pindah lini di dalam Stasiun ${name(leg.stops[0])}` : `${i === 0 ? "Berjalan" : "pindah dengan berjalan kaki"} ke ${name(leg.stops[1])}`,
@@ -148,6 +158,13 @@ export class GroundingGuard {
       else if (st.amenities.lift === "unknown") notes.push(`Data lift di ${st.name} tidak tersedia.`);
       else notes.push(`Lift tidak tercatat di ${st.name}.`);
     }
+    for (const leg of f.route.legs)
+      for (const a of leg.access ?? [])
+        if (a.status !== "available") {
+          const label = AMENITY_LABEL[a.need] ?? a.need;
+          const st = name(a.stationId);
+          notes.push(a.status === "out_of_service" ? `${label} di ${st} untuk pindah dilaporkan tidak berfungsi.` : a.status === "absent" ? `${label} untuk pindah tidak tercatat di ${st}.` : `Data ${label.toLowerCase()} untuk pindah di ${st} belum tersedia.`);
+        }
     if (f.alternatives.length) {
       const alt = f.alternatives[0];
       notes.push(`Alternatif transfer yang lebih aksesibel: melalui ${name(alt.viaStationId)}.`);
@@ -171,6 +188,10 @@ export function factsForPrompt(f: PlanFacts): unknown {
       jarakMeter: l.distanceM,
       menit: l.minutes,
       tarif: l.fare,
+      ...(l.options && l.options.length > 1 ? { pilihanLin: l.options.map((o) => o.lineName ?? o.lineId) } : {}),
+      ...(l.frequency ? { frekuensiMenit: l.frequency.headwayMinutes } : {}),
+      ...(l.notes ? { petunjuk: l.notes } : {}),
+      ...(l.access?.length ? { aksesPindah: l.access.map((a) => ({ stasiun: st(a.stationId)?.name ?? a.stationId, fasilitas: AMENITY_LABEL[a.need], status: a.status })) } : {}),
     })),
     totalTarif: f.route.totalFare,
     totalMenit: f.route.timeComplete ? f.route.totalMinutes : null,

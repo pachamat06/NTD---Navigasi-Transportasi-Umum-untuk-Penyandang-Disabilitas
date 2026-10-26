@@ -13,11 +13,11 @@ import type { ContentItem, ContentKind } from "../store/types";
 import type { Services } from "../services";
 import { ok, parse, rateLimit, requireAdmin } from "./middleware";
 
-const kindSchema = z.enum(["facility", "entrance", "notice", "station_info"]);
+const kindSchema = z.enum(["facility", "entrance", "notice", "station_info", "map_stop", "map_track"]);
 const idParam = z.string().min(1).max(80);
 
 /** Item yang terikat stasiun wajib punya stationId yang dikenal; pengumuman memakai targetId. */
-const STATION_BOUND: ContentKind[] = ["facility", "entrance", "station_info"];
+const STATION_BOUND: ContentKind[] = ["facility", "entrance", "station_info", "map_stop"];
 
 function itemView(i: ContentItem) {
   const state = i.draftDeleted ? "akan_dihapus" : i.published === null ? "baru" : i.draft !== null ? "diubah" : "terbit";
@@ -120,12 +120,17 @@ export function adminRoutes(s: Services): Router {
       if (!stationId || !known.has(stationId)) throw new AppError("INVALID", "stationId wajib diisi dengan stasiun yang dikenal.");
     }
     if (kind === "notice" && parsed.scope === "station" && !known.has(String(parsed.targetId))) throw new AppError("INVALID", "targetId harus id stasiun yang dikenal.");
+    if (kind === "map_track") {
+      if (!known.has(String(parsed.fromStationId)) || !known.has(String(parsed.toStationId))) throw new AppError("INVALID", "fromStationId dan toStationId harus id stasiun yang dikenal.");
+      const lines = new Set((await s.stations.lines(newContext({ preview: true }))).map((l) => l.id));
+      if (!lines.has(String(parsed.lineId))) throw new AppError("INVALID", "lineId harus id lini yang dikenal.");
+    }
     return parsed;
   };
 
   r.post("/content", async (req, res) => {
     const body = parse(z.object({ kind: kindSchema, stationId: z.string().max(80).nullable().optional(), data: z.unknown() }), req.body ?? {});
-    const stationId = body.kind === "notice" ? null : (body.stationId ?? null);
+    const stationId = body.kind === "notice" || body.kind === "map_track" ? null : (body.stationId ?? null);
     const data = await validateBody(body.kind, stationId, body.data);
     const item = await s.store.content.saveDraft({ kind: body.kind, stationId, data, by: actor(req) });
     await audit(req, "content.create", item.id, { kind: body.kind, stationId });

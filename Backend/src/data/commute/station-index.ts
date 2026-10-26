@@ -4,9 +4,11 @@
 // (Frontend/src/lib/map-assets.ts) dan geometri lini dikunci dengan slug tersebut. Commute Data API
 // memakai pasangan (operator, kode), mis. KCI-SUD. Tabel di bawah menjembatani keduanya dan dipelihara
 // tim bersama indeks posisi peta (Risiko #13, NTD-16):
+// - `live`  = id stasiun pada Commute Data API (`{operator}-{code}`), cara utama mengenali stasiun pada API
+//             sungguhan dan kunci posisi pada peta (data peta Commute dikunci dengan id ini);
 // - `refs`  = kode pada sumber offline (FixtureCommuteSource), mengikuti label peta FDTJ;
-// - `match` = cara mengenali stasiun yang sama pada API sungguhan: kode operator + nama tampilan atau
-//             nama resmi (officialName). Kode asli API tidak ditulis tetap agar tahan perubahan kode.
+// - `match` = cadangan bila id `live` tidak ditemukan (mis. kode berubah): kode operator + nama tampilan
+//             atau nama resmi (officialName).
 // Stasiun di luar tabel tetap bisa dipakai dengan id turunan `operator:kode` (huruf kecil).
 
 import type { StationRef } from "../../domain/models";
@@ -14,6 +16,8 @@ import type { UpStation } from "./types";
 
 export interface StationIndexEntry {
   id: string;
+  /** Id Commute Data API, mis. "KCI-SUD". */
+  live: string[];
   refs: StationRef[];
   /** Label kode di peta (mis. C13, B09, A01). */
   codes: string[];
@@ -23,26 +27,26 @@ export interface StationIndexEntry {
 const m = (operators: string[], ...names: string[]) => ({ operators, names });
 
 export const STATION_INDEX: StationIndexEntry[] = [
-  { id: "tanah-abang", refs: [{ operator: "KCI", code: "C10" }], codes: ["C10"], match: m(["KCI"], "Tanah Abang") },
-  { id: "bni-city", refs: [{ operator: "KCI", code: "C11" }, { operator: "RLK", code: "A02" }], codes: ["C11", "A02"], match: m(["KCI", "RLK"], "BNI City", "Sudirman Baru", "Sudirman Baru BNI City") },
-  { id: "sudirman", refs: [{ operator: "KCI", code: "C12" }], codes: ["C12"], match: m(["KCI"], "Sudirman") },
-  { id: "manggarai", refs: [{ operator: "KCI", code: "C13" }, { operator: "KCI", code: "B09" }, { operator: "RLK", code: "A01" }], codes: ["C13", "B09", "A01"], match: m(["KCI", "RLK"], "Manggarai") },
-  { id: "jakarta-kota", refs: [{ operator: "KCI", code: "B01" }], codes: ["B01"], match: m(["KCI"], "Jakarta Kota") },
-  { id: "jayakarta", refs: [{ operator: "KCI", code: "B02" }], codes: ["B02"], match: m(["KCI"], "Jayakarta") },
-  { id: "mangga-besar", refs: [{ operator: "KCI", code: "B03" }], codes: ["B03"], match: m(["KCI"], "Mangga Besar") },
-  { id: "sawah-besar", refs: [{ operator: "KCI", code: "B04" }], codes: ["B04"], match: m(["KCI"], "Sawah Besar") },
-  { id: "juanda", refs: [{ operator: "KCI", code: "B05" }], codes: ["B05"], match: m(["KCI"], "Juanda") },
-  { id: "gondangdia", refs: [{ operator: "KCI", code: "B07" }], codes: ["B07"], match: m(["KCI"], "Gondangdia") },
-  { id: "cikini", refs: [{ operator: "KCI", code: "B08" }], codes: ["B08"], match: m(["KCI"], "Cikini") },
-  { id: "duri", refs: [{ operator: "RLK", code: "A03" }], codes: ["A03"], match: m(["KCI", "RLK"], "Duri") },
-  { id: "bendungan-hilir", refs: [{ operator: "MRTJ", code: "M10" }], codes: ["M10"], match: m(["MRTJ"], "Bendungan Hilir") },
-  { id: "setiabudi-astra", refs: [{ operator: "MRTJ", code: "M11" }], codes: ["M11"], match: m(["MRTJ"], "Setiabudi Astra", "Setiabudi") },
-  { id: "dukuh-atas-mrt", refs: [{ operator: "MRTJ", code: "M12" }], codes: ["M12"], match: m(["MRTJ"], "Dukuh Atas BNI", "Dukuh Atas") },
-  { id: "bundaran-hi", refs: [{ operator: "MRTJ", code: "M13" }], codes: ["M13"], match: m(["MRTJ"], "Bundaran HI Bank Jakarta", "Bundaran HI") },
-  { id: "dukuh-atas-lrt", refs: [{ operator: "LRTJ", code: "BK01" }, { operator: "LRTJ", code: "CB01" }], codes: ["BK01", "CB01"], match: m(["LRTJBDB"], "Dukuh Atas BSI", "Dukuh Atas") },
-  { id: "setiabudi-lrt", refs: [{ operator: "LRTJ", code: "BK02" }, { operator: "LRTJ", code: "CB02" }], codes: ["BK02", "CB02"], match: m(["LRTJBDB"], "Setiabudi") },
-  { id: "rasuna-said", refs: [{ operator: "LRTJ", code: "BK03" }, { operator: "LRTJ", code: "CB03" }], codes: ["BK03", "CB03"], match: m(["LRTJBDB"], "Rasuna Said") },
-  { id: "kuningan", refs: [{ operator: "LRTJ", code: "BK04" }, { operator: "LRTJ", code: "CB04" }], codes: ["BK04", "CB04"], match: m(["LRTJBDB"], "Kuningan") },
+  { id: "tanah-abang", live: ["KCI-THB"], refs: [{ operator: "KCI", code: "C10" }], codes: ["C10"], match: m(["KCI"], "Tanah Abang") },
+  { id: "bni-city", live: ["KCI-SUDB"], refs: [{ operator: "KCI", code: "C11" }, { operator: "RLK", code: "A02" }], codes: ["C11", "A02"], match: m(["KCI", "RLK"], "BNI City", "Sudirman Baru", "Sudirman Baru BNI City") },
+  { id: "sudirman", live: ["KCI-SUD"], refs: [{ operator: "KCI", code: "C12" }], codes: ["C12"], match: m(["KCI"], "Sudirman") },
+  { id: "manggarai", live: ["KCI-MRI"], refs: [{ operator: "KCI", code: "C13" }, { operator: "KCI", code: "B09" }, { operator: "RLK", code: "A01" }], codes: ["C13", "B09", "A01"], match: m(["KCI", "RLK"], "Manggarai") },
+  { id: "jakarta-kota", live: ["KCI-JAKK"], refs: [{ operator: "KCI", code: "B01" }], codes: ["B01"], match: m(["KCI"], "Jakarta Kota") },
+  { id: "jayakarta", live: ["KCI-JAY"], refs: [{ operator: "KCI", code: "B02" }], codes: ["B02"], match: m(["KCI"], "Jayakarta") },
+  { id: "mangga-besar", live: ["KCI-MGB"], refs: [{ operator: "KCI", code: "B03" }], codes: ["B03"], match: m(["KCI"], "Mangga Besar") },
+  { id: "sawah-besar", live: ["KCI-SW"], refs: [{ operator: "KCI", code: "B04" }], codes: ["B04"], match: m(["KCI"], "Sawah Besar") },
+  { id: "juanda", live: ["KCI-JUA"], refs: [{ operator: "KCI", code: "B05" }], codes: ["B05"], match: m(["KCI"], "Juanda") },
+  { id: "gondangdia", live: ["KCI-GDD"], refs: [{ operator: "KCI", code: "B07" }], codes: ["B07"], match: m(["KCI"], "Gondangdia") },
+  { id: "cikini", live: ["KCI-CKI"], refs: [{ operator: "KCI", code: "B08" }], codes: ["B08"], match: m(["KCI"], "Cikini") },
+  { id: "duri", live: ["KCI-DU"], refs: [{ operator: "RLK", code: "A03" }], codes: ["A03"], match: m(["KCI", "RLK"], "Duri") },
+  { id: "bendungan-hilir", live: ["MRTJ-BNH"], refs: [{ operator: "MRTJ", code: "M10" }], codes: ["M10"], match: m(["MRTJ"], "Bendungan Hilir") },
+  { id: "setiabudi-astra", live: ["MRTJ-STB"], refs: [{ operator: "MRTJ", code: "M11" }], codes: ["M11"], match: m(["MRTJ"], "Setiabudi Astra", "Setiabudi") },
+  { id: "dukuh-atas-mrt", live: ["MRTJ-DKA"], refs: [{ operator: "MRTJ", code: "M12" }], codes: ["M12"], match: m(["MRTJ"], "Dukuh Atas BNI", "Dukuh Atas") },
+  { id: "bundaran-hi", live: ["MRTJ-BHI"], refs: [{ operator: "MRTJ", code: "M13" }], codes: ["M13"], match: m(["MRTJ"], "Bundaran HI Bank Jakarta", "Bundaran HI") },
+  { id: "dukuh-atas-lrt", live: ["LRTJBDB-DKA"], refs: [{ operator: "LRTJ", code: "BK01" }, { operator: "LRTJ", code: "CB01" }], codes: ["BK01", "CB01"], match: m(["LRTJBDB"], "Dukuh Atas BSI", "Dukuh Atas") },
+  { id: "setiabudi-lrt", live: ["LRTJBDB-SET"], refs: [{ operator: "LRTJ", code: "BK02" }, { operator: "LRTJ", code: "CB02" }], codes: ["BK02", "CB02"], match: m(["LRTJBDB"], "Setiabudi") },
+  { id: "rasuna-said", live: ["LRTJBDB-RAS"], refs: [{ operator: "LRTJ", code: "BK03" }, { operator: "LRTJ", code: "CB03" }], codes: ["BK03", "CB03"], match: m(["LRTJBDB"], "Rasuna Said") },
+  { id: "kuningan", live: ["LRTJBDB-KUA"], refs: [{ operator: "LRTJ", code: "BK04" }, { operator: "LRTJ", code: "CB04" }], codes: ["BK04", "CB04"], match: m(["LRTJBDB"], "Kuningan") },
 ];
 
 export interface LineIndexEntry {
@@ -88,6 +92,11 @@ export function refsOf(stationId: string): StationRef[] {
   return BY_ID.get(stationId)?.refs ?? parseDerived(stationId);
 }
 
+/** Id Commute Data API yang dikurasi untuk slug NTD ([] = tidak ada di tabel). */
+export function liveIdsOf(stationId: string): string[] {
+  return BY_ID.get(stationId)?.live ?? [];
+}
+
 export function codesOf(stationId: string, fallback: string): string[] {
   return BY_ID.get(stationId)?.codes ?? [fallback];
 }
@@ -126,7 +135,7 @@ export const normalizeName = (s: string) =>
     .trim();
 
 /**
- * Mencocokkan stasiun sumber data ke slug NTD: (1) kode sumber offline, (2) nama sama persis
+ * Mencocokkan stasiun sumber data ke slug NTD: (1) id Commute Data API (`live`) atau kode sumber offline, (2) nama sama persis
  * dengan operator yang sesuai, (3) nama diawali nama tabel bila kandidatnya tunggal. Sisanya memakai id turunan.
  */
 export function buildStationIndex(stations: UpStation[]): StationIndex {
@@ -137,8 +146,9 @@ export function buildStationIndex(stations: UpStation[]): StationIndex {
     refsById.set(id, [...(refsById.get(id) ?? []), { operator: s.operator, code: s.code }]);
   };
   const rest: UpStation[] = [];
+  const byLive = new Map(STATION_INDEX.flatMap((e) => e.live.map((l) => [l.toUpperCase(), e] as const)));
   for (const s of stations) {
-    const e = BY_REF.get(refKey(s));
+    const e = byLive.get(`${s.operator}-${s.code}`.toUpperCase()) ?? BY_REF.get(refKey(s));
     if (e) assign(s, e.id);
     else rest.push(s);
   }

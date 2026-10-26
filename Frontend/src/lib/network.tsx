@@ -5,7 +5,7 @@
 import { createContext, useCallback, useContext, useEffect, useMemo, useState, type ReactNode } from "react";
 import { fetchMeta, fetchNetwork } from "./api";
 import { buildPositions } from "./map-assets";
-import type { AmenityType, Hub, Line, Meta, NetworkStation, StationAssessment } from "./types";
+import type { AmenityType, Hub, Line, MapOverrides, MapTrack, Meta, NetworkStation, StationAssessment } from "./types";
 
 export const AMENITY_LABEL: Record<AmenityType, string> = {
   lift: "Lift",
@@ -29,6 +29,8 @@ export interface NetworkValue {
   amenityLabel: (type: string) => string;
   /** Posisi pada Aset Peta Transit; undefined = tidak ada di peta. */
   positionOf: (id: string) => { x: number; y: number } | undefined;
+  /** Bentuk jalur yang ditetapkan admin. */
+  mapTracks: MapTrack[];
 }
 
 type LoadState = { kind: "loading" } | { kind: "error"; message: string } | { kind: "ready"; value: NetworkValue };
@@ -43,11 +45,11 @@ const normalize = (s: string) =>
     .replace(/[^a-z0-9]+/g, " ")
     .trim();
 
-function build(stations: NetworkStation[], lines: Line[], hubs: Hub[], meta: Meta | null): NetworkValue {
+function build(stations: NetworkStation[], lines: Line[], hubs: Hub[], meta: Meta | null, map?: MapOverrides): NetworkValue {
   const st = new Map(stations.map((s) => [s.id, s]));
   const ln = new Map(lines.map((l) => [l.id, l]));
   const hb = new Map(hubs.map((h) => [h.id, h]));
-  const pos = buildPositions(stations);
+  const pos = buildPositions(stations, map?.stops);
   return {
     stations,
     lines,
@@ -74,6 +76,7 @@ function build(stations: NetworkStation[], lines: Line[], hubs: Hub[], meta: Met
     },
     amenityLabel: (type) => meta?.amenityLabels[type] ?? AMENITY_LABEL[type as AmenityType] ?? type,
     positionOf: (id) => pos.get(id),
+    mapTracks: map?.tracks ?? [],
   };
 }
 
@@ -84,7 +87,7 @@ export function NetworkProvider({ children, fallback }: { children: ReactNode; f
     setState({ kind: "loading" });
     const [net, meta] = await Promise.all([fetchNetwork(), fetchMeta()]);
     if (net.status === "error") return setState({ kind: "error", message: net.message });
-    setState({ kind: "ready", value: build(net.data.stations, net.data.lines, net.data.hubs, meta.status === "ok" ? meta.data : null) });
+    setState({ kind: "ready", value: build(net.data.stations, net.data.lines, net.data.hubs, meta.status === "ok" ? meta.data : null, net.data.map) });
   }, []);
 
   useEffect(() => {

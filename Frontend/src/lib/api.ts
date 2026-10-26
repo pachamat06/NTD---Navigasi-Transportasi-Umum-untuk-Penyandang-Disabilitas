@@ -1,6 +1,6 @@
 // Klien Backend NTD. Semua respons berbentuk {status, data} atau {status: "error", code, message} (Bab III 3.2.3).
 
-import type { ApiResult, ErrorCode, JourneyPlan, Meta, Mode, Network, Notice, StationDetailData } from "./types";
+import type { ApiResult, ErrorCode, JourneyPlan, Meta, Mode, Network, Notice, StationDetailData, TransferNeed } from "./types";
 
 export const API_URL = (process.env.NEXT_PUBLIC_API_URL ?? "http://localhost:4000").replace(/\/$/, "");
 
@@ -23,12 +23,13 @@ export const fetchMeta = () => call<Meta>("/api/meta");
 export const fetchNotices = () => call<Notice[]>("/api/notices");
 export const fetchStationDetail = (id: string) => call<StationDetailData>(`/api/stations/${encodeURIComponent(id)}`);
 
-export function planJourney(originId: string, destinationId: string, opts: { avoid?: string[]; avoidModes?: Mode[]; signal?: AbortSignal } = {}) {
+export function planJourney(originId: string, destinationId: string, opts: { avoid?: string[]; avoidModes?: Mode[]; needs?: TransferNeed[]; signal?: AbortSignal } = {}) {
   const body = {
     originId,
     destinationId,
     ...(opts.avoid?.length ? { avoid: opts.avoid } : {}),
     ...(opts.avoidModes?.length ? { avoidModes: opts.avoidModes } : {}),
+    ...(opts.needs?.length ? { needs: opts.needs } : {}),
   };
   return call<JourneyPlan>("/api/plan", { method: "POST", body: JSON.stringify(body), signal: opts.signal });
 }

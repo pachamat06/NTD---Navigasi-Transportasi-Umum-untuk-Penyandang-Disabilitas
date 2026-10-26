@@ -65,6 +65,8 @@ export interface Station {
   lineIds: string[];
   hubId?: string;
   codes: string[];
+  /** Id stasiun pada Commute Data API (`{operator}-{code}`, mis. KCI-SUD); kunci posisi pada peta. */
+  commuteIds?: string[];
   /** Koordinat dari dataset (bila ada); hanya dipakai backend untuk memilih stasiun transit alternatif. */
   lat?: number;
   lng?: number;
@@ -82,18 +84,59 @@ export interface StationWithAmenities extends Station {
   dataAvailable: boolean;
 }
 
+export interface ExitRef {
+  ref: string;
+  name?: string | null;
+  signs?: string[];
+}
+
 export interface HubWalk {
   from: string;
   to: string;
   distanceM: number;
   minutes: number | null;
+  /** Petunjuk jalan dari dataset (mis. "Keluar lewat pintu B, lalu ..."). */
+  notes?: string;
+  fromExit?: ExitRef;
+  toExit?: ExitRef;
 }
 
 export interface Hub {
   id: string;
   name: string;
+  /** "integrated" = bagi penumpang satu tempat; "hub" = beberapa stasiun dalam satu kompleks. */
+  kind?: "hub" | "integrated";
   memberIds: string[];
   walks: HubWalk[];
+}
+
+/** Fasilitas yang dibutuhkan pengguna saat pindah (mis. pengguna kursi roda butuh lift). */
+export const TRANSFER_NEEDS = ["lift", "eskalator", "ramp"] as const;
+export type TransferNeed = (typeof TRANSFER_NEEDS)[number];
+
+/** Frekuensi kendaraan saat jadwal tidak tersedia (dari dataset, bukan jadwal dan bukan perkiraan dari jarak). */
+export interface Frequency {
+  /** Rata-rata jarak antarkendaraan (menit). Untuk pilihan gabungan: frekuensi gabungan semua lin. */
+  headwayMinutes: number;
+  /** "STOP" = diukur di pemberhentian naik, "LINE" = rata-rata se-lin. */
+  source: "STOP" | "LINE";
+  /** Jam operasional lin di hari itu, bila diketahui ("05:00–22:00" atau "24 jam"). */
+  serviceHours?: string;
+}
+
+/** Satu lin yang bisa dinaiki pada ruas yang sama (pemberhentian dan tarif sama). */
+export interface RideOption {
+  lineId: string;
+  lineName?: string;
+  headsign?: string;
+  frequency?: Frequency;
+}
+
+/** Pemeriksaan fasilitas yang dibutuhkan pengguna di stasiun tempat pindah. */
+export interface TransferAccess {
+  stationId: string;
+  need: TransferNeed;
+  status: AmenityDetailStatus;
 }
 
 export interface StationAssessment {
@@ -117,6 +160,21 @@ export interface RouteLeg {
   fare: number;
   departureAt?: string;
   arrivalAt?: string;
+  /** Ruas naik: tujuan akhir kendaraan. */
+  headsign?: string;
+  /** Ruas naik tanpa jadwal: frekuensi lin di pemberhentian naik. */
+  frequency?: Frequency;
+  /**
+   * Ruas naik yang dilayani beberapa lin paralel (pemberhentian dan tarif sama), mis. TJ 4, 4D, 5, 5C:
+   * naik yang mana pun sampai. Lin utama paling depan. `frequency` ruas = frekuensi gabungan.
+   */
+  options?: RideOption[];
+  /** Ruas pindah: petunjuk jalan dan pintu keluar dari dataset. */
+  notes?: string;
+  fromExit?: ExitRef;
+  toExit?: ExitRef;
+  /** Ruas pindah: status fasilitas yang dibutuhkan pengguna di kedua ujung. */
+  access?: TransferAccess[];
 }
 
 export interface Route {
