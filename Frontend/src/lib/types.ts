@@ -73,6 +73,8 @@ export interface MapStop {
   stationId: string;
   x: number;
   y: number;
+  /** Titik anak: posisi stasiun ini khusus untuk lini `lineId` (tidak diisi = posisi utama). */
+  lineId?: string;
 }
 
 /** Bentuk jalur antara dua pemberhentian berurutan pada satu lini, ditetapkan admin. */
@@ -109,12 +111,22 @@ export interface StationAssessment {
   adequate: boolean;
   dataAvailable: boolean;
   notes?: string[];
+  /** Potongan skor, mis. celah peron yang harus melewati anak tangga. */
+  penalties?: { reason: string; points: number }[];
   /** Skor untuk perjalanan ini: jalur gate ke peron menentukan perlu tidaknya lift/eskalator. */
   journey?: {
     platforms: string[];
     level: boolean;
-    via: PlatformConnection;
+    via: AccessVia;
     gate?: string;
+    /** Jalur/penyeberangan khusus pengguna disabilitas. */
+    dedicated?: boolean;
+    /** JPO/terowongan tanpa anak tangga (ramp landai). */
+    stepFree?: boolean;
+    /** Jalur lewat concourse (gate → concourse → peron). */
+    concourse?: ConcourseRoute;
+    /** Status lift pada ruas yang pindah lantai di jalur lewat concourse. */
+    pathLift?: DetailStatus;
     excluded: AmenityType[];
     lift?: AmenityStatus;
     stationScore: number;
@@ -147,12 +159,49 @@ export interface Entrance {
   signs?: string[];
   /** "dataset" = pintu dari Commute (/exits), "ntd" = isian tim. */
   source?: "dataset" | "ntd";
-  /** Peron yang dicapai dari gate ini dan cara mencapainya. */
-  platformLinks?: { platform: string; via: PlatformConnection; note?: string }[];
+  /** Peron yang dicapai langsung dari gate ini dan cara mencapainya. */
+  platformLinks?: { platform: string; via: PlatformConnection; dedicated?: boolean; stepFree?: boolean; note?: string }[];
+  /** Concourse yang dicapai dari gate ini (gate yang tidak langsung ke peron). */
+  concourseLinks?: (AccessSegment & { concourse: string })[];
 }
 
 /** langsung/crosswalk/sebidang tidak pindah lantai; jpo/terowongan naik atau turun lantai. */
 export type PlatformConnection = "langsung" | "crosswalk" | "sebidang" | "jpo" | "terowongan";
+
+/** Jalur akses yang dinilai: langsung dari gate, atau lewat concourse. */
+export type AccessVia = PlatformConnection | "concourse";
+
+/** Cara berpindah pada satu ruas di dalam stasiun; "datar" dan "ramp" tanpa anak tangga. */
+export type SegmentMeans = "datar" | "ramp" | "lift" | "eskalator" | "tangga";
+
+/** Satu ruas jalur (gate → concourse atau concourse → peron). */
+export interface AccessSegment {
+  means: SegmentMeans[];
+  lift?: LiftInfo;
+  escalators?: EscalatorGroup[];
+  dedicated?: boolean;
+  note?: string;
+}
+
+/** Concourse: area penghubung antara gate dan peron. */
+export interface Concourse {
+  id: string;
+  code: string;
+  name?: string;
+  level?: string;
+  /** Area berbayar (setelah gerbang tiket). */
+  paid?: boolean;
+  platformLinks: (AccessSegment & { platform: string })[];
+  note?: string;
+}
+
+/** Jalur gate → concourse → peron yang dipakai pada skor perjalanan. */
+export interface ConcourseRoute {
+  code: string;
+  name?: string;
+  toConcourse: SegmentMeans[];
+  toPlatform: SegmentMeans[];
+}
 
 export type DetailStatus = AmenityStatus | "out_of_service";
 
@@ -207,6 +256,8 @@ export interface StationInfo {
 export interface StationDetailData extends NetworkStation {
   platforms?: Platform[];
   entrances: Entrance[];
+  /** Concourse isian tim (stasiun yang gate-nya tidak langsung ke peron). */
+  concourses?: Concourse[];
   info: StationInfo[];
   notices: Notice[];
 }
@@ -219,6 +270,8 @@ export interface RouteLeg {
   stops: string[];
   distanceM: number;
   minutes: number | null;
+  /** true = waktu tempuh perkiraan dari jadwal GTFS Transjakarta (koridor BRT), bukan dari dataset rute. */
+  minutesEstimated?: boolean;
   fare: number;
   /** Arah/tujuan akhir kendaraan. */
   headsign?: string;
@@ -230,6 +283,8 @@ export interface RouteLeg {
   frequency?: Frequency;
   /** Lin paralel yang melayani pemberhentian dan tarif yang sama; boleh naik yang mana saja. */
   options?: RideOption[];
+  /** Pindah ke bus arah sebaliknya (berbalik arah) di halte TransJakarta; petunjuk di `notes`. */
+  turnaround?: boolean;
   /** Petunjuk jalan kaki saat pindah. */
   notes?: string;
   fromExit?: ExitRef;
@@ -259,6 +314,8 @@ export interface TransferAccess {
   status: AmenityStatus | "out_of_service";
   /** Status diambil dari peron ini. */
   platform?: string;
+  /** Lift/eskalator tidak dibutuhkan karena peron dicapai dari gate tanpa anak tangga. */
+  notNeeded?: { via: AccessVia; gate?: string; dedicated?: boolean; stepFree?: boolean; concourse?: ConcourseRoute };
 }
 
 export interface Route {
@@ -266,6 +323,8 @@ export interface Route {
   totalDistanceM: number;
   totalMinutes: number | null;
   timeComplete: boolean;
+  /** Sebagian waktu tempuh adalah perkiraan dari jadwal GTFS Transjakarta. */
+  timeEstimated?: boolean;
   totalFare: number;
   transfers: number;
   /** Nama pemberhentian dari data rute, untuk halte/stasiun yang tidak ada di daftar stasiun. */

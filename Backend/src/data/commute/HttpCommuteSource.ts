@@ -376,7 +376,8 @@ function lineStations(operator: string, detail: ApiLineDetail | null): Pick<UpLi
         stationNumbers.push(st.stationNumber || null);
       }
     }
-    if (refs.length) segments.push({ stations: refs, ...(seg.joinsAtCode ? { joinsAt: { operator, code: seg.joinsAtCode } } : {}) });
+    if (refs.length)
+      segments.push({ stations: refs, ...(seg.joinsAtCode ? { joinsAt: { operator, code: seg.joinsAtCode } } : {}), ...(seg.kind === "LOOP" ? { loop: true } : {}) });
   }
   return { stations, stationNumbers, segments };
 }

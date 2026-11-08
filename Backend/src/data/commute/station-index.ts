@@ -122,7 +122,19 @@ export interface StationIndex {
   codesOf(stationId: string, fallback: string): string[];
   /** Slug pada tabel yang tidak ditemukan pada sumber data (untuk pemeriksaan di halaman admin). */
   unmatched: string[];
+  /** Nama tampilan stasiun gabungan (halte BRT per arah digabung, mis. "Kebon Sirih"); undefined = pakai nama sumber. */
+  nameOf?(stationId: string): string | undefined;
 }
+
+/** Halte BRT yang datanya terpisah per arah, mis. "Kebon Sirih Arah Utara" dan "Kebon Sirih Arah Selatan". */
+const DIRECTIONAL = /^(.*?)\s+arah\s+(utara|selatan|timur|barat)$/i;
+
+/** Nama dasar halte per arah ("Kebon Sirih" untuk "Kebon Sirih Arah Utara"); undefined bila bukan halte per arah. */
+export function directionalBase(name: string): string | undefined {
+  return DIRECTIONAL.exec(name.trim())?.[1];
+}
+
+const slugOf = (s: string) => normalizeName(s).replace(/ /g, "-");
 
 export const normalizeName = (s: string) =>
   s
@@ -163,7 +175,27 @@ export function buildStationIndex(stations: UpStation[]): StationIndex {
     const cands = rest.filter((s) => !idByRef.has(refKey(s)) && e.match.operators.includes(s.operator) && names(s).some((n) => wanted.some((w) => n.startsWith(w + " "))));
     if (cands.length === 1) assign(cands[0], e.id);
   }
+  // Halte TransJakarta yang sama tetapi datanya terpisah per arah digabung menjadi satu stasiun NTD
+  // (`tj:kebon-sirih`). Kode tiap arah tetap tersimpan sebagai refs, dan id turunan per arah (`tj:h00267s`)
+  // tetap bisa dipakai untuk data satu arah saja (fasilitas, rute).
+  const mergedNames = new Map<string, string>();
+  const groups = new Map<string, UpStation[]>();
+  for (const s of rest) {
+    if (idByRef.has(refKey(s)) || s.operator.toUpperCase() !== "TJ") continue;
+    const base = directionalBase(s.name);
+    if (!base) continue;
+    const key = normalizeName(base);
+    groups.set(key, [...(groups.get(key) ?? []), s]);
+  }
+  for (const list of groups.values()) {
+    if (list.length < 2) continue;
+    const base = directionalBase(list[0].name)!;
+    const id = `tj:${slugOf(base)}`;
+    mergedNames.set(id, base);
+    for (const s of list) assign(s, id);
+  }
   return {
+    nameOf: (id) => mergedNames.get(id),
     idOf: (ref) => idByRef.get(refKey(ref)) ?? derivedId(ref),
     refsOf: (id) => refsById.get(id) ?? parseDerived(id),
     codesOf: (id, fallback) => BY_ID.get(id)?.codes ?? [fallback],

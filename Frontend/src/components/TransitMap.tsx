@@ -1,7 +1,7 @@
 "use client";
 
 import { useEffect, useRef, useState } from "react";
-import { MAP_ASSET, legGeometry, ridePath } from "@/lib/map-assets";
+import { MAP_ASSET, legGeometry, offsetPath, ridePath, trackGroup } from "@/lib/map-assets";
 import { useNetwork } from "@/lib/network";
 import type { Route } from "@/lib/types";
 import { AccessBadge } from "./AccessBadge";
@@ -27,7 +27,7 @@ const TOUCH_PX = 22; // radius area sentuh di layar (diameter 44 px)
  * memakai indeks posisi (kode stasiun -> x, y). Peta hanya untuk memilih dan menyorot, bukan menghitung rute.
  */
 export function TransitMap({ originId, destinationId, route, onSetOrigin, onSetDestination, onShowDetail }: Props) {
-  const { stations: STATIONS, hubs: HUBS, lineById, assess, positionOf, mapTracks } = useNetwork();
+  const { stations: STATIONS, lines: LINES, hubs: HUBS, lineById, assess, positionOf, positionOn, mapTracks } = useNetwork();
   const boxRef = useRef<HTMLDivElement>(null);
   const [size, setSize] = useState({ w: 800, h: 520 });
   const [view, setView] = useState<View>({ x: MAP_ASSET.initialView.x, y: MAP_ASSET.initialView.y, w: MAP_ASSET.initialView.width });
@@ -173,20 +173,55 @@ export function TransitMap({ originId, destinationId, route, onSetOrigin, onSetD
           {route && <rect x={0} y={0} width={MAP_ASSET.width} height={MAP_ASSET.height} fill="#ffffff" opacity={0.6} />}
 
           {route?.legs.map((leg, i) => {
-            const placed = leg.stops.flatMap((id) => {
-              const p = positionOf(id);
-              return p ? [{ id, ...p }] : [];
-            });
-            const color = leg.type === "RIDE" ? (lineById(leg.lineId!)?.color ?? "#555555") : "#111111";
+            // Ruas naik memakai titik anak stasiun untuk lininya (bila admin membuatnya), agar lini berbeda yang
+            // berhenti di stasiun yang sama tidak bertumpuk di satu titik.
+            const placedOn = (lineId?: string) =>
+              leg.stops.flatMap((id) => {
+                const p = leg.type === "RIDE" ? positionOn(id, lineId) : positionOf(id);
+                return p ? [{ id, ...p }] : [];
+              });
             // Ruas naik mengikuti bentuk jalur dari admin atau jalur di peta antar pemberhentian; jalur yang tak
             // terbaca memakai bentuk lini kurasi, lalu garis lurus. Perpindahan tetap garis lurus.
-            const shaped = leg.type === "RIDE" ? legGeometry(leg.lineId!, leg.stops[0], leg.stops[leg.stops.length - 1]) : [];
-            const traced = leg.type === "RIDE" ? ridePath(placed, color, { lineId: leg.lineId, tracks: mapTracks }) : placed.map((p) => [p.x, p.y] as [number, number]);
-            const pts = leg.type === "RIDE" && traced.length <= placed.length && shaped.length >= 2 ? shaped : traced;
+            const pathOn = (lineId: string | undefined, color: string): [number, number][] => {
+              const placed = placedOn(lineId);
+              if (leg.type !== "RIDE") return placed.map((p) => [p.x, p.y] as [number, number]);
+              const shaped = legGeometry(lineId!, leg.stops[0], leg.stops[leg.stops.length - 1]);
+              // Lin turunan berwarna sama memakai bentuk jalur bersama (lihat trackGroup).
+              const traced = ridePath(placed, color, { lineId, tracks: mapTracks, group: trackGroup(LINES, lineId) });
+              return traced.length <= placed.length && shaped.length >= 2 ? shaped : traced;
+            };
+            const color = leg.type === "RIDE" ? (lineById(leg.lineId!)?.color ?? "#555555") : "#111111";
+            const pts = pathOn(leg.lineId, color);
             if (pts.length < 2 || (leg.type === "TRANSFER" && leg.stops[0] === leg.stops[1])) return null;
             const d = pts.map((p) => p.join(",")).join(" ");
+            // Lin paralel pada ruas yang sama (berhenti di semua pemberhentian ruas ini): digambar berdampingan dengan
+            // warnanya sendiri. Bila admin membuat titik anak, garisnya mengikuti titik anak itu; bila tidak, digeser
+            // sejajar dari garis lin utama.
+            const parallels =
+              leg.type === "RIDE"
+                ? (leg.options ?? [])
+                    .filter((o) => o.lineId !== leg.lineId)
+                    .map((o, k) => {
+                      const c = lineById(o.lineId)?.color ?? "#555555";
+                      const own = pathOn(o.lineId, c);
+                      const same = own.length === pts.length && own.every((p, j) => p[0] === pts[j][0] && p[1] === pts[j][1]);
+                      const side = (k % 2 === 0 ? 1 : -1) * Math.ceil((k + 1) / 2);
+                      return { lineId: o.lineId, name: o.lineName ?? lineById(o.lineId)?.name ?? o.lineId, color: c, pts: same ? offsetPath(own, px(11) * side) : own };
+                    })
+                    .filter((p) => p.pts.length >= 2)
+                : [];
             return (
               <g key={i}>
+                {parallels.map((p) => {
+                  const pd = p.pts.map((q) => q.join(",")).join(" ");
+                  return (
+                    <g key={p.lineId}>
+                      <title>Lin paralel: {p.name}</title>
+                      <polyline points={pd} fill="none" stroke="#ffffff" strokeWidth={px(12)} strokeLinecap="round" strokeLinejoin="round" />
+                      <polyline points={pd} fill="none" stroke={p.color} strokeWidth={px(7)} strokeLinecap="round" strokeLinejoin="round" />
+                    </g>
+                  );
+                })}
                 <polyline points={d} fill="none" stroke="#ffffff" strokeWidth={px(leg.type === "RIDE" ? 16 : 10)} strokeLinecap="round" strokeLinejoin="round" />
                 <polyline
                   points={d}
@@ -373,6 +408,15 @@ export function TransitMap({ originId, destinationId, route, onSetOrigin, onSetD
         <span className="flex items-center gap-1">
           <span aria-hidden className="font-bold text-[var(--muted)]">?</span> data tidak tersedia
         </span>
+        {route?.legs.some((l) => l.type === "RIDE" && (l.options?.length ?? 0) > 1) && (
+          <span className="flex items-center gap-1">
+            <span aria-hidden className="inline-flex flex-col gap-[2px]">
+              <span className="block h-[3px] w-4 rounded bg-[var(--muted)]" />
+              <span className="block h-[3px] w-4 rounded bg-[var(--accent)]" />
+            </span>{" "}
+            garis berdampingan = lin paralel yang melayani ruas sama (warna lin masing-masing)
+          </span>
+        )}
         <span className="w-full text-[var(--muted)]">{MAP_ASSET.credit} Data © Commute Data API (ODbL-1.0).</span>
       </div>
     </div>

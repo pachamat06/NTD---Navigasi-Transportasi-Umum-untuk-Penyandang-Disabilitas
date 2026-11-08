@@ -3,7 +3,7 @@
 
 import type { RequestContext } from "../context";
 import type { ContentSnapshot } from "./content";
-import type { FacilityAnalysisService } from "./FacilityAnalysisService";
+import { needMet, type FacilityAnalysisService } from "./FacilityAnalysisService";
 import type { Alternative, Hub, Route, StationAssessment, TransferNeed } from "./models";
 import { transferStationIds, type RoutePlannerService } from "./RoutePlannerService";
 
@@ -27,8 +27,8 @@ export class AlternativeService {
     // Fasilitas yang dibutuhkan pengguna (mis. lift) harus tercatat tersedia di stasiun tempat pindah.
     const meetsNeeds = async (id: string) => {
       if (!needs.length) return true;
-      const f = await this.facilities.facilities(id, ctx, snap);
-      return needs.every((n) => f.amenities[n] === "available");
+      const { assessment, facilities: f } = await this.facilities.assess(id, ctx, snap);
+      return needs.every((n) => needMet(n, f.amenities, assessment.layout));
     };
 
     const weak: string[] = [];
@@ -47,7 +47,9 @@ export class AlternativeService {
           const assessment = await assess(via);
           if (!assessment.dataAvailable || !(await meetsNeeds(via))) continue;
           // Tanpa kebutuhan khusus, alternatif harus lebih baik skornya; dengan kebutuhan, cukup memenuhinya.
-          if (assessment.score <= weakScore && (!needs.length || (await meetsNeeds(weakId)))) continue;
+          // Stasiun yang diminta dihindari pengguna cukup diganti stasiun yang memadai, walau skornya tidak lebih tinggi.
+          const avoided = avoid.includes(weakId);
+          if (avoided ? !assessment.adequate : assessment.score <= weakScore && (!needs.length || (await meetsNeeds(weakId)))) continue;
           const alt = await this.planner.getRouteVia(originId, via, destinationId, ctx, input.at);
           if (!alt) continue;
           const altTransfers = transferStationIds(alt);

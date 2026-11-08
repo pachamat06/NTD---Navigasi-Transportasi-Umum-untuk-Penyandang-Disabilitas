@@ -6,7 +6,7 @@
 import type { RequestContext } from "../context";
 import type { ContentService, ContentSnapshot } from "../domain/content";
 import { routeStationIds, transferStationIds, usesModes } from "../domain/RoutePlannerService";
-import { AMENITY_LABEL, journeyAssessment, VIA_LABEL } from "../domain/FacilityAnalysisService";
+import { AMENITY_LABEL, journeyAssessment, layoutAccess, needMet, viaText } from "../domain/FacilityAnalysisService";
 import type { Alternative, AmenityDetailStatus, JourneyPlan, Line, Mode, Notification, Platform, Route, Station, StationAssessment, StationDetail, TransferAccess, TransferNeed } from "../domain/models";
 import type { StationService } from "../domain/StationService";
 import { AppError } from "../errors";
@@ -116,7 +116,7 @@ export class NavigationAgent {
     const lacking = async (id: string) => {
       if (!needs.length) return false;
       const d = await this.stations.detail(id, ctx, snap, byId.get(id));
-      return !d || needs.some((n) => d.amenities[n] !== "available");
+      return !d || needs.some((n) => !needMet(n, d.amenities, d.assessment.layout));
     };
     const weak: string[] = [];
     for (const id of transferStationIds(route)) {
@@ -150,18 +150,22 @@ export class NavigationAgent {
       if (d) details.set(id, d);
     }
 
-    // Peron naik tiap ruas (fasilitas dan celah peron dengan kendaraan).
-    route = withPlatforms(route, details);
-    for (const a of alternatives) if (a.route) a.route = withPlatforms(a.route, details);
-    warnings.push(...gapWarnings(route, byId));
-
-    // Skor perjalanan: jalur gate ke peron yang dipakai menentukan apakah lift/eskalator dibutuhkan.
-    const used = gatePlatforms(route, details);
-    assessments = assessments.map((a) => {
-      const d = details.get(a.stationId);
-      return d ? journeyAssessment(a, d, used.get(a.stationId) ?? [], snap) : a;
-    });
-    warnings.push(...crossingWarnings(assessments, byId));
+    // Peron naik tiap ruas (fasilitas dan celah peron dengan kendaraan), lalu skor perjalanan: jalur gate ke
+    // peron yang dipakai menentukan apakah lift/eskalator dibutuhkan. Data peron hanya pelengkap, jadi galat
+    // di sini tidak menggagalkan rute.
+    try {
+      route = withPlatforms(route, details);
+      for (const a of alternatives) if (a.route) a.route = withPlatforms(a.route, details);
+      const used = gatePlatforms(route, details);
+      const adjusted = assessments.map((a) => {
+        const d = details.get(a.stationId);
+        return d ? journeyAssessment(a, d, used.get(a.stationId) ?? [], snap) : a;
+      });
+      warnings.push(...gapWarnings(route, byId), ...crossingWarnings(adjusted, byId));
+      assessments = adjusted;
+    } catch (e) {
+      this.log.warn("data peron dilewati", { error: (e as Error).message });
+    }
 
     // Fasilitas yang dibutuhkan pengguna di setiap stasiun tempat pindah.
     if (needs.length) {
@@ -176,6 +180,8 @@ export class NavigationAgent {
     const notices = snap.notices({ stationIds: routeIds, lineIds, hubIds });
 
     if (!route.timeComplete) warnings.push("Sebagian ruas tidak memiliki data waktu tempuh, sehingga total waktu belum lengkap.");
+    for (const l of route.legs) if (l.turnaround && l.notes) warnings.push(`Berbalik arah: ${l.notes}`);
+    if (route.timeEstimated) warnings.push("Waktu tempuh TransJakarta adalah perkiraan dari jadwal GTFS Transjakarta, bukan waktu nyata; belum termasuk waktu tunggu dan kemacetan.");
     if (route.fareComplete === false) warnings.push("Tarif sebagian ruas tidak tersedia di dataset, sehingga total tarif belum lengkap.");
     const noData = assessments.filter((a) => !a.dataAvailable).map((a) => byId.get(a.stationId)!.name);
     if (noData.length) warnings.push(`Data fasilitas belum tersedia untuk: ${noData.join(", ")}.`);
@@ -273,18 +279,37 @@ export function withTransferAccess(route: Route, needs: TransferNeed[], details:
       { stationId: leg.stops[leg.stops.length - 1], platforms: next?.type === "RIDE" ? platformsFor(details.get(leg.stops[leg.stops.length - 1]), next.lineId, next.platform, next.headsign) : [] },
     ];
     const access: TransferAccess[] = [];
-    for (const { stationId, platforms } of ends)
+    for (const { stationId, platforms } of ends) {
+      const d = details.get(stationId);
+      // Peron yang dicapai dari gate tanpa anak tangga tidak membutuhkan lift/eskalator (aturan yang sama dengan skor).
+      const layout = d?.entrances?.length && platforms.length ? layoutAccess(d.entrances, platforms.map((p) => p.code), d.concourses ?? []) : undefined;
+      const notNeeded = layout?.level
+        ? { via: layout.via, gate: layout.gate, ...(layout.dedicated ? { dedicated: true } : {}), ...(layout.stepFree ? { stepFree: true } : {}), ...(layout.concourse ? { concourse: layout.concourse } : {}) }
+        : undefined;
       for (const need of needs) {
+        const extra = notNeeded && need !== "ramp" ? { notNeeded } : {};
+        // Jalur lewat concourse yang pindah lantai: lift/eskalator di ruas itulah yang dipakai.
+        const path = !layout || layout.level ? undefined : need === "lift" ? layout.pathLift : need === "eskalator" ? layout.pathEscalator : undefined;
+        if (path) {
+          access.push({ stationId, need, status: path, platform: platforms.map((p) => p.code).join(", ") });
+          continue;
+        }
         const known = platforms.filter((p) => p.amenities[need]);
         if (platforms.length && known.length === platforms.length) {
           const worst = known.reduce((a, b) => (RANK[b.amenities[need]!] < RANK[a.amenities[need]!] ? b : a));
-          access.push({ stationId, need, status: worst.amenities[need]!, platform: platforms.length === 1 ? worst.code : platforms.map((p) => p.code).join(", ") });
+          access.push({ stationId, need, status: worst.amenities[need]!, platform: platforms.length === 1 ? worst.code : platforms.map((p) => p.code).join(", "), ...extra });
           continue;
         }
-        const d = details.get(stationId);
         const ntd = d?.amenityDetails.find((x) => x.type === need && x.source === "ntd");
-        access.push({ stationId, need, status: ntd?.status === "out_of_service" ? "out_of_service" : (d?.amenities[need] ?? "unknown") });
+        access.push({
+          stationId,
+          need,
+          status: ntd?.status === "out_of_service" ? "out_of_service" : (d?.amenities[need] ?? "unknown"),
+          ...(notNeeded && need !== "ramp" ? { platform: platforms.map((p) => p.code).join(", ") } : {}),
+          ...extra,
+        });
       }
+    }
     // Pindah di stasiun yang sama tanpa info peron menghasilkan entri kembar.
     const seen = new Set<string>();
     return { ...leg, access: access.filter((a) => !seen.has(JSON.stringify(a)) && !!seen.add(JSON.stringify(a))) };
@@ -329,9 +354,11 @@ export function crossingWarnings(assessments: StationAssessment[], byId: Map<str
     const j = a.journey;
     if (!j) continue;
     const name = `${byId.get(a.stationId)?.name ?? a.stationId} (peron ${j.platforms.join(", ")})`;
-    if (j.via === "sebidang") out.push(`Menuju ${name} harus menyeberang rel lewat pelintasan sebidang; minta bantuan petugas bila perlu.`);
+    if (j.dedicated) out.push(`Menuju ${name} memakai jalur ${viaText(j).replace(/^lewat /, "")} (${j.gate}); minta bantuan petugas bila perlu.`);
+    else if (j.via === "sebidang") out.push(`Menuju ${name} harus menyeberang rel lewat pelintasan sebidang; minta bantuan petugas bila perlu.`);
     else if (j.via === "crosswalk") out.push(`Menuju ${name} harus menyeberang jalan lewat crosswalk.`);
-    else if (!j.level && j.lift !== "available") out.push(`${name} hanya dapat dicapai ${VIA_LABEL[j.via]}, dan lift ${j.lift === "unknown" ? "belum ada datanya" : "tidak tercatat"}.`);
+    else if (!j.level && j.pathLift === "out_of_service") out.push(`${name} hanya dapat dicapai ${viaText(j)}, dan lift di jalur itu dilaporkan sedang tidak berfungsi.`);
+    else if (!j.level && j.lift !== "available") out.push(`${name} hanya dapat dicapai ${viaText(j)}, dan lift ${j.lift === "unknown" ? "belum ada datanya" : "tidak tercatat"}.`);
   }
   return out;
 }
@@ -357,6 +384,8 @@ export function accessWarnings(route: Route, byId: Map<string, Station>): string
       const st = byId.get(a.stationId)?.name ?? route.stopNames?.[a.stationId] ?? a.stationId;
       const name = a.platform ? `${st} (peron ${a.platform})` : st;
       const label = AMENITY_LABEL[a.need] ?? a.need;
+      // Tidak dibutuhkan: peron dicapai tanpa anak tangga; penyeberangannya sudah dijelaskan crossingWarnings.
+      if (a.notNeeded) continue;
       if (a.status === "out_of_service") out.add(`${label} di ${name} dilaporkan sedang tidak berfungsi; perpindahan di sini mungkin tidak bisa dilakukan.`);
       else if (a.status === "absent") out.add(`${label} tidak tercatat di ${name}, padahal Anda membutuhkannya untuk pindah. Pertimbangkan alternatif atau minta bantuan petugas.`);
       else if (a.status === "unknown") out.add(`Data ${label.toLowerCase()} di ${name} belum tersedia; belum bisa dipastikan perpindahan di sini dapat dilakukan.`);

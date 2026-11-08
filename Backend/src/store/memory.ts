@@ -8,6 +8,8 @@ import type {
   CacheRepository,
   ContentItem,
   ContentRepository,
+  ServerConfigEntry,
+  ServerConfigRepository,
   Store,
   TestCase,
   TestRepository,
@@ -189,6 +191,20 @@ class MemoryAudit implements AuditRepository {
   }
 }
 
+class MemoryServerConfig implements ServerConfigRepository {
+  private m = new Map<string, ServerConfigEntry>();
+  async get<T>(key: string) {
+    const e = this.m.get(key);
+    return e ? ({ ...e, value: clone(e.value) } as ServerConfigEntry<T>) : null;
+  }
+  async put<T>(key: string, value: T, by: string) {
+    this.m.set(key, { value: clone(value), updatedAt: new Date(), updatedBy: by });
+  }
+  async delete(key: string) {
+    return this.m.delete(key);
+  }
+}
+
 export function createMemoryStore(): Store {
   return {
     kind: "memory",
@@ -197,6 +213,7 @@ export function createMemoryStore(): Store {
     admins: new MemoryAdmins(),
     tests: new MemoryTests(),
     audit: new MemoryAudit(),
+    serverConfig: new MemoryServerConfig(),
     ping: async () => true,
     close: async () => {},
   };

@@ -8,7 +8,7 @@ import { FixtureCommuteSource } from "../src/data/commute/FixtureCommuteSource";
 import { directionLabel, HttpCommuteSource, jakartaDayHour } from "../src/data/commute/HttpCommuteSource";
 import type { CommuteSource, UpFare, UpHeadway, UpHubTransfer, UpLine, UpStation } from "../src/data/commute/types";
 import type { Entrance, Platform, Route, Station, StationAssessment, StationDetail } from "../src/domain/models";
-import type { ContentSnapshot } from "../src/domain/content";
+import { ContentSnapshot } from "../src/domain/content";
 import { journeyAssessment } from "../src/domain/FacilityAnalysisService";
 import { mergeEntrances, mergePlatforms } from "../src/domain/StationService";
 import { combinedFrequency, frequencyOf, parallelLines, RoutePlannerService } from "../src/domain/RoutePlannerService";
@@ -337,11 +337,22 @@ describe("Peron dan gate: dataset lalu isian admin", () => {
     const byId = new Map<string, Station>([["sud", { id: "sud", name: "Sudirman" } as Station]]);
     expect(accessWarnings(out, byId).some((w) => w.includes("Sudirman (peron 1)"))).toBe(true);
     expect(gapWarnings(withP, byId)).toEqual(["Naik di Sudirman (peron 1): ada 2 anak tangga antara peron dan kendaraan. Petugas dapat menyediakan pelat/ramp portabel."]);
+
+    // Peron 1 dicapai lewat pelintasan sebidang khusus disabilitas: lift tidak dibutuhkan, jadi tidak diperingatkan.
+    const gateLink: Entrance = { id: "g", stationId: "sud", name: "Gate selatan", accessible: false, features: [], platformLinks: [{ platform: "1", via: "sebidang", dedicated: true }], source: "ntd" };
+    const level = new Map([["sud", { ...d, entrances: [gateLink] } as StationDetail]]);
+    const out2 = withTransferAccess(withP, ["lift", "ramp"], level);
+    expect(out2.legs[1].access?.find((a) => a.stationId === "sud" && a.need === "lift")).toEqual({
+      stationId: "sud", need: "lift", status: "absent", platform: "1", notNeeded: { via: "sebidang", gate: "Gate selatan", dedicated: true },
+    });
+    // Ramp tetap diperiksa.
+    expect(out2.legs[1].access?.find((a) => a.stationId === "sud" && a.need === "ramp")?.notNeeded).toBeUndefined();
+    expect(accessWarnings(out2, byId).some((w) => w.startsWith("Lift tidak tercatat di Sudirman"))).toBe(false);
   });
 
-  it("skor perjalanan: gate langsung/sebidang ke peron membuat lift dan eskalator tidak dihitung; JPO menghitungnya", () => {
-    const W = { lift: 40, eskalator: 20, toilet: 25, ramp: 15 } as const;
-    const snap = { weight: (t: keyof typeof W) => W[t], settings: { scoring: { threshold: 70 } } } as unknown as ContentSnapshot;
+  it("skor perjalanan: gate langsung/sebidang ke peron membuat lift dan eskalator tidak dibutuhkan; JPO menghitungnya", () => {
+    // Bobot bawaan: lift 40, eskalator 20, toilet 25, ramp 15; ambang 70.
+    const snap = new ContentSnapshot([], false, new Date());
     const platforms: Platform[] = [
       { code: "1", serves: [{ lineId: "krl", direction: "Arah Tanah Abang" }], amenities: {}, source: "ntd" },
       { code: "2", serves: [{ lineId: "krl", direction: "Arah Manggarai" }], amenities: { lift: "absent" }, source: "ntd" },
@@ -352,6 +363,7 @@ describe("Peron dan gate: dataset lalu isian admin", () => {
       gate("Gate selatan", false, [{ platform: "2", via: "sebidang" }]),
     ];
     // Stasiun kecil: toilet dan ramp ada, lift dan eskalator tidak; skor stasiun 40.
+    // Bila jalurnya sejajar, lift dan eskalator tidak dibutuhkan sehingga dianggap terpenuhi.
     const d = { id: "s", name: "Kecil", amenities: { lift: "absent", eskalator: "absent", toilet: "available", ramp: "available" }, amenityDetails: [], platforms, entrances } as unknown as StationDetail;
     const a: StationAssessment = { stationId: "s", score: 40, adequate: false, dataAvailable: true };
 
@@ -362,12 +374,36 @@ describe("Peron dan gate: dataset lalu isian admin", () => {
     expect(p2).toMatchObject({ score: 40, adequate: false, journey: { level: false, via: "jpo", lift: "absent", excluded: [] } });
     // Tanpa data hubungan gate dan peron, skor stasiun dipakai apa adanya.
     expect(journeyAssessment(a, { ...d, entrances: [] }, ["1"], snap)).toBe(a);
+    // Stasiun yang hanya punya eskalator (skor 20) tidak turun skornya karena lift/eskalator tidak dibutuhkan.
+    const onlyEsc = { ...d, amenities: { lift: "absent", eskalator: "available", toilet: "absent", ramp: "unknown" } } as unknown as StationDetail;
+    expect(journeyAssessment({ ...a, score: 20 }, onlyEsc, ["1"], snap).score).toBe(60);
 
     const byId = new Map<string, Station>([["s", { id: "s", name: "Kecil" } as Station]]);
     expect(crossingWarnings([p2], byId)).toEqual(["Kecil (peron 2) hanya dapat dicapai lewat JPO, dan lift tidak tercatat."]);
     const viaRail = journeyAssessment(a, { ...d, entrances: [gate("Gate selatan", true, [{ platform: "2", via: "sebidang" }])] }, ["2"], snap);
     expect(viaRail.score).toBe(100);
     expect(crossingWarnings([viaRail], byId)[0]).toContain("pelintasan sebidang");
+
+    // Penyeberangan khusus disabilitas dipakai walau gate-nya tidak ditandai aksesibel, dan mengalahkan JPO.
+    const special = journeyAssessment(a, { ...d, entrances: [entrances[0], gate("Gate selatan", false, [{ platform: "2", via: "sebidang", dedicated: true }])] }, ["2"], snap);
+    expect(special).toMatchObject({ score: 100, journey: { level: true, via: "sebidang", dedicated: true, gate: "Gate selatan" } });
+    expect(crossingWarnings([special], byId)[0]).toBe("Menuju Kecil (peron 2) memakai jalur pelintasan sebidang (menyeberang rel) khusus pengguna disabilitas (Gate selatan); minta bantuan petugas bila perlu.");
+
+    // Celah peron memotong skor perjalanan: 2 anak tangga -15, setengahnya bila ada pelat/ramp dari petugas.
+    const withGap = (boardingAid: boolean) =>
+      ({ ...d, platforms: [{ ...platforms[0], gap: { level: "tangga", steps: 2, boardingAid } }, platforms[1]] }) as StationDetail;
+    expect(journeyAssessment(a, withGap(false), ["1"], snap)).toMatchObject({ score: 85, adequate: true, penalties: [{ points: 15 }] });
+    expect(journeyAssessment(a, withGap(true), ["1"], snap).score).toBe(92);
+    // Tanpa data jalur, celah peron tetap memotong skor stasiun.
+    const noLinks = journeyAssessment(a, { ...withGap(false), entrances: [] }, ["1"], snap);
+    expect(noLinks.score).toBe(25);
+    expect(noLinks.journey).toBeUndefined();
+    // Skor stasiun memotong celah peron 2; perjalanan yang hanya memakai peron 1 tidak ikut terpotong.
+    const gap2 = { reason: "Celah peron 2: 2 anak tangga antara peron dan kendaraan", points: 15 };
+    const stationWithGap: StationAssessment = { ...a, score: 25, penalties: [gap2], notes: ["Celah peron 2: 2 anak tangga antara peron dan kendaraan (skor −15)."] };
+    const onP1 = journeyAssessment(stationWithGap, { ...d, entrances: [] }, ["1"], snap);
+    expect(onP1).toMatchObject({ score: 40, notes: [] });
+    expect(onP1.penalties).toBeUndefined();
 
     const route: Route = {
       legs: [{ type: "RIDE", lineId: "krl", headsign: "Tanah Abang", stops: ["s", "t"], distanceM: 1, minutes: 1, fare: 0 }],

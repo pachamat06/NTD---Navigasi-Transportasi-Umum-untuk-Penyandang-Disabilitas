@@ -49,9 +49,10 @@ export interface UpLine {
   stationNumbers?: (string | null)[];
   /**
    * Ruas lin berurutan (batang utama dan cabang). `joinsAt` = stasiun tempat cabang berpisah dari batang utama.
-   * Tidak diisi = `stations` adalah satu ruas lurus.
+   * `loop` = ruas putaran (mis. lingkar Lin Cikarang Pondok Jati ... Matraman) yang tersambung ke `joinsAt` di
+   * KEDUA ujungnya. Tidak diisi = `stations` adalah satu ruas lurus.
    */
-  segments?: { stations: UpStopRef[]; joinsAt?: UpStopRef }[];
+  segments?: { stations: UpStopRef[]; joinsAt?: UpStopRef; loop?: boolean }[];
 }
 
 /** Pintu keluar stasiun (/stations/{op}/{code}/exits, rujukan pada transfer). */

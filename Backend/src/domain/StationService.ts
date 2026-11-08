@@ -6,6 +6,7 @@ import type { CommuteApiClient } from "../data/commute/CommuteApiClient";
 import type { ContentSnapshot } from "./content";
 import type { FacilityAnalysisService } from "./FacilityAnalysisService";
 import type { Entrance, Hub, Line, Platform, Station, StationDetail } from "./models";
+import { applyPatternsToLines, type PatternProvider } from "./routePatterns";
 
 const normalize = (s: string) =>
   s
@@ -19,6 +20,8 @@ export class StationService {
   constructor(
     private commute: CommuteApiClient,
     private facilities: FacilityAnalysisService,
+    /** Pengaturan rute dari admin: urutan stasiun lini mengikuti pengaturan itu. */
+    private patterns?: PatternProvider,
   ) {}
 
   list(ctx: RequestContext): Promise<Station[]> {
@@ -50,8 +53,9 @@ export class StationService {
     return scored.slice(0, limit).map((x) => x.s);
   }
 
-  lines(ctx: RequestContext): Promise<Line[]> {
-    return this.commute.getLines(ctx);
+  async lines(ctx: RequestContext): Promise<Line[]> {
+    const [lines, patterns] = await Promise.all([this.commute.getLines(ctx), this.patterns ? this.patterns(ctx) : Promise.resolve([])]);
+    return applyPatternsToLines(lines, patterns);
   }
 
   hubs(ctx: RequestContext): Promise<Hub[]> {
@@ -75,6 +79,7 @@ export class StationService {
       assessment,
       platforms: mergePlatforms(platforms, snap.platformsOf(id)),
       entrances: mergeEntrances(exits, snap.entrancesOf(id)),
+      concourses: snap.concoursesOf(id),
       info: snap.infoOf(id),
       notices: snap.notices({ stationIds: [id], lineIds: st.lineIds, hubIds: st.hubId ? [st.hubId] : [] }).filter((n) => n.scope !== "global"),
     };

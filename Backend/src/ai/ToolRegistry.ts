@@ -4,7 +4,7 @@
 import type { RequestContext } from "../context";
 import type { AlternativeService } from "../domain/AlternativeService";
 import type { ContentSnapshot } from "../domain/content";
-import type { FacilityAnalysisService } from "../domain/FacilityAnalysisService";
+import { needMet, type FacilityAnalysisService } from "../domain/FacilityAnalysisService";
 import type { Alternative, Hub, Mode, Route, Station, StationAssessment, TransferNeed } from "../domain/models";
 import { WALK_WEIGHT, type RoutePlannerService } from "../domain/RoutePlannerService";
 import type { StationService } from "../domain/StationService";
@@ -82,7 +82,16 @@ export class ToolRegistry {
           : i.avoidModes?.length
             ? d.planner.getRouteAvoiding(i.fromId, i.toId, i.avoidModes, ctx, i.at, i.needs?.length ? WALK_WEIGHT.SLOW : WALK_WEIGHT.AVERAGE)
             : d.planner.getRoute(i.fromId, i.toId, ctx, i.at);
-        return (await route) as Tools[N]["out"];
+        const found = await route;
+        if (!found || !i.needs?.length) return found as Tools[N]["out"];
+        // Halte BRT gabungan dua arah: fasilitas tiap arah diperiksa lewat id turunan per kode (mis. tj:h00267s).
+        const needs = i.needs;
+        const metAt = async (code: string) => {
+          const id = `tj:${code.toLowerCase()}`;
+          const det = await d.stations.detail(id, ctx, snap, { id, name: code, operator: "TransJakarta", lineIds: [], codes: [code] }, { dataset: false });
+          return !!det && needs.every((n) => needMet(n, det.amenities, det.assessment.layout));
+        };
+        return (await d.planner.backtrackForNeeds(found, ctx, metAt)) as Tools[N]["out"];
       }
       case "lengkapi_rute": {
         const i = input as Tools["lengkapi_rute"]["in"];

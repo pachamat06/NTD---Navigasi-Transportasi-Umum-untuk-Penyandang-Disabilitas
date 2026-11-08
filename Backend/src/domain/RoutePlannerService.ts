@@ -1,10 +1,14 @@
 // Modul Perencana Rute (UC-03). Rute disusun dari data dataset (/fares legs), bukan dari geometri
 // peta; moda dan nama lini dilengkapi dari /lines dan /operators. Waktu tempuh yang tidak tersedia
-// ditandai null dan TIDAK diperkirakan dari jarak (Tabel 3.4 no. 3, UC-01 E5).
+// ditandai null dan TIDAK diperkirakan dari jarak (Tabel 3.4 no. 3, UC-01 E5). Pengecualian: ruas
+// TransJakarta koridor BRT NTD memakai waktu jadwal GTFS Transjakarta, ditandai `minutesEstimated`.
 
 import type { RequestContext } from "../context";
 import type { CommuteApiClient, FareResult, LineHeadway } from "../data/commute/CommuteApiClient";
+import { lineIdOf, lineRefOf, type StationIndex } from "../data/commute/station-index";
+import type { TjGtfs } from "../data/gtfs/TjGtfs";
 import type { Frequency, Hub, Line, Mode, RideOption, Route, RouteLeg, Station } from "./models";
+import { applyPatternsToSequences, patternMinutes, type LineSequences, type PatternProvider } from "./routePatterns";
 
 /** Moda menurut kode operator, untuk ruas yang lininya tidak ada di daftar lini (mis. operator dikeluarkan). */
 const OPERATOR_MODE: Record<string, Mode> = { KCI: "RAIL", RLK: "RAIL", MRTJ: "SUBWAY", LRTJ: "TRAM", LRTJBDB: "TRAM", TJ: "BUS", APCGK: "MONORAIL" };
@@ -31,12 +35,166 @@ interface Ride {
 }
 
 export class RoutePlannerService {
-  constructor(private commute: CommuteApiClient) {}
+  constructor(
+    private commute: CommuteApiClient,
+    /** Jadwal GTFS Transjakarta untuk waktu tempuh ruas TransJakarta yang tidak punya jadwal di dataset. */
+    private gtfs?: TjGtfs,
+    /** Pengaturan rute per lini dan arah dari admin (urutan pemberhentian dan waktu tempuh). */
+    private patterns?: PatternProvider,
+  ) {}
+
+  /** Urutan stasiun tiap lini: data bawaan, diganti pengaturan rute admin bila ada. */
+  async sequences(ctx: RequestContext): Promise<LineSequences[]> {
+    const [base, patterns] = await Promise.all([this.commute.getLineSequences(ctx), this.patterns ? this.patterns(ctx) : Promise.resolve([])]);
+    return applyPatternsToSequences(base, patterns);
+  }
 
   async getRoute(fromId: string, toId: string, ctx: RequestContext, at?: string): Promise<Route | null> {
     const fare = await this.commute.getFare(fromId, toId, ctx, at);
     if (!fare) return null;
-    return this.enrich(fare, await this.commute.getLines(ctx));
+    const lines = await this.commute.getLines(ctx);
+    return this.fixDirections(this.enrich(fare, lines), lines, ctx);
+  }
+
+  /**
+   * Halte BRT gabungan dua arah (mis. Kebon Sirih Arah Utara/Selatan) sebagai halte asal atau tujuan: bila halte
+   * arah yang dipakai tidak punya fasilitas yang dibutuhkan (`metAt` false) tetapi halte arah sebaliknya punya,
+   * penumpang diarahkan berbalik arah:
+   * - tujuan: lewati halte itu sampai halte berikutnya yang bisa berbalik arah, pindah bus, turun di halte seberang;
+   * - asal: naik dari halte seberang ke halte berikutnya yang bisa berbalik arah, pindah bus, lalu lanjut.
+   */
+  async backtrackForNeeds(route: Route, ctx: RequestContext, metAt: (code: string) => Promise<boolean>): Promise<Route> {
+    const gtfs = this.gtfs;
+    if (!gtfs) return route;
+    const idx = await this.commute.index(ctx);
+    const idOf = (code: string) => idx.idOf({ operator: "TJ", code });
+    const name = (code: string) => gtfs.stop(code)?.name ?? code;
+    const lineName = async (code: string) => (await this.commute.getLines(ctx)).find((l) => l.id === lineIdOf("TJ", code))?.name;
+    const legs = [...route.legs];
+    let changed = false;
+    const turn = (at: string, notes: string): RouteLeg => ({ type: "TRANSFER", stops: [at, at], distanceM: 0, minutes: null, fare: 0, turnaround: true, notes });
+    const ride = async (line: string, codes: string[], headsign: string): Promise<RouteLeg> => {
+      const ln = await lineName(line);
+      return { type: "RIDE", lineId: lineIdOf("TJ", line), ...(ln ? { lineName: ln } : {}), operator: "TransJakarta", mode: "BUS", headsign, stops: codes.map(idOf), distanceM: gtfs.distance(codes), minutes: null, fare: 0 };
+    };
+    const opposite = (stopId: string, used: string) => {
+      const codes = idx.refsOf(stopId).filter((r) => r.operator.toUpperCase() === "TJ").map((r) => r.code.toUpperCase());
+      return codes.length > 1 ? codes.find((c) => c !== used) : undefined;
+    };
+
+    // Tujuan: ruas naik terakhir.
+    const li = legs.map((l) => l.type).lastIndexOf("RIDE");
+    if (li >= 0 && li === legs.length - 1) {
+      const leg = legs[li];
+      const lines = tjLines(leg, gtfs);
+      const cands = tjCodes(leg.stops, idx);
+      const m = lines.length && cands ? gtfs.match(lines, cands) : null;
+      const used = m?.codes[m.codes.length - 1];
+      const other = used ? opposite(leg.stops[leg.stops.length - 1], used) : undefined;
+      const next = m ? gtfs.nextTurnaround(m) : undefined;
+      if (m && used && other && next && !(await metAt(used)) && (await metAt(other))) {
+        const back = gtfs.path(next.code, other, lines);
+        if (back) {
+          const ext = m.pattern.stops.slice(m.to + 1, next.index + 1);
+          legs.splice(
+            li,
+            1,
+            { ...leg, stops: [...leg.stops, ...ext.map(idOf)], distanceM: leg.distanceM + gtfs.distance([used, ...ext]), minutes: null, minutesEstimated: undefined },
+            turn(idOf(next.code), `${name(used)} tidak memiliki fasilitas yang dibutuhkan, sedangkan ${name(other)} memilikinya. Jangan turun di ${name(used)}; lanjut ke ${name(next.code)}, pindah ke bus arah sebaliknya, lalu turun di ${name(other)}.`),
+            await ride(back.line, back.stops, back.headsign),
+          );
+          changed = true;
+        }
+      }
+    }
+
+    // Asal: ruas naik pertama.
+    const fi = legs.findIndex((l) => l.type === "RIDE");
+    if (fi === 0) {
+      const leg = legs[0];
+      const lines = tjLines(leg, gtfs);
+      const cands = tjCodes(leg.stops, idx);
+      const m = lines.length && cands ? gtfs.match(lines, cands) : null;
+      const used = m?.codes[0];
+      const other = used ? opposite(leg.stops[0], used) : undefined;
+      if (m && used && other && !(await metAt(used)) && (await metAt(other))) {
+        const out = gtfs.turnaroundAfter(other, lines);
+        const back = out ? gtfs.path(out.stops[out.stops.length - 1], used, lines) : null;
+        if (out && back) {
+          const at = out.stops[out.stops.length - 1];
+          legs.splice(
+            0,
+            1,
+            await ride(out.line, out.stops, out.headsign),
+            turn(idOf(at), `${name(used)} tidak memiliki fasilitas yang dibutuhkan, sedangkan ${name(other)} memilikinya. Naik dari ${name(other)} ke ${name(at)}, pindah ke bus arah sebaliknya, lalu lanjutkan perjalanan.`),
+            { ...leg, stops: [...back.stops.map(idOf), ...leg.stops.slice(1)], distanceM: leg.distanceM + gtfs.distance(back.stops), minutes: null, minutesEstimated: undefined },
+          );
+          changed = true;
+        }
+      }
+    }
+    if (!changed) return route;
+    const next = totals(legs, route.totalFare, legs.reduce((s, l) => s + l.distanceM, 0));
+    return { ...next, ...(route.stopNames ? { stopNames: route.stopNames } : {}), ...(route.fareComplete !== undefined ? { fareComplete: route.fareComplete } : {}) };
+  }
+
+  /**
+   * Ruas naik TransJakarta yang urutan haltenya tidak dilayani satu bus (mis. Kampung Melayu > Matraman Baru >
+   * Bali Mester: Bali Mester hanya dilayani arah Kampung Melayu) dipecah di halte tempat penumpang bisa berbalik
+   * arah: turun, pindah ke bus arah sebaliknya, lalu naik sampai tujuan. Butuh data GTFS.
+   */
+  async fixDirections(route: Route, lines: Line[], ctx: RequestContext): Promise<Route> {
+    const gtfs = this.gtfs;
+    if (!gtfs) return route;
+    const idx = await this.commute.index(ctx);
+    let changed = false;
+    const legs = route.legs.flatMap((leg): RouteLeg[] => {
+      const lineCodes = tjLines(leg, gtfs);
+      const cands = leg.type === "RIDE" ? tjCodes(leg.stops, idx) : undefined;
+      if (!lineCodes.length || !cands || gtfs.match(lineCodes, cands)) return [leg];
+      const s = gtfs.split(lineCodes, cands);
+      if (!s) return [leg];
+      changed = true;
+      const at = leg.stops[s.at];
+      const share = (codes: string[]) => gtfs.distance(codes);
+      const [d1, d2] = [share(s.first.codes), share(s.second.codes)];
+      const dist1 = d1 + d2 > 0 ? Math.round((leg.distanceM * d1) / (d1 + d2)) : 0;
+      const ride = (m: typeof s.first, stops: string[], extra: Partial<RouteLeg>): RouteLeg => {
+        const lineId = lineIdOf("TJ", m.line);
+        const line = lines.find((l) => l.id === lineId);
+        return {
+          type: "RIDE",
+          lineId,
+          ...(line ? { lineName: line.name, operator: line.operator } : leg.operator ? { operator: leg.operator } : {}),
+          mode: "BUS",
+          headsign: m.pattern.headsign,
+          stops,
+          distanceM: 0,
+          minutes: null,
+          fare: 0,
+          ...extra,
+        };
+      };
+      const name = gtfs.stop(s.code)?.name ?? at;
+      return [
+        ride(s.first, leg.stops.slice(0, s.at + 1), { distanceM: dist1, fare: leg.fare }),
+        {
+          type: "TRANSFER",
+          stops: [at, at],
+          distanceM: 0,
+          minutes: null,
+          fare: 0,
+          turnaround: true,
+          notes: s.crossing
+            ? `Turun di ${name}, keluar halte dan menyeberang ke halte arah sebaliknya, lalu naik bus ke arah ${s.second.pattern.headsign}. Bus arah ini tidak berhenti di halte tujuan.`
+            : `Turun di ${name} lalu pindah ke bus arah sebaliknya (${s.second.pattern.headsign}) tanpa keluar halte. Bus arah ini tidak berhenti di halte tujuan.`,
+        },
+        ride(s.second, leg.stops.slice(s.at), { distanceM: Math.max(0, leg.distanceM - dist1) }),
+      ];
+    });
+    if (!changed) return route;
+    const next = totals(legs, route.totalFare, route.totalDistanceM);
+    return { ...next, ...(route.stopNames ? { stopNames: route.stopNames } : {}), ...(route.fareComplete !== undefined ? { fareComplete: route.fareComplete } : {}) };
   }
 
   /**
@@ -52,7 +210,7 @@ export class RoutePlannerService {
       this.commute.getStations(ctx),
       this.commute.getLines(ctx),
       this.commute.getHubs(ctx),
-      this.commute.getLineSequences(ctx),
+      this.sequences(ctx),
     ]);
     const lineById = new Map(lines.map((l) => [l.id, l]));
     const allowed = sequences.filter((s) => {
@@ -185,7 +343,7 @@ export class RoutePlannerService {
    */
   async annotate(route: Route, ctx: RequestContext, at?: string): Promise<Route> {
     const needsParallel = route.legs.some((l) => l.type === "RIDE" && !l.options && l.lineId);
-    const [lines, sequences] = await Promise.all([this.commute.getLines(ctx), needsParallel ? this.commute.getLineSequences(ctx) : Promise.resolve([])]);
+    const [lines, sequences] = await Promise.all([this.commute.getLines(ctx), needsParallel ? this.sequences(ctx) : Promise.resolve([])]);
     const lineById = new Map(lines.map((l) => [l.id, l]));
     const legs = await Promise.all(
       route.legs.map(async (leg): Promise<RouteLeg> => {
@@ -223,9 +381,71 @@ export class RoutePlannerService {
         return { ...out, ...(out.options ? { options } : {}), ...(frequency ? { frequency } : {}) };
       }),
     );
-    const next = { ...route, legs };
-    return { ...next, totalDistanceM: route.totalDistanceM || legs.reduce((s, l) => s + l.distanceM, 0) };
+    const timed = await this.withGtfsTimes(legs, ctx);
+    const next = { ...route, legs: timed };
+    const estimated = timed.some((l) => l.minutesEstimated);
+    return {
+      ...next,
+      totalDistanceM: route.totalDistanceM || timed.reduce((s, l) => s + l.distanceM, 0),
+      ...(estimated
+        ? {
+            totalMinutes: timed.some((l) => l.minutes !== null) ? timed.reduce((s, l) => s + (l.minutes ?? 0), 0) : null,
+            timeComplete: timed.every((l) => l.minutes !== null),
+            timeEstimated: true,
+          }
+        : {}),
+    };
   }
+
+  /**
+   * Ruas naik tanpa waktu tempuh (mis. /fares TJ tidak memuat jam): waktu dari pengaturan rute admin bila ada,
+   * lalu waktu jadwal dari GTFS Transjakarta bila lin ruas itu (atau salah satu lin paralelnya) adalah koridor
+   * BRT yang ada di data GTFS NTD. Keduanya perkiraan (`minutesEstimated`).
+   */
+  private async withGtfsTimes(legs: RouteLeg[], ctx: RequestContext): Promise<RouteLeg[]> {
+    if (!legs.some((l) => l.type === "RIDE" && l.minutes === null)) return legs;
+    const patterns = this.patterns ? await this.patterns(ctx) : [];
+    if (patterns.length)
+      legs = legs.map((leg) => {
+        if (leg.type !== "RIDE" || leg.minutes !== null) return leg;
+        const lineIds = [leg.lineId, ...(leg.options ?? []).map((o) => o.lineId)].filter((x): x is string => !!x);
+        const t = patternMinutes(patterns, lineIds, leg.stops);
+        return t ? { ...leg, minutes: t.minutes, minutesEstimated: true } : leg;
+      });
+    const gtfs = this.gtfs;
+    if (!gtfs || !legs.some((l) => l.type === "RIDE" && l.minutes === null)) return legs;
+    const idx = await this.commute.index(ctx);
+    return legs.map((leg) => {
+      if (leg.type !== "RIDE" || leg.minutes !== null) return leg;
+      const codes = tjCodes(leg.stops, idx);
+      if (!codes) return leg;
+      for (const lineId of [leg.lineId, ...(leg.options ?? []).map((o) => o.lineId)]) {
+        const ref = lineId ? lineRefOf(lineId) : undefined;
+        if (ref?.operator !== "TJ" || !gtfs.hasRoute(ref.code)) continue;
+        const t = gtfs.rideTime(ref.code, codes);
+        if (t) return { ...leg, minutes: t.minutes, minutesEstimated: true };
+      }
+      return leg;
+    });
+  }
+}
+
+/**
+ * Kode halte TJ tiap pemberhentian ruas (halte gabungan dua arah: kedua kodenya); undefined bila ada
+ * pemberhentian yang bukan halte TransJakarta.
+ */
+export function tjCodes(stops: string[], idx: StationIndex): string[][] | undefined {
+  const codes = stops.map((s) => idx.refsOf(s).flatMap((r) => (r.operator.toUpperCase() === "TJ" ? [r.code.toUpperCase()] : [])));
+  return codes.every((c) => c.length > 0) ? codes : undefined;
+}
+
+/** Kode lin GTFS untuk ruas naik TransJakarta: lin ruas dan lin paralelnya yang ada di data GTFS. */
+export function tjLines(leg: RouteLeg, gtfs: TjGtfs): string[] {
+  if (leg.type !== "RIDE") return [];
+  return [leg.lineId, ...(leg.options ?? []).map((o) => o.lineId)].flatMap((id) => {
+    const ref = id ? lineRefOf(id) : undefined;
+    return ref?.operator === "TJ" && gtfs.hasRoute(ref.code) ? [ref.code] : [];
+  });
 }
 
 /** Frekuensi satu lin dari baris /headway; arah dipilih lewat tujuan akhir bila frekuensi dua arah berbeda. */
@@ -252,16 +472,16 @@ export function combinedFrequency(list: (Frequency | undefined)[]): Frequency | 
  * Lin (memenuhi `same`) yang berhenti di SEMUA pemberhentian `stops` secara berurutan tanpa melewati
  * pemberhentian lain di antaranya, ke arah mana pun. Lin `primary` paling depan.
  */
-export function parallelLines(stops: string[], primary: string, sequences: { lineId: string; sequences: string[][] }[], same: (lineId: string) => boolean): string[] {
+export function parallelLines(stops: string[], primary: string, sequences: LineSequences[], same: (lineId: string) => boolean): string[] {
   if (stops.length < 2) return [primary];
-  const covers = (seq: string[]) => {
-    for (const dir of [seq, [...seq].reverse()]) {
+  const covers = (seq: string[], directed?: boolean) => {
+    for (const dir of directed ? [seq] : [seq, [...seq].reverse()]) {
       const i = dir.indexOf(stops[0]);
       if (i >= 0 && stops.every((s, k) => dir[i + k] === s)) return true;
     }
     return false;
   };
-  const found = sequences.filter((l) => l.lineId !== primary && same(l.lineId) && l.sequences.some(covers)).map((l) => l.lineId);
+  const found = sequences.filter((l) => l.lineId !== primary && same(l.lineId) && l.sequences.some((seq) => covers(seq, l.directed))).map((l) => l.lineId);
   return [primary, ...new Set(found)];
 }
 
@@ -318,7 +538,7 @@ export function transferStationIds(route: Route): string[] {
 export function findRides(
   fromId: string,
   toId: string,
-  sequences: { lineId: string; sequences: string[][] }[],
+  sequences: LineSequences[],
   hubs: Hub[],
   stations: Map<string, Station>,
   walkWeight: number = WALK_WEIGHT.AVERAGE,
@@ -343,7 +563,8 @@ export function findRides(
     for (const seq of l.sequences)
       for (let i = 1; i < seq.length; i++) {
         addRide(seq[i - 1], seq[i], l.lineId);
-        addRide(seq[i], seq[i - 1], l.lineId);
+        // Urutan searah (pengaturan rute dua arah dari admin) tidak bisa dinaiki ke arah sebaliknya.
+        if (!l.directed) addRide(seq[i], seq[i - 1], l.lineId);
       }
   const walks = new Map<string, { to: string; cost: number }[]>();
   const addWalk = (a: string, b: string, m?: number) => {
@@ -380,7 +601,9 @@ export function findRides(
       }
     };
     for (const e of rideNext.get(st) ?? []) relax(e.to, e.lineId, e.cost + (line && line !== e.lineId ? TRANSFER_COST_KM : 0));
-    if (line) for (const w of walks.get(st) ?? []) relax(w.to, "", w.cost);
+    // Jalan kaki antarstasiun hub: setelah naik, atau di awal perjalanan (asal di anggota hub yang tidak
+    // dilayani moda yang diizinkan, mis. halte TJ di sebelah stasiun kereta). Dua jalan kaki berturut tidak diizinkan.
+    if (line || st === fromId) for (const w of walks.get(st) ?? []) relax(w.to, "", w.cost);
   }
   if (!goal) return null;
   const path: [string, string][] = [];

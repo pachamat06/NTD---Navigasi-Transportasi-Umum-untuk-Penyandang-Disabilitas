@@ -49,6 +49,8 @@ Sumber data Commute (`COMMUTE_SOURCE`):
 
 Id stasiun GUI berbentuk slug (mis. `bni-city`) karena posisi di peta dikunci dengan slug. `station-index.ts` mencocokkan slug ke stasiun API lewat operator + nama tampilan atau nama resmi, jadi kode API tidak ditulis tetap. Stasiun di luar tabel memakai id turunan `operator:kode` (mis. `kci:kat`). Slug yang tidak cocok ditampilkan di Ringkasan halaman admin; tambahkan namanya di tabel bila muncul.
 
+Pelengkap GTFS Transjakarta (`src/data/gtfs/`): khusus koridor BRT 1–14 yang tercantum di NTD. Ruas naik TransJakarta tanpa jadwal di `/fares` diberi waktu tempuh dari jadwal GTFS (`minutesEstimated: true`, rute `timeEstimated: true`, disertai peringatan bahwa itu perkiraan); halte yang dilewati lin tetapi tidak ada di `/stations` ditambahkan dengan nama dan koordinat GTFS; koridor yang berhenti di halte menurut GTFS ditambahkan ke `lineIds`. Data dibuat ulang dari GTFS baru dengan `python3 scripts/build-tj-gtfs.py path/gtfs.zip`.
+
 Batasan data API: tidak ada jenis fasilitas ramp (status ramp selalu "data tidak tersedia" kecuali diisi tim lewat admin), `TOILET` biasa tidak dihitung sebagai toilet aksesibel, daftar fasilitas kosong berarti data belum ada, dan /hubs tidak memuat jarak jalan kaki antarstasiun.
 
 ### Data tambahan dari admin
@@ -56,7 +58,8 @@ Batasan data API: tidak ada jenis fasilitas ramp (status ramp selalu "data tidak
 Dataset tidak memuat semua informasi aksesibilitas, jadi tim melengkapinya lewat halaman admin (proyek terpisah, closed source). Jenis konten (`content_items.kind`):
 
 - `facility`: koreksi status lift, eskalator, toilet aksesibel, ramp, dll. (`available`, `absent`, `out_of_service` dengan `until`, `unknown`). Menimpa dataset untuk jenis yang sama.
-- `entrance`: pintu akses/gate stasiun (nama, lokasi, fitur seperti lift/ramp/guiding block, jam buka, jumlah dan arah eskalator, lift). Dengan `exitRef`, isian tim melengkapi pintu dataset yang sama (`/exits` Commute) dan mewarisi papan petunjuknya. `platformLinks` mencatat peron yang dicapai dari gate itu dan caranya (`langsung`, `crosswalk`, `sebidang`, `jpo`, `terowongan`).
+- `entrance`: pintu akses/gate stasiun (nama, lokasi, fitur seperti lift/ramp/guiding block, jam buka, jumlah dan arah eskalator, lift). Dengan `exitRef`, isian tim melengkapi pintu dataset yang sama (`/exits` Commute) dan mewarisi papan petunjuknya. `platformLinks` mencatat peron yang dicapai dari gate itu dan caranya (`langsung`, `crosswalk`, `sebidang`, `jpo`, `terowongan`). Gate yang tidak langsung ke peron memakai `concourseLinks`: concourse yang dicapai dan cara berpindah ke sana (`means`: `datar`, `ramp`, `lift`, `eskalator`, `tangga`, plus `lift` berisi jumlah/status dan `dedicated`). Satu gate boleh punya keduanya.
+- `concourse` (migrasi `006_concourses.sql`): area penghubung antara gate dan peron, satu entri per `code` per stasiun (`name`, `level`, `paid` untuk area setelah gerbang tiket). `platformLinks` berisi ruas concourse ke tiap peron dengan `means`, lift, eskalator, dan `dedicated` yang sama seperti ruas gate. Data pintu lama tanpa concourse tetap berlaku apa adanya.
 - `platform`: peron hasil survei (`code`, jenis `island`/`side`/`bay`, nomor jalur, lin dan arah yang dilayani, fasilitas per peron, eskalator `{count, direction: naik|turun|bergantian, connects}`, lift, dan celah peron dengan kendaraan `{level: sejajar|sedikit|tangga, steps, horizontalCm, verticalCm, boardingAid}`). Nomor peron dan arah diambil dari dataset (`/timetable/grouped`); isian tim menimpa dataset untuk nomor peron yang sama. Butuh migrasi `003_platforms.sql`.
 - `station_info`: info lain (kontak layanan, layanan pendampingan, dll.).
 - `notice`: pengumuman/notifikasi untuk stasiun, lini, hub, atau global, dengan periode aktif dan tingkat (`info`, `warning`, `critical`).
@@ -66,9 +69,9 @@ Dataset tidak memuat semua informasi aksesibilitas, jadi tim melengkapinya lewat
 
 Setiap konten punya versi **draft** dan **terbit**. Pengguna hanya melihat versi terbit. Admin bisa melihat hasil API dengan draft memakai header `X-NTD-Preview: 1` plus token admin. Publikasi menyalin draft ke terbit dan (opsional) menjalankan semua kasus uji API terlebih dahulu.
 
-Skor aksesibilitas = jumlah bobot fasilitas yang tersedia, dinormalisasi 0 sampai 100 (bawaan: lift 40, eskalator 20, toilet 25, ramp 15; ambang 70). Stasiun "memadai" bila datanya ada dan skornya mencapai ambang.
+Skor aksesibilitas = jumlah bobot fasilitas yang tersedia, dinormalisasi 0 sampai 100 (bawaan: lift 40, eskalator 20, toilet 25, ramp 15; ambang 70). Stasiun "memadai" bila datanya ada dan skornya mencapai ambang. Fasilitas tambahan (guiding block 10, petugas bantuan 10, kursi roda, gerbang lebar, area prioritas, informasi audio, informasi visual masing-masing 5) hanya dihitung bila statusnya sudah diisi tim, sehingga stasiun yang belum disurvei tidak dirugikan. Bila tim sudah mengisi jalur gate ke semua peron (`platformLinks`) dan semuanya tanpa anak tangga (langsung, crosswalk, pelintasan sebidang, atau JPO/terowongan bertanda `stepFree`), lift dan eskalator dianggap terpenuhi pada skor stasiun (`assessment.layout`). Jalur bertanda `dedicated` (khusus pengguna disabilitas) dipakai walau gate-nya tidak aksesibel untuk umum. Rincian bobot ada di `assessment.factors`. Peron dari dataset ikut diperiksa; bila ada peron yang belum dihubungkan ke gate, faktor jalur diabaikan dan skor memakai bobot fasilitas biasa. Celah peron dengan kendaraan memotong skor (bawaan: anak tangga 15, beda tinggi kecil 5; setengahnya bila ada pelat/ramp dari petugas; `assessment.penalties`): skor stasiun memakai celah terburuk, skor perjalanan hanya celah peron yang dipakai. Jalur gate → concourse → peron dinilai sama: tanpa anak tangga bila kedua ruas `datar`/`ramp` (`via: "concourse"`, `layout.concourse`); bila ada ruas yang pindah lantai, status lift dan eskalator di ruas itu (`pathLift`, `pathEscalator`, terburuk di antara ruas yang pindah lantai) menggantikan status stasiun/peron pada skor. Jalur ber-lift diutamakan atas jalur tangga saja. Pada kebutuhan pindah (`needs`), lift/eskalator ditandai `notNeeded` bila peron yang dipakai dicapai tanpa anak tangga, sehingga tidak diperingatkan; untuk jalur lewat concourse yang pindah lantai, status lift diambil dari ruas itu. Semua bobot dan potongan dapat diatur di halaman Pengaturan admin.
 
-Pada `POST /api/plan`, skor stasiun asal, tujuan, dan ujung perpindahan yang keluar stasiun disesuaikan dengan jalur gate ke peron yang dipakai (`assessment.journey`). Bila semua peron itu dapat dicapai tanpa pindah lantai (langsung, crosswalk, pelintasan sebidang), lift dan eskalator tidak ikut dihitung. Bila hanya lewat JPO/terowongan, lift dan eskalator menentukan skor, memakai fasilitas peron bila sudah diisi. Tanpa data `platformLinks`, skor stasiun dipakai apa adanya. Penyeberangan sebidang, crosswalk, dan JPO/terowongan tanpa lift diberi peringatan.
+Pada `POST /api/plan`, skor stasiun asal, tujuan, dan ujung perpindahan yang keluar stasiun disesuaikan dengan jalur gate ke peron yang dipakai (`assessment.journey`). Bila semua peron itu dapat dicapai tanpa pindah lantai (langsung, crosswalk, pelintasan sebidang), lift dan eskalator tidak dibutuhkan dan dianggap terpenuhi. Bila hanya lewat JPO/terowongan, lift dan eskalator menentukan skor, memakai fasilitas peron bila sudah diisi. Tanpa data `platformLinks`, skor stasiun dipakai apa adanya. Penyeberangan sebidang, crosswalk, dan JPO/terowongan tanpa lift diberi peringatan.
 
 ## API
 
@@ -114,6 +117,17 @@ Hanya origin di `ADMIN_ORIGINS` yang boleh memanggil lewat browser. Peran `admin
 | GET, POST | `/tests` · PUT, DELETE `/tests/:id` | Kasus uji API |
 | POST | `/tests/run`, `/tests/:id/run`, `/tests/adhoc` · GET `/tests/runs` | Jalankan uji pada data `published` atau `preview` |
 | GET | `/system` · POST `/cache/purge` · GET `/audit` | Status layanan, kosongkan cache, log aktivitas |
+| POST | `/stations/:id/floor-plan` | `{images: [{data, name?}]}` (1–4 gambar base64, maks. 5 MB/gambar) → usulan fasilitas, peron, gate, dan info dari AI. Tidak menyimpan apa pun; dibatasi 20 kali per 10 menit |
+| GET, PUT | `/ai/vision` | Penyedia AI pembaca denah (provider, model, endpoint, batas waktu, kunci API). Kunci tidak pernah dikembalikan; PUT hanya admin |
+
+#### Isi fasilitas dari gambar denah
+
+Halaman stasiun di admin punya "Isi otomatis dari gambar denah": foto papan denah per lantai (dengan legenda), peta lokalitas, dan angkutan lanjutan dikirim ke backend, diteruskan ke penyedia AI, lalu jawabannya dipetakan ke skema konten NTD (`facility`, `platform`, `entrance`, `station_info`) dan divalidasi. Admin memeriksa, menyunting, dan memilih usulan; yang dipilih disimpan sebagai draft lewat `/content` dan baru terlihat pengguna setelah publikasi.
+
+- Penyedia bawaan Claude (`claude-sonnet-5-5`, structured output JSON, cadangan sisi server bila model menolak). Alternatif: `openai` = endpoint apa pun yang kompatibel dengan OpenAI Chat Completions.
+- Konfigurasi dari `AI_VISION_*` (lihat `.env.example`), dapat ditimpa admin di Pengaturan → AI pembaca denah. Disimpan di tabel `server_config` (migrasi 005), di luar alur draft/publikasi.
+- Kunci API hanya dipakai untuk penyedia dan endpoint tempat kunci itu diisi; mengganti penyedia/endpoint tidak mengirim kunci lama ke tujuan baru.
+- Body besar (hingga 24 MB) hanya diurai untuk token admin yang valid; endpoint lain tetap 100 kB.
 
 ## Deployment
 

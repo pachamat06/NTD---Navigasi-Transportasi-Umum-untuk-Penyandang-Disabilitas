@@ -23,6 +23,17 @@ export interface Config {
     model?: string;
     timeoutMs: number;
   };
+  /**
+   * AI pembaca denah stasiun (admin: isi fasilitas dari gambar). Nilai di sini adalah bawaan dari environment;
+   * admin dapat menimpanya lewat Pengaturan (disimpan di server, kunci tidak pernah dikirim ke browser).
+   */
+  vision: {
+    provider: VisionProvider;
+    apiKey?: string;
+    model?: string;
+    baseUrl?: string;
+    timeoutMs: number;
+  };
   admin: {
     enabled: boolean;
     tokenSecret?: string;
@@ -33,6 +44,9 @@ export interface Config {
   rateLimit: { windowMs: number; max: number };
 }
 
+export const VISION_PROVIDERS = ["claude", "openai", "none"] as const;
+export type VisionProvider = (typeof VISION_PROVIDERS)[number];
+
 const list = (v: string | undefined, fallback: string[]) =>
   v ? v.split(",").map((s) => s.trim()).filter(Boolean) : fallback;
 
@@ -41,6 +55,15 @@ export function loadConfig(env: NodeJS.ProcessEnv = process.env): Config {
   if (!["none", "claude", "gpt"].includes(provider)) throw new Error(`LLM_PROVIDER tidak dikenal: ${provider}`);
   const source = (env.COMMUTE_SOURCE ?? "fixture") as Config["commute"]["source"];
   if (!["http", "fixture"].includes(source)) throw new Error(`COMMUTE_SOURCE tidak dikenal: ${source}`);
+
+  const visionProvider = (env.AI_VISION_PROVIDER || "claude") as VisionProvider;
+  if (!VISION_PROVIDERS.includes(visionProvider)) throw new Error(`AI_VISION_PROVIDER tidak dikenal: ${visionProvider}`);
+  // Tanpa kunci khusus, penyedia Claude memakai kunci LLM notifikasi bila penyedianya juga Claude.
+  const visionKey =
+    env.AI_VISION_API_KEY ||
+    (visionProvider === "claude" && provider === "claude" ? env.LLM_API_KEY : undefined) ||
+    (visionProvider === "claude" ? env.ANTHROPIC_API_KEY : undefined) ||
+    undefined;
 
   const tokenSecret = env.ADMIN_TOKEN_SECRET;
   const adminEnabled = env.ADMIN_ENABLED !== "false";
@@ -67,6 +90,13 @@ export function loadConfig(env: NodeJS.ProcessEnv = process.env): Config {
       apiKey: env.LLM_API_KEY || undefined,
       model: env.LLM_MODEL || undefined,
       timeoutMs: Number(env.LLM_TIMEOUT_MS) || 15000,
+    },
+    vision: {
+      provider: visionProvider,
+      apiKey: visionKey,
+      model: env.AI_VISION_MODEL || undefined,
+      baseUrl: env.AI_VISION_BASE_URL || undefined,
+      timeoutMs: Number(env.AI_VISION_TIMEOUT_MS) || 120_000,
     },
     admin: {
       enabled: adminEnabled,

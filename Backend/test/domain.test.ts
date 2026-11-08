@@ -115,7 +115,11 @@ describe("FacilityAnalysisService", () => {
     ];
     const bni = await facilities.assess("bni-city", newContext(), snap(items));
     expect(bni.facilities.amenities.lift).toBe("absent");
-    expect(bni.assessment.score).toBe(60);
+    // Inti: eskalator 20 + toilet 25 + ramp 15 dari 100; guiding block (10) sudah diisi tim, jadi ikut dihitung: 70/110.
+    expect(bni.assessment.score).toBe(64);
+    expect(bni.assessment.factors?.find((f) => f.type === "guiding_block")).toEqual({ type: "guiding_block", weight: 10, result: "met" });
+    // Fasilitas tambahan yang belum diisi tidak dihitung.
+    expect(bni.assessment.factors?.find((f) => f.type === "petugas_bantuan")?.result).toBe("skipped");
     expect(bni.assessment.notes?.[0]).toMatch(/Lift sedang tidak berfungsi/);
     expect(bni.facilities.amenityDetails.find((d) => d.type === "guiding_block")).toMatchObject({ source: "ntd", status: "available" });
     expect((await facilities.assess("manggarai", newContext(), snap(items))).facilities.amenities.lift).toBe("available");
@@ -135,6 +139,56 @@ describe("FacilityAnalysisService", () => {
     const settings = item({ id: "settings", kind: "settings", published: { ...DEFAULT_SETTINGS, scoring: { weights: { lift: 1, eskalator: 1, toilet: 0, ramp: 0 }, threshold: 50 } } });
     const a = await facilities.assess("sudirman", newContext(), snap([settings]));
     expect(a.assessment).toMatchObject({ score: 50, adequate: true });
+  });
+
+  it("skor stasiun: lift dan eskalator tidak dihitung bila semua peron dicapai tanpa anak tangga", async () => {
+    const { facilities } = setup();
+    const gate = (name: string, accessible: boolean, platformLinks: unknown[]) =>
+      item({ kind: "entrance", stationId: "sudirman", published: { name, accessible, features: [], platformLinks } });
+    const before = (await facilities.assess("sudirman", newContext(), snap())).assessment;
+    expect(before.layout).toBeUndefined();
+
+    // Gate utama lewat JPO bertangga, tetapi ada pelintasan sebidang khusus disabilitas ke kedua peron.
+    const items = [
+      gate("Gate utama", true, [{ platform: "1", via: "jpo" }, { platform: "2", via: "jpo" }]),
+      gate("Gate selatan", false, [{ platform: "1", via: "sebidang", dedicated: true }, { platform: "2", via: "sebidang", dedicated: true }]),
+    ];
+    const a = (await facilities.assess("sudirman", newContext(), snap(items))).assessment;
+    expect(a.layout).toMatchObject({ level: true, via: "sebidang", dedicated: true, gate: "Gate selatan" });
+    expect(a.factors?.filter((f) => f.result === "not_needed").map((f) => f.type)).toEqual(["lift", "eskalator"]);
+    expect(a.score).toBeGreaterThan(before.score);
+    expect(a.notes?.some((n) => n.includes("khusus pengguna disabilitas"))).toBe(true);
+
+    // JPO beramp juga tanpa anak tangga; JPO bertangga untuk salah satu peron membuat lift dihitung lagi.
+    const ramp = [gate("Gate utama", true, [{ platform: "1", via: "jpo", stepFree: true }, { platform: "2", via: "langsung" }])];
+    const r = (await facilities.assess("sudirman", newContext(), snap(ramp))).assessment;
+    expect(r.layout).toMatchObject({ level: true, stepFree: true });
+    expect(r.notes).toContain("Jalur gate ke peron: semua peron dicapai lewat JPO beramp tanpa anak tangga dari gate Gate utama, jadi lift dan eskalator tidak dibutuhkan.");
+    // Peron 2 (dari dataset) belum dihubungkan ke gate mana pun: faktor jalur diabaikan, skor kembali ke bobot fasilitas biasa.
+    const partial = (await facilities.assess("sudirman", newContext(), snap([gate("Gate utama", true, [{ platform: "1", via: "langsung" }])]))).assessment;
+    expect(partial.layout).toBeUndefined();
+    expect(partial.score).toBe(before.score);
+    const mixed = [gate("Gate utama", true, [{ platform: "1", via: "langsung" }, { platform: "2", via: "terowongan" }])];
+    const m = (await facilities.assess("sudirman", newContext(), snap(mixed))).assessment;
+    expect(m.layout).toMatchObject({ level: false, via: "terowongan" });
+    expect(m.score).toBe(before.score);
+  });
+
+  it("skor stasiun memotong celah peron terburuk (kasus Universitas Indonesia)", async () => {
+    const { facilities } = setup();
+    // Gate di peron 1 dan pelintasan sebidang ke peron 2: lift/eskalator tidak dibutuhkan, toilet dan ramp ada.
+    const items = [
+      item({ stationId: "sudirman", published: { type: "toilet", status: "available" } }),
+      item({ stationId: "sudirman", published: { type: "ramp", status: "available" } }),
+      item({ kind: "entrance", stationId: "sudirman", published: { name: "Gate utama", accessible: true, features: [], platformLinks: [{ platform: "1", via: "langsung" }, { platform: "2", via: "sebidang" }] } }),
+      item({ kind: "platform", stationId: "sudirman", published: { code: "1", amenities: {}, gap: { level: "sedikit" } } }),
+      item({ kind: "platform", stationId: "sudirman", published: { code: "2", amenities: {}, gap: { level: "tangga", steps: 2 } } }),
+    ];
+    const a = (await facilities.assess("sudirman", newContext(), snap(items))).assessment;
+    expect(a.layout?.level).toBe(true);
+    // 100 dari bobot fasilitas, dipotong 15 karena peron 2 harus naik 2 anak tangga ke kendaraan.
+    expect(a).toMatchObject({ score: 85, adequate: true, penalties: [{ points: 15, reason: "Celah peron 2: 2 anak tangga antara peron dan kendaraan" }] });
+    expect(a.notes).toContain("Celah peron 2: 2 anak tangga antara peron dan kendaraan (skor −15).");
   });
 });
 

@@ -20,7 +20,7 @@ export interface CacheRepository {
  * hanya terlihat di mode pratinjau admin) dan "published" (terlihat oleh pengguna). Publikasi menyalin
  * draft ke published, sehingga perubahan dapat diuji coba lebih dulu sebelum sampai ke pengguna.
  */
-export type ContentKind = "facility" | "entrance" | "notice" | "station_info" | "settings" | "map_stop" | "map_track" | "platform";
+export type ContentKind = "facility" | "entrance" | "notice" | "station_info" | "settings" | "map_stop" | "map_track" | "platform" | "route_pattern" | "concourse";
 
 export interface ContentItem<T = unknown> {
   id: string;
@@ -116,6 +116,22 @@ export interface AuditRepository {
   list(limit: number): Promise<AuditEntry[]>;
 }
 
+/**
+ * Konfigurasi server yang tidak boleh ikut alur draft/publikasi dan tidak pernah dikirim utuh ke browser,
+ * mis. pengaturan penyedia AI beserta kunci API-nya. Hanya dibaca dan ditulis oleh backend.
+ */
+export interface ServerConfigEntry<T = unknown> {
+  value: T;
+  updatedAt: Date;
+  updatedBy: string | null;
+}
+
+export interface ServerConfigRepository {
+  get<T>(key: string): Promise<ServerConfigEntry<T> | null>;
+  put<T>(key: string, value: T, by: string): Promise<void>;
+  delete(key: string): Promise<boolean>;
+}
+
 export interface Store {
   readonly kind: "postgres" | "memory";
   cache: CacheRepository;
@@ -123,6 +139,7 @@ export interface Store {
   admins: AdminRepository;
   tests: TestRepository;
   audit: AuditRepository;
+  serverConfig: ServerConfigRepository;
   ping(): Promise<boolean>;
   close(): Promise<void>;
 }

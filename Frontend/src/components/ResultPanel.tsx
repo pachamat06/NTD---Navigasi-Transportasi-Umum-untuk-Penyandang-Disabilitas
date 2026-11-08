@@ -3,7 +3,7 @@
 import { AMENITY_LABEL, useNetwork } from "@/lib/network";
 import type { Alternative, AmenityType, ExitRef, Frequency, JourneyPlan, Notice, RouteLeg } from "@/lib/types";
 import { AccessBadge } from "./AccessBadge";
-import { PlatformDetails, VIA_TEXT } from "./PlatformInfo";
+import { accessText, PlatformDetails } from "./PlatformInfo";
 
 const km = (m: number) => `${(m / 1000).toLocaleString("id-ID", { maximumFractionDigits: 1 })} km`;
 const rupiah = (n: number) => `Rp ${n.toLocaleString("id-ID")}`;
@@ -40,12 +40,13 @@ export function ResultPanel({
           Ringkasan
         </h3>
         <dl className="grid grid-cols-2 gap-3">
-          <Stat icon="⏱" label="Waktu tempuh" value={route.totalMinutes === null ? "Tidak tersedia" : `${route.totalMinutes} mnt${route.timeComplete ? "" : "*"}`} />
+          <Stat icon="⏱" label="Waktu tempuh" value={route.totalMinutes === null ? "Tidak tersedia" : `${route.timeEstimated ? "± " : ""}${route.totalMinutes} mnt${route.timeComplete ? "" : "*"}`} />
           <Stat icon="📏" label="Jarak" value={km(route.totalDistanceM)} />
           <Stat icon="💳" label="Tarif" value={rupiah(route.totalFare)} />
           <Stat icon="⇄" label="Transfer" value={`${route.transfers}×`} />
         </dl>
         {!route.timeComplete && <p className="mt-2 text-sm text-[var(--muted)]">* Total belum lengkap karena ada ruas tanpa data waktu tempuh.</p>}
+        {route.timeEstimated && <p className="mt-2 text-sm text-[var(--muted)]">± Waktu TransJakarta adalah perkiraan dari jadwal GTFS Transjakarta, belum termasuk waktu tunggu dan kemacetan.</p>}
       </section>
 
       <section aria-labelledby="notifikasi" className="card border-l-4 border-l-[var(--accent)]">
@@ -106,7 +107,7 @@ export function ResultPanel({
                       </p>
                       {leg.headsign && <p className="text-sm">Arah {leg.headsign}</p>}
                       <p className="text-sm text-[var(--muted)]">
-                        {leg.stops.length - 1} pemberhentian · {km(leg.distanceM)} · {leg.minutes === null ? "waktu tidak tersedia" : `${leg.minutes} mnt`} · {rupiah(leg.fare)}
+                        {leg.stops.length - 1} pemberhentian · {km(leg.distanceM)} · {leg.minutes === null ? "waktu tidak tersedia" : leg.minutesEstimated ? `± ${leg.minutes} mnt (perkiraan jadwal)` : `${leg.minutes} mnt`} · {rupiah(leg.fare)}
                       </p>
                       {(leg.boardAt || leg.platform) && (
                         <div className="mt-1 text-sm">
@@ -132,7 +133,11 @@ export function ResultPanel({
                     </>
                   ) : (
                     <p className="text-sm">
-                      {leg.stops[0] === leg.stops[1] ? (
+                      {leg.turnaround ? (
+                        <>
+                          ↩ Berbalik arah di <b>{name(leg.stops[0])}</b>: pindah ke bus arah sebaliknya
+                        </>
+                      ) : leg.stops[0] === leg.stops[1] ? (
                         <>⇄ Pindah lini di dalam stasiun · waktu tidak tersedia</>
                       ) : (
                         <>
@@ -207,6 +212,13 @@ function RideChoices({ leg }: { leg: RouteLeg }) {
 
 const exitText = (e: ExitRef) => `${e.name ?? e.ref}${e.signs?.length ? ` (ikuti tanda ${e.signs.join(", ")})` : ""}`;
 const ACCESS_TEXT = { available: "tersedia", absent: "tidak tercatat", unknown: "belum ada data", out_of_service: "tidak berfungsi" } as const;
+/** Lift pada ruas yang pindah lantai di jalur lewat concourse. */
+const PATH_LIFT_TEXT = {
+  available: "ada lift di jalur ini",
+  absent: "tidak ada lift di jalur ini",
+  unknown: "data lift di jalur ini belum ada",
+  out_of_service: "lift di jalur ini sedang tidak berfungsi",
+} as const;
 
 /** Petunjuk jalan kaki dan status fasilitas yang dibutuhkan pengguna di titik pindah. */
 function TransferHints({ leg, name }: { leg: RouteLeg; name: (id: string) => string }) {
@@ -226,9 +238,12 @@ function TransferHints({ leg, name }: { leg: RouteLeg; name: (id: string) => str
       {leg.access && leg.access.length > 0 && (
         <ul className="mt-1" aria-label="Fasilitas untuk pindah">
           {leg.access.map((a) => (
-            <li key={`${a.stationId}-${a.need}-${a.platform ?? ""}`} className={a.status === "available" ? "" : "text-[var(--warn)]"}>
-              <span aria-hidden>{a.status === "available" ? "✔" : "⚠"}</span> {AMENITY_LABEL[a.need]} di {name(a.stationId)}
-              {a.platform ? ` (peron ${a.platform})` : ""}: {ACCESS_TEXT[a.status]}
+            <li key={`${a.stationId}-${a.need}-${a.platform ?? ""}`} className={a.status === "available" || a.notNeeded ? "" : "text-[var(--warn)]"}>
+              <span aria-hidden>{a.status === "available" || a.notNeeded ? "✔" : "⚠"}</span> {AMENITY_LABEL[a.need]} di {name(a.stationId)}
+              {a.platform ? ` (peron ${a.platform})` : ""}:{" "}
+              {a.notNeeded
+                ? `tidak dibutuhkan, peron dicapai ${accessText(a.notNeeded)}`
+                : ACCESS_TEXT[a.status]}
             </li>
           ))}
         </ul>
@@ -262,10 +277,10 @@ function StopRow({ id, name, label, a, onShowDetail }: { id: string; name?: stri
       {label && <span className="text-xs uppercase tracking-wide text-[var(--muted)]">{label}</span>}
       <AccessBadge a={a} />
       {j && (
-        <p className={`w-full text-sm ${j.level ? "text-[var(--muted)]" : "text-[var(--warn)]"}`}>
-          <span aria-hidden>{j.level ? "↔" : "↕"}</span> Peron {j.platforms.join(", ")} {VIA_TEXT[j.via]}
+        <p className={`w-full text-sm ${j.level || j.pathLift === "available" ? "text-[var(--muted)]" : "text-[var(--warn)]"}`}>
+          <span aria-hidden>{j.level ? "↔" : "↕"}</span> Peron {j.platforms.join(", ")} {accessText(j)}
           {j.gate ? ` (${j.gate})` : ""}
-          {j.level ? ", lift dan eskalator tidak dibutuhkan" : ", lift dan eskalator dibutuhkan"} · skor stasiun {j.stationScore}
+          {j.level ? ", lift dan eskalator tidak dibutuhkan" : j.pathLift ? `, ${PATH_LIFT_TEXT[j.pathLift]}` : ", lift dan eskalator dibutuhkan"} · skor stasiun {j.stationScore}
         </p>
       )}
       {notes.map((n) => (

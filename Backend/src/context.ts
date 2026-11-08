@@ -12,6 +12,12 @@ export interface RequestContext {
   cacheTtlSeconds?: number;
   /** Lewati LLM dan pakai template (uji coba otomatis). */
   skipLlm?: boolean;
+  /**
+   * Hasil baca cache Commute per kunci selama satu permintaan. Satu permintaan (mis. /api/network) membaca
+   * daftar stasiun ratusan kali; tanpa ini setiap baca menyalin/mengurai seluruh daftar dari store dan
+   * indeks stasiun dibangun ulang.
+   */
+  memo?: Map<string, Promise<unknown>>;
 }
 
 export function newContext(opts: { preview?: boolean; now?: Date } = {}): RequestContext {

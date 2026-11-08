@@ -139,6 +139,66 @@ export interface TransferAccess {
   status: AmenityDetailStatus;
   /** Status diambil dari peron ini (bukan stasiun keseluruhan). */
   platform?: string;
+  /**
+   * Lift/eskalator tidak dibutuhkan karena peron ini dicapai dari gate tanpa anak tangga (jalur yang dipakai di sini).
+   * `status` tetap diisi apa adanya.
+   */
+  notNeeded?: Pick<LayoutAccess, "via" | "gate" | "dedicated" | "stepFree" | "concourse">;
+}
+
+/**
+ * Rincian satu faktor skor. `met` = terpenuhi, `missing` = tidak ada/tidak tercatat, `not_needed` = tidak dibutuhkan
+ * pada jalur ini (dihitung terpenuhi), `skipped` = fasilitas tambahan yang belum diisi tim (tidak ikut dihitung).
+ */
+export interface ScoreFactor {
+  type: AnyAmenityType;
+  weight: number;
+  result: "met" | "missing" | "not_needed" | "skipped";
+}
+
+/** Potongan skor di luar bobot fasilitas, mis. celah peron yang harus melewati anak tangga. */
+export interface ScorePenalty {
+  reason: string;
+  points: number;
+}
+
+/** Jalur gate → concourse → peron yang dipakai, dengan cara berpindah tiap ruas. */
+export interface ConcourseRoute {
+  /** Kode/nama concourse seperti diisi tim, mis. "Utara" atau "B1". */
+  code: string;
+  name?: string;
+  /** Cara dari gate ke concourse. */
+  toConcourse: SegmentMeans[];
+  /** Cara dari concourse ke peron. */
+  toPlatform: SegmentMeans[];
+}
+
+/** Rincian jalur akses yang sama untuk skor stasiun dan skor perjalanan. */
+interface AccessPath {
+  /** true bila semua peron itu dapat dicapai tanpa anak tangga, sehingga lift dan eskalator tidak dibutuhkan. */
+  level: boolean;
+  /** Jalur terburuk di antara jalur terbaik tiap peron. "concourse" = gate ke concourse dulu, lalu ke peron. */
+  via: AccessVia;
+  gate?: string;
+  /** Jalur itu adalah jalur/penyeberangan khusus pengguna disabilitas. */
+  dedicated?: boolean;
+  /** JPO/terowongan yang tanpa anak tangga (ramp landai). */
+  stepFree?: boolean;
+  /** Jalur lewat concourse: concourse dan cara berpindah tiap ruasnya. */
+  concourse?: ConcourseRoute;
+  /**
+   * Jalur lewat concourse yang pindah lantai: status lift pada ruas yang pindah lantai (terburuk di antara ruas itu).
+   * Menggantikan status lift stasiun/peron pada skor karena lebih spesifik.
+   */
+  pathLift?: AmenityDetailStatus;
+  /** Sama dengan `pathLift` untuk eskalator. */
+  pathEscalator?: AmenityStatus;
+}
+
+/** Jalur dari gate ke peron yang menentukan perlu tidaknya lift dan eskalator. */
+export interface LayoutAccess extends AccessPath {
+  /** Peron yang dinilai (semua peron yang dikenal untuk skor stasiun, atau peron yang dipakai untuk skor perjalanan). */
+  platforms: string[];
 }
 
 export interface StationAssessment {
@@ -147,18 +207,19 @@ export interface StationAssessment {
   adequate: boolean;
   dataAvailable: boolean;
   notes?: string[];
+  /** Rincian bobot yang membentuk skor. */
+  factors?: ScoreFactor[];
+  penalties?: ScorePenalty[];
+  /** Jalur gate ke peron untuk skor stasiun (dari isian tim), bila diketahui untuk semua peron. */
+  layout?: LayoutAccess;
   /** Skor dihitung untuk perjalanan ini: jalur gate ke peron yang dipakai menentukan perlu tidaknya lift/eskalator. */
   journey?: JourneyAccess;
 }
 
-export interface JourneyAccess {
+export interface JourneyAccess extends AccessPath {
   /** Peron yang dipakai di stasiun ini pada perjalanan. */
   platforms: string[];
-  /** Jalur terbaik dari gate ke peron: tanpa pindah lantai bila `level`. */
-  level: boolean;
-  via: PlatformConnection;
-  gate?: string;
-  /** Jenis fasilitas yang tidak ikut dihitung karena tidak dibutuhkan pada jalur ini. */
+  /** Jenis fasilitas yang tidak dibutuhkan pada jalur ini, sehingga dianggap terpenuhi pada skor. */
   excluded: AmenityType[];
   /** Status lift untuk jalur ini bila harus pindah lantai (dari peron bila diisi tim). */
   lift?: AmenityStatus;
@@ -174,8 +235,13 @@ export interface RouteLeg {
   operator?: string;
   stops: string[];
   distanceM: number;
-  /** null bila dataset tidak memiliki jadwal untuk ruas ini (tidak diperkirakan dari jarak). */
+  /**
+   * null bila tidak ada jadwal untuk ruas ini (tidak diperkirakan dari jarak). Ruas TransJakarta koridor BRT
+   * yang tidak punya jadwal di dataset diisi waktu jadwal GTFS Transjakarta dan ditandai `minutesEstimated`.
+   */
   minutes: number | null;
+  /** true = `minutes` adalah perkiraan dari jadwal GTFS Transjakarta, bukan waktu dari dataset rute. */
+  minutesEstimated?: boolean;
   fare: number;
   departureAt?: string;
   arrivalAt?: string;
@@ -192,6 +258,11 @@ export interface RouteLeg {
    * naik yang mana pun sampai. Lin utama paling depan. `frequency` ruas = frekuensi gabungan.
    */
   options?: RideOption[];
+  /**
+   * Ruas pindah: berbalik arah di halte TransJakarta karena bus arah semula tidak berhenti di halte tujuan atau
+   * halte arah itu tidak punya fasilitas yang dibutuhkan. Petunjuknya di `notes`.
+   */
+  turnaround?: boolean;
   /** Ruas pindah: petunjuk jalan dan pintu keluar dari dataset. */
   notes?: string;
   fromExit?: ExitRef;
@@ -205,6 +276,8 @@ export interface Route {
   totalDistanceM: number;
   totalMinutes: number | null;
   timeComplete: boolean;
+  /** true = sebagian waktu tempuh adalah perkiraan dari jadwal GTFS Transjakarta (lihat RouteLeg.minutesEstimated). */
+  timeEstimated?: boolean;
   totalFare: number;
   transfers: number;
   /** Nama pemberhentian dari sumber data (dipakai untuk halte/stasiun yang tidak ada di daftar stasiun). */
@@ -323,8 +396,58 @@ export interface Entrance {
   source?: DataSource;
   /** Pintu dataset (nama di papan) yang dilengkapi entri tim ini. */
   exitRef?: string;
-  /** Peron yang dicapai dari pintu/gate ini dan cara mencapainya. */
+  /** Peron yang dicapai langsung dari pintu/gate ini dan cara mencapainya. */
   platformLinks?: GatePlatformLink[];
+  /**
+   * Concourse (area penghubung) yang dicapai dari gate ini. Dipakai untuk stasiun yang gate-nya tidak langsung ke
+   * peron: gate → concourse → peron. Gate boleh punya keduanya (sebagian peron langsung, sebagian lewat concourse).
+   */
+  concourseLinks?: GateConcourseLink[];
+}
+
+/** Cara berpindah pada satu ruas di dalam stasiun. "datar" dan "ramp" tanpa anak tangga; selainnya pindah lantai. */
+export const SEGMENT_MEANS = ["datar", "ramp", "lift", "eskalator", "tangga"] as const;
+export type SegmentMeans = (typeof SEGMENT_MEANS)[number];
+
+/** Satu ruas jalur di dalam stasiun (gate → concourse, atau concourse → peron) beserta fasilitas aksesibilitasnya. */
+export interface AccessSegment {
+  /** Cara yang tersedia pada ruas ini (boleh lebih dari satu, mis. tangga + eskalator + lift). */
+  means: SegmentMeans[];
+  /** Lift pada ruas ini (jumlah dan status); tanpa isian, lift dianggap berfungsi bila "lift" ada di `means`. */
+  lift?: LiftInfo;
+  escalators?: EscalatorGroup[];
+  /** Ruas ini adalah jalur khusus pengguna disabilitas. */
+  dedicated?: boolean;
+  note?: string;
+}
+
+export interface GateConcourseLink extends AccessSegment {
+  /** Kode concourse yang dicapai. */
+  concourse: string;
+}
+
+export interface ConcoursePlatformLink extends AccessSegment {
+  platform: string;
+}
+
+/**
+ * Concourse: area penghubung antara gate dan peron (umumnya lantai atas/bawah tempat gerbang tiket), diisi tim NTD.
+ * Ruas concourse ke peron beserta lift/eskalator/tangga/ramp-nya menentukan perlu tidaknya lift pada skor.
+ */
+export interface Concourse {
+  id: string;
+  stationId: string;
+  /** Kode/nama singkat concourse, dirujuk oleh gate, mis. "Utara", "B1", "Concourse 2". */
+  code: string;
+  name?: string;
+  /** Lantai concourse, mis. "Lantai 2" atau "B1". */
+  level?: string;
+  /** Area berbayar (setelah gerbang tiket). */
+  paid?: boolean;
+  /** Peron yang dicapai dari concourse ini dan caranya. */
+  platformLinks: ConcoursePlatformLink[];
+  note?: string;
+  source: DataSource;
 }
 
 /**
@@ -333,14 +456,29 @@ export interface Entrance {
  */
 export type PlatformConnection = "langsung" | "crosswalk" | "sebidang" | "jpo" | "terowongan";
 
+/** Jalur akses yang dinilai: penyeberangan langsung dari gate, atau lewat concourse. */
+export type AccessVia = PlatformConnection | "concourse";
+
 export interface GatePlatformLink {
   platform: string;
   via: PlatformConnection;
+  /**
+   * Jalur atau penyeberangan khusus pengguna disabilitas (mis. pelintasan sebidang khusus di stasiun yang umumnya
+   * memakai JPO). Dipakai walau gate-nya tidak ditandai aksesibel, karena jalur itu memang disediakan untuk mereka.
+   */
+  dedicated?: boolean;
+  /** JPO/terowongan yang dapat dilalui tanpa anak tangga (ramp landai), sehingga lift tidak dibutuhkan. */
+  stepFree?: boolean;
   note?: string;
 }
 
 /** Penyeberangan yang tidak berpindah lantai, sehingga lift dan eskalator tidak dibutuhkan. */
 export const LEVEL_CONNECTIONS: readonly PlatformConnection[] = ["langsung", "crosswalk", "sebidang"];
+
+/** Jalur gate ke peron yang dapat dilalui tanpa anak tangga, sehingga lift dan eskalator tidak dibutuhkan. */
+export function isStepFree(link: Pick<GatePlatformLink, "via" | "stepFree">): boolean {
+  return LEVEL_CONNECTIONS.includes(link.via) || !!link.stepFree;
+}
 
 export interface StationInfo {
   id: string;
@@ -355,6 +493,8 @@ export interface StationDetail extends StationWithAmenities {
   /** Peron: dataset digabung dengan isian tim (nomor peron yang sama digabung, isian tim menang). */
   platforms: Platform[];
   entrances: Entrance[];
+  /** Concourse isian tim (kosong/tidak ada untuk stasiun yang gate-nya langsung ke peron). */
+  concourses?: Concourse[];
   info: StationInfo[];
   notices: Notice[];
 }

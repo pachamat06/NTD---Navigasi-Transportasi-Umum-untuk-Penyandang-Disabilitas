@@ -28,6 +28,14 @@ export function createApp(s: Services): express.Express {
 
   app.use(requestLogger(log));
   app.use(securityHeaders());
+  // Unggahan denah stasiun (gambar base64) untuk dibaca AI: batas besar hanya untuk token admin yang valid,
+  // agar permintaan tanpa sesi tidak bisa memaksa server mengurai body besar. Endpoint lain tetap 100 kB.
+  const floorPlanJson = express.json({ limit: "24mb" });
+  app.use(/^\/api\/admin\/stations\/[^/]+\/floor-plan$/, async (req, res, next) => {
+    const token = req.headers.authorization?.match(/^Bearer\s+(.+)$/i)?.[1];
+    if (!config.admin.enabled || req.method !== "POST" || !token || !(await s.auth.verify(token))) return next();
+    floorPlanJson(req, res, next);
+  });
   app.use(express.json({ limit: "100kb" }));
 
   app.get("/health", (_req, res) => {

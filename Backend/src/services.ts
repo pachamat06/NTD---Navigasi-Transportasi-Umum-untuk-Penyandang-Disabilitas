@@ -7,11 +7,14 @@ import { ClaudeClient } from "./ai/llm/ClaudeClient";
 import { GptClient } from "./ai/llm/GptClient";
 import type { LlmClient } from "./ai/llm/LlmClient";
 import { NavigationAgent } from "./ai/NavigationAgent";
+import { VisionService, type VisionClientFactory } from "./ai/vision/VisionService";
 import { ToolRegistry } from "./ai/ToolRegistry";
 import type { Config } from "./config";
+import type { RequestContext } from "./context";
 import { CommuteApiClient } from "./data/commute/CommuteApiClient";
 import { FixtureCommuteSource } from "./data/commute/FixtureCommuteSource";
 import { HttpCommuteSource } from "./data/commute/HttpCommuteSource";
+import { TjGtfs } from "./data/gtfs/TjGtfs";
 import type { CommuteSource } from "./data/commute/types";
 import { AlternativeService } from "./domain/AlternativeService";
 import { ContentService } from "./domain/content";
@@ -27,6 +30,7 @@ export interface Services {
   log: Logger;
   source: CommuteSource;
   commute: CommuteApiClient;
+  gtfs: TjGtfs;
   content: ContentService;
   stations: StationService;
   planner: RoutePlannerService;
@@ -36,6 +40,8 @@ export interface Services {
   guard: GroundingGuard;
   llm: LlmClient | null;
   agent: NavigationAgent;
+  /** AI pembaca denah stasiun untuk halaman admin. */
+  vision: VisionService;
   auth: AuthService;
   tests: TestRunner;
   startedAt: Date;
@@ -55,20 +61,25 @@ export function createSource(config: Config): CommuteSource {
     : new FixtureCommuteSource();
 }
 
-export function createServices(opts: { config: Config; store: Store; log: Logger; source?: CommuteSource; llm?: LlmClient | null }): Services {
+export function createServices(opts: { config: Config; store: Store; log: Logger; source?: CommuteSource; llm?: LlmClient | null; visionFactory?: VisionClientFactory }): Services {
   const { config, store, log } = opts;
   const source = opts.source ?? createSource(config);
-  const commute = new CommuteApiClient(source, store.cache);
+  // GTFS Transjakarta (koridor BRT 1–14 dan lin BRT turunannya) melengkapi data TransJakarta yang tidak ada di Commute.
+  const gtfs = new TjGtfs();
+  const commute = new CommuteApiClient(source, store.cache, gtfs);
   const content = new ContentService(store.content);
+  // Pengaturan rute per lini dan arah dari admin (draft hanya untuk pratinjau admin).
+  const patterns = async (ctx: RequestContext) => (await content.snapshot(ctx)).routePatterns();
   const facilities = new FacilityAnalysisService(commute);
-  const stations = new StationService(commute, facilities);
-  const planner = new RoutePlannerService(commute);
+  const stations = new StationService(commute, facilities, patterns);
+  const planner = new RoutePlannerService(commute, gtfs, patterns);
   const alternatives = new AlternativeService(planner, facilities);
   const tools = new ToolRegistry({ stations, planner, facilities, alternatives });
   const guard = new GroundingGuard();
   const llm = opts.llm === undefined ? createLlm(config) : opts.llm;
   const agent = new NavigationAgent(tools, stations, content, guard, llm, log);
+  const vision = new VisionService(config.vision, store.serverConfig, opts.visionFactory);
   const auth = new AuthService(store.admins, config.admin.tokenSecret, config.admin.tokenTtlMinutes);
   const tests = new TestRunner(agent, store.tests);
-  return { config, store, log, source, commute, content, stations, planner, facilities, alternatives, tools, guard, llm, agent, auth, tests, startedAt: new Date() };
+  return { config, store, log, source, commute, gtfs, content, stations, planner, facilities, alternatives, tools, guard, llm, agent, vision, auth, tests, startedAt: new Date() };
 }

@@ -112,7 +112,8 @@ const norm = (s: string) =>
  */
 export function buildPositions(stations: PositionedStation[], overrides: MapStop[] = []): Map<string, { x: number; y: number }> {
   const out = new Map<string, { x: number; y: number }>();
-  const manual = new Map(overrides.map((o) => [o.stationId, { x: o.x, y: o.y }]));
+  // Titik anak (posisi per lini) tidak menggeser posisi utama stasiun; lihat childPositions.
+  const manual = new Map(overrides.filter((o) => !o.lineId).map((o) => [o.stationId, { x: o.x, y: o.y }]));
   const busByCode = new Map<string, BusStopLabel>();
   for (const b of BUS_STOPS) for (const c of b.codes) busByCode.set(c, b);
   const busNames = BUS_STOPS.filter((b) => b.name).map((b) => ({ b, n: norm(b.name), corridors: b.codes.map((c) => c.split("-")[0]) }));
@@ -158,6 +159,36 @@ export function buildPositions(stations: PositionedStation[], overrides: MapStop
     if (pick) out.set(s.id, { x: pick.b.at[0], y: pick.b.at[1] });
   }
   return out;
+}
+
+/**
+ * Titik anak stasiun dari admin: posisi stasiun khusus untuk satu lini (kunci `stasiun|lini`), agar garis
+ * beberapa lini yang berhenti di stasiun yang sama (mis. Bundaran Senayan, Pulo Gadung) tidak bertumpuk.
+ */
+export function childPositions(overrides: MapStop[] = []): Map<string, { x: number; y: number }> {
+  return new Map(overrides.filter((o) => o.lineId).map((o) => [`${o.stationId}|${o.lineId}`, { x: o.x, y: o.y }]));
+}
+
+/**
+ * Garis sejajar berjarak `d` (satuan peta; positif = sisi kanan arah jalan) dari polyline `pts`, untuk
+ * menggambar lin paralel berdampingan dengan lin utama pada ruas yang sama.
+ */
+export function offsetPath(pts: Pt[], d: number): Pt[] {
+  if (pts.length < 2 || !d) return pts;
+  const normal = (a: Pt, b: Pt): Pt => {
+    const len = dist(a, b) || 1;
+    return [-(b[1] - a[1]) / len, (b[0] - a[0]) / len];
+  };
+  return pts.map((p, i) => {
+    const n1 = i > 0 ? normal(pts[i - 1], p) : null;
+    const n2 = i < pts.length - 1 ? normal(p, pts[i + 1]) : null;
+    let [nx, ny] = n1 && n2 ? [n1[0] + n2[0], n1[1] + n2[1]] : (n1 ?? n2)!;
+    const len = Math.hypot(nx, ny) || 1;
+    [nx, ny] = [nx / len, ny / len];
+    // Di tikungan, geser lebih jauh agar jarak antargaris tetap (dibatasi agar sudut tajam tidak melonjak).
+    const cos = n1 && n2 ? Math.max(0.5, nx * n1[0] + ny * n1[1]) : 1;
+    return [p[0] - (nx * d) / cos, p[1] - (ny * d) / cos];
+  });
 }
 
 // ---------------------------------------------------------------------------------------------
@@ -253,15 +284,32 @@ function trackBetween(a: string, b: string, color: [number, number, number], str
   return parts.flatMap((pts, i) => (i ? pts.slice(1) : pts));
 }
 
-/** Bentuk jalur dari admin untuk lini `lineId` dari `from` ke `to` (dibalik bila tersimpan terbalik). */
-function manualTrack(tracks: MapTrack[], lineId: string | undefined, from: string, to: string): Pt[] | null {
+/**
+ * Bentuk jalur dari admin untuk lini `lineId` dari `from` ke `to` (dibalik bila tersimpan terbalik). Bila lini itu
+ * tidak punya bentuk sendiri, dipakai bentuk dari lini sekelompoknya (`group`: lin turunan dengan operator dan
+ * warna sama, mis. koridor 1 dan turunannya), karena di peta jalurnya satu garis yang sama.
+ */
+function manualTrack(tracks: MapTrack[], lineId: string | undefined, from: string, to: string, group: string[] = []): Pt[] | null {
   if (!lineId) return null;
-  for (const t of tracks) {
-    if (t.lineId !== lineId) continue;
-    if (t.fromStationId === from && t.toStationId === to) return t.points;
-    if (t.fromStationId === to && t.toStationId === from) return [...t.points].reverse();
+  for (const ids of [[lineId], group]) {
+    for (const t of tracks) {
+      if (!ids.includes(t.lineId)) continue;
+      if (t.fromStationId === from && t.toStationId === to) return t.points;
+      if (t.fromStationId === to && t.toStationId === from) return [...t.points].reverse();
+    }
   }
   return null;
+}
+
+/** Kunci kelompok lini untuk bentuk jalur bersama: operator dan warna yang sama (lin induk dan turunannya). */
+export const trackGroupKey = (line: { operator: string; color: string }) => `${line.operator}|${line.color.trim().toLowerCase()}`;
+
+/** Id semua lini sekelompok dengan `lineId` (termasuk dirinya), lihat trackGroupKey. */
+export function trackGroup(lines: { id: string; operator: string; color: string }[], lineId: string | undefined): string[] {
+  const me = lines.find((l) => l.id === lineId);
+  if (!me) return lineId ? [lineId] : [];
+  const key = trackGroupKey(me);
+  return lines.filter((l) => trackGroupKey(l) === key).map((l) => l.id);
 }
 
 /**
@@ -269,13 +317,13 @@ function manualTrack(tracks: MapTrack[], lineId: string | undefined, from: strin
  * pemberhentian, pakai bentuk jalur dari admin bila ada, lalu jalur di peta. Bila keduanya tidak ada,
  * pakai garis lurus.
  */
-export function ridePath(stops: { id: string; x: number; y: number }[], lineColor: string, opts: { lineId?: string; tracks?: MapTrack[] } = {}): Pt[] {
+export function ridePath(stops: { id: string; x: number; y: number }[], lineColor: string, opts: { lineId?: string; tracks?: MapTrack[]; group?: string[] } = {}): Pt[] {
   const color = rgb(lineColor);
   const pts: Pt[] = [];
   stops.forEach((s, i) => {
     const p: Pt = [s.x, s.y];
     if (i === 0) return pts.push(p);
-    const manual = manualTrack(opts.tracks ?? [], opts.lineId, stops[i - 1].id, s.id);
+    const manual = manualTrack(opts.tracks ?? [], opts.lineId, stops[i - 1].id, s.id, opts.group);
     if (manual) return pts.push(...manual, p);
     const q: Pt = [stops[i - 1].x, stops[i - 1].y];
     const a = nodeAt(q);

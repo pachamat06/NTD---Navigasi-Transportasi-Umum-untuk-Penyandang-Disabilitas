@@ -10,6 +10,7 @@ import type {
   ContentItem,
   ContentKind,
   ContentRepository,
+  ServerConfigRepository,
   Store,
   TestCase,
   TestRepository,
@@ -276,6 +277,23 @@ export function createPgStore(pool: Pool): Store {
     },
   };
 
+  const serverConfig: ServerConfigRepository = {
+    async get(key) {
+      const [r] = await q("SELECT * FROM server_config WHERE key = $1", [key]);
+      return r ? { value: r.value, updatedAt: r.updated_at, updatedBy: r.updated_by } : null;
+    },
+    async put(key, value, by) {
+      await q(
+        `INSERT INTO server_config (key, value, updated_by) VALUES ($1, $2, $3)
+         ON CONFLICT (key) DO UPDATE SET value = EXCLUDED.value, updated_by = EXCLUDED.updated_by, updated_at = now()`,
+        [key, json(value), by],
+      );
+    },
+    async delete(key) {
+      return (await q("DELETE FROM server_config WHERE key = $1 RETURNING key", [key])).length > 0;
+    },
+  };
+
   return {
     kind: "postgres",
     cache,
@@ -283,6 +301,7 @@ export function createPgStore(pool: Pool): Store {
     admins,
     tests,
     audit,
+    serverConfig,
     ping: async () => {
       try {
         await q("SELECT 1");

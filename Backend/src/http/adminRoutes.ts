@@ -11,13 +11,18 @@ import { DEFAULT_SETTINGS, SCHEMAS, SETTINGS_ID, settingsSchema, type Settings }
 import { AppError } from "../errors";
 import type { ContentItem, ContentKind } from "../store/types";
 import type { Services } from "../services";
+import { lineRefOf } from "../data/commute/station-index";
+import { defaultsFromGtfs, defaultsFromSequences } from "../domain/routePatterns";
+import { buildSuggestions, FLOOR_PLAN_JSON_SCHEMA, FLOOR_PLAN_SYSTEM, floorPlanPrompt, MAX_IMAGES, parseFloorPlan, sniffImage, type FloorPlanResult } from "../ai/vision/floorPlan";
+import { VisionError } from "../ai/vision/VisionClient";
+import { visionSettingsInput } from "../ai/vision/VisionService";
 import { ok, parse, rateLimit, requireAdmin } from "./middleware";
 
-const kindSchema = z.enum(["facility", "entrance", "notice", "station_info", "platform", "map_stop", "map_track"]);
+const kindSchema = z.enum(["facility", "entrance", "notice", "station_info", "platform", "concourse", "map_stop", "map_track", "route_pattern"]);
 const idParam = z.string().min(1).max(80);
 
 /** Item yang terikat stasiun wajib punya stationId yang dikenal; pengumuman memakai targetId. */
-const STATION_BOUND: ContentKind[] = ["facility", "entrance", "station_info", "platform", "map_stop"];
+const STATION_BOUND: ContentKind[] = ["facility", "entrance", "station_info", "platform", "concourse", "map_stop"];
 
 function itemView(i: ContentItem) {
   const state = i.draftDeleted ? "akan_dihapus" : i.published === null ? "baru" : i.draft !== null ? "diubah" : "terbit";
@@ -88,7 +93,7 @@ export function adminRoutes(s: Services): Router {
       stations.map((st) => {
         const mine = items.filter((i) => i.stationId === st.id);
         const count = (k: ContentKind) => mine.filter((i) => i.kind === k && !i.draftDeleted).length;
-        return { ...st, facilities: count("facility"), entrances: count("entrance"), platforms: count("platform"), info: count("station_info"), pending: mine.filter((i) => i.draft !== null || i.draftDeleted).length };
+        return { ...st, facilities: count("facility"), entrances: count("entrance"), platforms: count("platform"), concourses: count("concourse"), info: count("station_info"), pending: mine.filter((i) => i.draft !== null || i.draftDeleted).length };
       }),
     );
   });
@@ -107,13 +112,103 @@ export function adminRoutes(s: Services): Router {
     ok(res, { preview, published: pub, datasetAmenities: dataset, items: items.map(itemView) });
   });
 
+  // ---------- Isi fasilitas dari gambar denah (AI) ----------
+  // Gambar dikirim ke penyedia AI dari backend (kunci API tidak pernah ke browser). Hasilnya hanya usulan:
+  // tidak ada yang disimpan; admin memeriksa, menyunting, lalu menyimpan lewat POST/PUT /content.
+  const floorPlanLimiter = rateLimit({ windowMs: 10 * 60_000, max: 20 });
+  r.post("/stations/:id/floor-plan", floorPlanLimiter, async (req, res) => {
+    const id = parse(idParam, req.params.id);
+    const body = parse(
+      z.object({
+        images: z
+          .array(z.object({ data: z.string().min(16).max(8_000_000), name: z.string().max(200).optional() }))
+          .min(1, "unggah minimal satu gambar")
+          .max(MAX_IMAGES, `maksimal ${MAX_IMAGES} gambar sekaligus`),
+      }),
+      req.body ?? {},
+    );
+    const images = body.images.map((img, i) => {
+      const data = img.data.replace(/^data:[^;,]+;base64,/, "").replace(/\s+/g, "");
+      const sniff = sniffImage(data);
+      if ("error" in sniff) throw new AppError("INVALID", `Gambar ${img.name ?? i + 1}: ${sniff.error}.`);
+      return { mediaType: sniff.mediaType, data };
+    });
+
+    const ctx = newContext({ preview: true });
+    const snap = await s.content.snapshot(ctx);
+    const [station, lines, items] = await Promise.all([s.stations.detail(id, ctx, snap), s.stations.lines(ctx), s.store.content.list({ stationId: id })]);
+    if (!station) throw new AppError("NOT_FOUND", `Stasiun "${id}" tidak ditemukan.`);
+
+    const client = await s.vision.client();
+    if (!client) {
+      const v = await s.vision.view();
+      throw new AppError("CONFLICT", `AI pembaca denah belum siap: ${v.problem ?? "konfigurasi belum lengkap"} Atur di Pengaturan → AI pembaca denah.`);
+    }
+
+    const started = Date.now();
+    let text: string;
+    try {
+      text = await client.analyze({
+        system: FLOOR_PLAN_SYSTEM,
+        prompt: floorPlanPrompt(
+          {
+            id: station.id,
+            name: station.name,
+            operator: station.operator,
+            codes: station.codes,
+            lines: lines.filter((l) => station.lineIds.includes(l.id)).map((l) => `${l.name} (${l.id})`),
+            platformCodes: station.platforms.map((p) => p.code),
+            exits: station.entrances.map((e) => e.name),
+            concourses: (station.concourses ?? []).map((c) => c.code),
+          },
+          images.length,
+        ),
+        images,
+        schema: FLOOR_PLAN_JSON_SCHEMA,
+        maxTokens: 16_000,
+      });
+    } catch (e) {
+      const msg = e instanceof VisionError ? e.message : `AI: ${(e as Error).message}`;
+      s.log.warn("floor-plan", { stationId: id, provider: client.name, model: client.model, error: msg });
+      await audit(req, "ai.floor_plan.error", id, { provider: client.name, model: client.model, images: images.length, error: msg });
+      throw new AppError(e instanceof VisionError && e.config ? "CONFLICT" : "API_DOWN", msg);
+    }
+
+    let raw;
+    try {
+      raw = parseFloorPlan(text);
+    } catch (e) {
+      await audit(req, "ai.floor_plan.error", id, { provider: client.name, model: client.model, error: (e as Error).message });
+      throw new AppError("API_DOWN", "Jawaban AI tidak dapat dibaca. Coba lagi atau gunakan model lain.");
+    }
+    const result: FloorPlanResult = {
+      stationId: id,
+      ...buildSuggestions(raw, items, station),
+      provider: client.name,
+      model: client.model,
+      durationMs: Date.now() - started,
+    };
+    await audit(req, "ai.floor_plan", id, { provider: client.name, model: client.model, images: images.length, suggestions: result.suggestions.length });
+    ok(res, result);
+  });
+
+  r.get("/ai/vision", async (_req, res) => ok(res, await s.vision.view()));
+
+  r.put("/ai/vision", requireAdmin("admin"), async (req, res) => {
+    const body = parse(visionSettingsInput, req.body ?? {});
+    const view = await s.vision.update(body, actor(req));
+    const { apiKey, ...rest } = body;
+    await audit(req, "ai.vision.update", null, { ...rest, apiKey: apiKey ? "(diganti)" : undefined });
+    ok(res, view);
+  });
+
   // ---------- Konten (fasilitas, pintu akses, pengumuman, info stasiun) ----------
   r.get("/content", async (req, res) => {
     const q = parse(z.object({ kind: kindSchema.optional(), stationId: z.string().max(80).optional() }), req.query);
     ok(res, (await s.store.content.list(q)).map(itemView));
   });
 
-  const validateBody = async (kind: Exclude<ContentKind, "settings">, stationId: string | null, data: unknown) => {
+  const validateBody = async (kind: Exclude<ContentKind, "settings">, stationId: string | null, data: unknown, selfId?: string) => {
     const parsed = parse(SCHEMAS[kind], data) as Record<string, unknown>;
     const known = new Set((await s.stations.list(newContext({ preview: true }))).map((x) => x.id));
     if (STATION_BOUND.includes(kind)) {
@@ -130,12 +225,28 @@ export function adminRoutes(s: Services): Router {
       const lines = new Set((await s.stations.lines(newContext({ preview: true }))).map((l) => l.id));
       if (!lines.has(String(parsed.lineId))) throw new AppError("INVALID", "lineId harus id lini yang dikenal.");
     }
+    if (kind === "map_stop" && parsed.lineId !== undefined) {
+      const lines = new Set((await s.stations.lines(newContext({ preview: true }))).map((l) => l.id));
+      if (!lines.has(String(parsed.lineId))) throw new AppError("INVALID", "lineId titik anak harus id lini yang dikenal.");
+    }
+    if (kind === "route_pattern") {
+      const lines = new Set((await s.stations.lines(newContext({ preview: true }))).map((l) => l.id));
+      if (!lines.has(String(parsed.lineId))) throw new AppError("INVALID", "lineId harus id lini yang dikenal.");
+      const unknown = (parsed.stops as { stationId: string }[]).filter((x) => !known.has(x.stationId));
+      if (unknown.length) throw new AppError("INVALID", `stationId tidak dikenal: ${[...new Set(unknown.map((x) => x.stationId))].join(", ")}.`);
+      // Satu pengaturan per lini dan arah.
+      const same = (await s.store.content.list({ kind: "route_pattern" })).find((it) => {
+        const v = (it.draft ?? it.published) as { lineId?: string; direction?: number } | null;
+        return it.id !== selfId && !it.draftDeleted && v?.lineId === parsed.lineId && v?.direction === parsed.direction;
+      });
+      if (same) throw new AppError("CONFLICT", "Pengaturan rute untuk lini dan arah ini sudah ada; ubah entri yang ada.", { id: same.id });
+    }
     return parsed;
   };
 
   r.post("/content", async (req, res) => {
     const body = parse(z.object({ kind: kindSchema, stationId: z.string().max(80).nullable().optional(), data: z.unknown() }), req.body ?? {});
-    const stationId = body.kind === "notice" || body.kind === "map_track" ? null : (body.stationId ?? null);
+    const stationId = body.kind === "notice" || body.kind === "map_track" || body.kind === "route_pattern" ? null : (body.stationId ?? null);
     const data = await validateBody(body.kind, stationId, body.data);
     const item = await s.store.content.saveDraft({ kind: body.kind, stationId, data, by: actor(req) });
     await audit(req, "content.create", item.id, { kind: body.kind, stationId });
@@ -147,7 +258,7 @@ export function adminRoutes(s: Services): Router {
     const prev = await s.store.content.get(id);
     if (!prev || prev.kind === "settings") throw new AppError("NOT_FOUND", "Konten tidak ditemukan.");
     const body = parse(z.object({ data: z.unknown() }), req.body ?? {});
-    const data = await validateBody(prev.kind as Exclude<ContentKind, "settings">, prev.stationId, body.data);
+    const data = await validateBody(prev.kind as Exclude<ContentKind, "settings">, prev.stationId, body.data, id);
     const item = await s.store.content.saveDraft({ id, kind: prev.kind, stationId: prev.stationId, data, by: actor(req) });
     await audit(req, "content.update", id, { kind: prev.kind });
     ok(res, itemView(item));
@@ -167,6 +278,37 @@ export function adminRoutes(s: Services): Router {
     const item = await s.store.content.discardDraft(id);
     await audit(req, "content.discard", id);
     ok(res, item ? itemView(item) : { id, removed: true });
+  });
+
+  // ---------- Rute per lini dan arah ----------
+  // Urutan stasiun tiap lini yang berlaku di pratinjau (bawaan + pengaturan admin), termasuk ruas cabang/ramp
+  // satu arah (mis. putaran Kota Tua dan Blok M koridor 1), untuk editor rute dan editor peta.
+  r.get("/routes", async (_req, res) => {
+    const ctx = newContext({ preview: true });
+    const [base, effective] = await Promise.all([s.commute.getLineSequences(ctx), s.planner.sequences(ctx)]);
+    const baseBy = new Map(base.map((b) => [b.lineId, b.sequences]));
+    ok(
+      res,
+      effective.map((e) => ({ lineId: e.lineId, sequences: e.sequences, directed: !!e.directed, base: baseBy.get(e.lineId) ?? [] })),
+    );
+  });
+
+  // Rute bawaan dua arah untuk sinkron ulang: dari GTFS Transjakarta (urutan halte dan waktu jadwal) atau dari
+  // Commute Data API (urutan stasiun lin; tanpa waktu tempuh). Hasilnya diisikan ke editor, lalu disimpan sebagai draft.
+  r.get("/routes/:lineId/defaults", async (req, res) => {
+    const lineId = parse(idParam, req.params.lineId);
+    const { source } = parse(z.object({ source: z.enum(["gtfs", "commute"]).default("commute") }), req.query);
+    const ctx = newContext({ preview: true });
+    if (!(await s.stations.lines(ctx)).some((l) => l.id === lineId)) throw new AppError("NOT_FOUND", `Lini "${lineId}" tidak ditemukan.`);
+    if (source === "gtfs") {
+      const ref = lineRefOf(lineId);
+      if (ref?.operator !== "TJ" || !s.gtfs.hasRoute(ref.code)) throw new AppError("NOT_FOUND", "Data GTFS hanya tersedia untuk koridor BRT TransJakarta yang tercantum di NTD.");
+      const idx = await s.commute.index(ctx);
+      const patterns = defaultsFromGtfs(s.gtfs, ref.code, (code) => idx.idOf({ operator: "TJ", code }));
+      return ok(res, { source, patterns, branches: [] });
+    }
+    const seq = (await s.commute.getLineSequences(ctx)).find((x) => x.lineId === lineId);
+    ok(res, { source, ...defaultsFromSequences(seq) });
   });
 
   // ---------- Pengaturan (bobot skor, ambang, disclaimer, LLM, TTL cache) ----------
@@ -276,6 +418,7 @@ export function adminRoutes(s: Services): Router {
       store: { kind: s.store.kind, ok: dbOk },
       commute: { source: s.commute.sourceName, baseUrl: s.config.commute.source === "http" ? s.config.commute.baseUrl : null, ...upstream, mapping },
       llm: s.llm ? { provider: s.llm.name, model: s.llm.model } : { provider: "none" },
+      vision: await s.vision.view().then((v) => ({ provider: v.provider, model: v.model, ready: v.ready })),
       cache,
       pendingChanges: pending.length,
       admins,

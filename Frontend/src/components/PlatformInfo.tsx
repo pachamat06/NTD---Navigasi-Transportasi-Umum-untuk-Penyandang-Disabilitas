@@ -3,19 +3,38 @@
 // Peron: lin/arah yang dilayani, fasilitas per peron, eskalator dan lift, serta celah peron dengan kendaraan.
 
 import { AMENITY_LABEL, useNetwork } from "@/lib/network";
-import type { DetailStatus, EscalatorGroup, LiftInfo, Platform, PlatformConnection, PlatformGap, StationDetailData } from "@/lib/types";
+import type { AccessSegment, AccessVia, ConcourseRoute, DetailStatus, EscalatorGroup, LiftInfo, Platform, PlatformGap, SegmentMeans, StationDetailData } from "@/lib/types";
 
 const TYPE_TEXT = { island: "peron pulau (island)", side: "peron samping (side)", bay: "peron ujung (bay)" } as const;
 const STATUS_TEXT: Record<DetailStatus, string> = { available: "tersedia", absent: "tidak ada", unknown: "belum ada data", out_of_service: "tidak berfungsi" };
 const DIRECTION_TEXT = { naik: "naik", turun: "turun", bergantian: "naik/turun bergantian" } as const;
 
-export const VIA_TEXT: Record<PlatformConnection, string> = {
+export const VIA_TEXT: Record<AccessVia, string> = {
   langsung: "langsung dari gate",
   crosswalk: "menyeberang jalan (crosswalk)",
   sebidang: "pelintasan sebidang (menyeberang rel)",
   jpo: "lewat JPO",
   terowongan: "lewat terowongan",
+  concourse: "lewat concourse",
 };
+
+const MEANS_TEXT: Record<SegmentMeans, string> = { datar: "datar", ramp: "ramp", lift: "lift", eskalator: "eskalator", tangga: "tangga" };
+
+/** Cara berpindah pada satu ruas, mis. "lift/tangga". */
+export const meansText = (m: SegmentMeans[]) => m.map((x) => MEANS_TEXT[x]).join("/");
+
+/** Ringkasan ruas: cara berpindah, lift yang tidak berfungsi, jalur khusus. */
+export function segmentText(s: AccessSegment): string {
+  const lift = s.means.includes("lift") && s.lift?.status && s.lift.status !== "available" ? `, lift ${STATUS_TEXT[s.lift.status]}` : "";
+  return `${meansText(s.means)}${lift}${s.dedicated ? ", khusus disabilitas" : ""}${s.note ? ` (${s.note})` : ""}`;
+}
+
+/** Cara mencapai peron, termasuk jalur lewat concourse: "lewat concourse Utara (gate → concourse: datar; concourse → peron: lift/tangga)". */
+export function accessText(a: { via: AccessVia; stepFree?: boolean; dedicated?: boolean; concourse?: ConcourseRoute }): string {
+  const c = a.concourse;
+  const via = c ? `lewat concourse ${c.name ?? c.code} (gate → concourse: ${meansText(c.toConcourse)}; concourse → peron: ${meansText(c.toPlatform)})` : VIA_TEXT[a.via];
+  return `${via}${a.stepFree ? " beramp tanpa anak tangga" : ""}${a.dedicated ? " khusus disabilitas" : ""}`;
+}
 
 export function gapText(g: PlatformGap): string {
   const base = g.level === "tangga" ? `perlu naik ${g.steps ?? "beberapa"} anak tangga ke kendaraan` : g.level === "sedikit" ? "beda tinggi kecil dengan kendaraan" : "sejajar dengan kendaraan";
@@ -70,7 +89,7 @@ export function PlatformDetails({ p, compact }: { p: Platform; compact?: boolean
   );
 }
 
-export function PlatformList({ platforms, entrances = [] }: { platforms: Platform[]; entrances?: StationDetailData["entrances"] }) {
+export function PlatformList({ platforms, entrances = [], concourses = [] }: { platforms: Platform[]; entrances?: StationDetailData["entrances"]; concourses?: StationDetailData["concourses"] }) {
   return (
     <ul className="mt-1 flex flex-col gap-2">
       {platforms.map((p) => (
@@ -83,7 +102,20 @@ export function PlatformList({ platforms, entrances = [] }: { platforms: Platfor
           <PlatformDetails p={p} />
           {(() => {
             const gates = entrances.flatMap((e) => (e.platformLinks ?? []).filter((l) => l.platform === p.code).map((l) => `${e.name} (${VIA_TEXT[l.via]})`));
-            return gates.length > 0 && <p className="text-[var(--muted)]">Dari gate: {gates.join(" · ")}</p>;
+            // Gate yang tidak langsung ke peron: gate → concourse → peron.
+            const viaConcourse = (concourses ?? []).flatMap((c) =>
+              c.platformLinks
+                .filter((l) => l.platform === p.code)
+                .flatMap((l) =>
+                  entrances.flatMap((e) => (e.concourseLinks ?? []).filter((g) => g.concourse === c.code).map((g) => `${e.name} → concourse ${c.name ?? c.code} (${segmentText(g)}) → peron (${segmentText(l)})`)),
+                ),
+            );
+            return (
+              <>
+                {gates.length > 0 && <p className="text-[var(--muted)]">Dari gate: {gates.join(" · ")}</p>}
+                {viaConcourse.length > 0 && <p className="text-[var(--muted)]">Lewat concourse: {viaConcourse.join(" · ")}</p>}
+              </>
+            );
           })()}
           {p.source === "dataset" && <p className="text-xs text-[var(--muted)]">Fasilitas peron ini belum disurvei tim NTD.</p>}
         </li>

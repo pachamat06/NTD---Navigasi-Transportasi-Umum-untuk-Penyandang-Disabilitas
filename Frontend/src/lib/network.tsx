@@ -4,7 +4,7 @@
 
 import { createContext, useCallback, useContext, useEffect, useMemo, useState, type ReactNode } from "react";
 import { fetchMeta, fetchNetwork } from "./api";
-import { buildPositions } from "./map-assets";
+import { buildPositions, childPositions } from "./map-assets";
 import type { AmenityType, Hub, Line, MapOverrides, MapTrack, Meta, NetworkStation, StationAssessment } from "./types";
 
 export const AMENITY_LABEL: Record<AmenityType, string> = {
@@ -29,6 +29,8 @@ export interface NetworkValue {
   amenityLabel: (type: string) => string;
   /** Posisi pada Aset Peta Transit; undefined = tidak ada di peta. */
   positionOf: (id: string) => { x: number; y: number } | undefined;
+  /** Posisi stasiun untuk satu lini: titik anak dari admin bila ada, selain itu posisi utama. */
+  positionOn: (id: string, lineId?: string) => { x: number; y: number } | undefined;
   /** Bentuk jalur yang ditetapkan admin. */
   mapTracks: MapTrack[];
 }
@@ -50,6 +52,7 @@ function build(stations: NetworkStation[], lines: Line[], hubs: Hub[], meta: Met
   const ln = new Map(lines.map((l) => [l.id, l]));
   const hb = new Map(hubs.map((h) => [h.id, h]));
   const pos = buildPositions(stations, map?.stops);
+  const child = childPositions(map?.stops);
   return {
     stations,
     lines,
@@ -76,6 +79,7 @@ function build(stations: NetworkStation[], lines: Line[], hubs: Hub[], meta: Met
     },
     amenityLabel: (type) => meta?.amenityLabels[type] ?? AMENITY_LABEL[type as AmenityType] ?? type,
     positionOf: (id) => pos.get(id),
+    positionOn: (id, lineId) => (lineId ? child.get(`${id}|${lineId}`) : undefined) ?? pos.get(id),
     mapTracks: map?.tracks ?? [],
   };
 }
