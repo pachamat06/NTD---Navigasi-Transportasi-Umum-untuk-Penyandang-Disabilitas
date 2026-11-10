@@ -116,9 +116,17 @@ Hanya origin di `ADMIN_ORIGINS` yang boleh memanggil lewat browser. Peran `admin
 | GET | `/pending` · POST `/publish` | Perubahan menunggu dan publikasi `{ids?, force?}` (admin) |
 | GET, POST | `/tests` · PUT, DELETE `/tests/:id` | Kasus uji API |
 | POST | `/tests/run`, `/tests/:id/run`, `/tests/adhoc` · GET `/tests/runs` | Jalankan uji pada data `published` atau `preview` |
+| GET | `/routes` · `/routes/:lineId/defaults?source=gtfs\|commute` | Urutan stasiun lini; rute bawaan dua arah untuk sinkron (urutan, waktu antarpemberhentian, frekuensi, jam layanan, `notes` ringkasan) |
+| POST | `/routes/sync` | `{lineIds (1–10), source: auto\|gtfs\|commute}`: sinkron banyak rute sekaligus dan simpan sebagai draft kedua arah; catatan admin dipertahankan |
+| GET | `/hubs` · `/hubs/defaults?hubId=&members=` | Hub yang berlaku (pratinjau) dan hub bawaan; data Commute untuk satu hub (anggota dan jalan kaki dari `/transfers`) |
 | GET | `/system` · POST `/cache/purge` · GET `/audit` | Status layanan, kosongkan cache, log aktivitas |
 | POST | `/stations/:id/floor-plan` | `{images: [{data, name?}]}` (1–4 gambar base64, maks. 5 MB/gambar) → usulan fasilitas, peron, gate, dan info dari AI. Tidak menyimpan apa pun; dibatasi 20 kali per 10 menit |
 | GET, PUT | `/ai/vision` | Penyedia AI pembaca denah (provider, model, endpoint, batas waktu, kunci API). Kunci tidak pernah dikembalikan; PUT hanya admin |
+
+#### Sinkron rute dan hub transfer
+
+- Sinkron rute dari GTFS Transjakarta mengisi waktu antarhalte, frekuensi rata-rata (ditimbang lama jendela frekuensi), dan jam layanan. Dari Commute, moda rel memakai jadwal hari kerja (`/stations/{op}/{code}/timetable`): waktu = median selisih jam berangkat pada nomor perjalanan yang sama di dua stasiun berurutan, frekuensi = rata-rata jarak keberangkatan dari stasiun awal, jam layanan = keberangkatan pertama–terakhir. TransJakarta lewat Commute memakai GTFS untuk waktu dan `/headway` (pukul 08.00) untuk frekuensi dan jam layanan. Pemberhentian yang belum dikenal NTD dibuang.
+- Hub transfer berlaku = `/hubs` Commute + hub bawaan NTD (`CURATED_HUBS`, mis. halte TransJakarta Cawang ↔ stasiun LRT Cawang, 170 m dari `/transfers`) + konten `hub` dari admin (id sama menggantikan, `disabled` menonaktifkan). Hub dipakai pencarian rute topologi, alternatif di hub, dan `hubId` stasiun. Hub tanpa data jalan kaki memakai jarak garis lurus antarkoordinat.
 
 #### Isi fasilitas dari gambar denah
 

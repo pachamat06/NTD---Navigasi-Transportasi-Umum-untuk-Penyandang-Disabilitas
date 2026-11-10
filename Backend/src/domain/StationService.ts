@@ -4,9 +4,11 @@
 import type { RequestContext } from "../context";
 import type { CommuteApiClient } from "../data/commute/CommuteApiClient";
 import type { ContentSnapshot } from "./content";
-import type { FacilityAnalysisService } from "./FacilityAnalysisService";
+import { applyPlatformExits, mergeGates, type FacilityAnalysisService } from "./FacilityAnalysisService";
 import type { Entrance, Hub, Line, Platform, Station, StationDetail } from "./models";
 import { applyPatternsToLines, type PatternProvider } from "./routePatterns";
+import { applyHubs, hubOfStation, type HubProvider } from "./hubs";
+import { inactiveStations, type StationStatusProvider } from "./stationStatus";
 
 const normalize = (s: string) =>
   s
@@ -22,10 +24,28 @@ export class StationService {
     private facilities: FacilityAnalysisService,
     /** Pengaturan rute dari admin: urutan stasiun lini mengikuti pengaturan itu. */
     private patterns?: PatternProvider,
+    /** Hub transfer dari admin (dibuat, diubah, atau dinonaktifkan). */
+    private hubOverrides?: HubProvider,
+    /** Status operasional stasiun dari admin; stasiun nonaktif ditandai `inactive`. */
+    private statuses?: StationStatusProvider,
   ) {}
 
-  list(ctx: RequestContext): Promise<Station[]> {
-    return this.commute.getStations(ctx);
+  /**
+   * Stasiun dataset; hub tiap stasiun mengikuti daftar hub yang berlaku (termasuk hub bawaan NTD dan isian admin).
+   * Stasiun yang sudah tidak beroperasi tetap tercantum dengan `inactive` agar pengguna mendapat pesan yang jelas.
+   */
+  async list(ctx: RequestContext): Promise<Station[]> {
+    const [stations, hubs, overrides] = await Promise.all([this.commute.getStations(ctx), this.hubsFor(ctx), this.statuses ? this.statuses(ctx) : Promise.resolve([])]);
+    const of = hubOfStation(hubs);
+    const inactive = inactiveStations(overrides);
+    return stations.map((s) => {
+      const hubId = of.get(s.id);
+      const off = inactive.get(s.id);
+      const status = off ? { inactive: true, ...(off.note ? { inactiveNote: off.note } : {}) } : {};
+      if (hubId === s.hubId) return off ? { ...s, ...status } : s;
+      const { hubId: _, ...rest } = s;
+      return { ...rest, ...(hubId ? { hubId } : {}), ...status };
+    });
   }
 
   async get(id: string, ctx: RequestContext): Promise<Station | undefined> {
@@ -58,8 +78,14 @@ export class StationService {
     return applyPatternsToLines(lines, patterns);
   }
 
+  /** Hub transfer yang berlaku: Commute, hub bawaan NTD, lalu isian admin. */
   hubs(ctx: RequestContext): Promise<Hub[]> {
-    return this.commute.getHubs(ctx);
+    return this.hubsFor(ctx);
+  }
+
+  private async hubsFor(ctx: RequestContext): Promise<Hub[]> {
+    const [base, overrides, stations] = await Promise.all([this.commute.getHubs(ctx), this.hubOverrides ? this.hubOverrides(ctx) : Promise.resolve([]), this.commute.getStations(ctx)]);
+    return applyHubs(base, overrides, new Set(stations.map((s) => s.id)));
   }
 
   /** Detail stasiun: fasilitas (dataset + tim), penilaian, pintu akses, info lain, dan pengumuman aktif. */
@@ -73,12 +99,14 @@ export class StationService {
       dataset ? this.commute.getPlatforms(id, ctx) : Promise.resolve([]),
       dataset ? this.commute.getExits(id, ctx) : Promise.resolve([]),
     ]);
+    const merged = mergePlatforms(platforms, snap.platformsOf(id));
     return {
       ...st,
       ...facilities,
       assessment,
-      platforms: mergePlatforms(platforms, snap.platformsOf(id)),
-      entrances: mergeEntrances(exits, snap.entrancesOf(id)),
+      platforms: merged,
+      // Akses peron ke pintu keluar (isian data peron) ikut menjadi jalur gate → peron.
+      entrances: applyPlatformExits(mergeEntrances(exits, snap.entrancesOf(id)), merged),
       concourses: snap.concoursesOf(id),
       info: snap.infoOf(id),
       notices: snap.notices({ stationIds: [id], lineIds: st.lineIds, hubIds: st.hubId ? [st.hubId] : [] }).filter((n) => n.scope !== "global"),
@@ -101,11 +129,5 @@ export function mergePlatforms(dataset: Platform[], ntd: Platform[]): Platform[]
 
 /** Pintu dataset (/exits) yang belum dilengkapi tim ikut ditampilkan; yang sudah dilengkapi memakai isian tim. */
 export function mergeEntrances(dataset: Entrance[], ntd: Entrance[]): Entrance[] {
-  const refOf = (e: Entrance) => e.id.slice(e.id.lastIndexOf(":") + 1);
-  const covered = new Map(ntd.filter((e) => e.exitRef).map((e) => [e.exitRef!, e]));
-  const filled = ntd.map((e) => {
-    const d = e.exitRef ? dataset.find((x) => refOf(x) === e.exitRef) : undefined;
-    return d?.signs && !e.signs ? { ...e, signs: d.signs } : e;
-  });
-  return [...filled, ...dataset.filter((d) => !covered.has(refOf(d)))];
+  return mergeGates(dataset, ntd);
 }

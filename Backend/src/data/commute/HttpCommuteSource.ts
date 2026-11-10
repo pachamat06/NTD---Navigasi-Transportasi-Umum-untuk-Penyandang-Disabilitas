@@ -4,12 +4,12 @@
 // Respons API dibungkus `{ status, data }` (gagal: `{ status, error: { code, message } }`) dan diterjemahkan
 // ke tipe internal di ./types. Endpoint yang dipakai:
 //   /stations, /stations/{operator}/{code}, /stations/{operator}/{code}/transfers,
-//   /stations/{operator}/{code}/headway, /hubs, /operators, /lines/{operator}/{lineCode}, /fares/{from}/{to}?at=
+//   /stations/{operator}/{code}/headway, /stations/{operator}/{code}/timetable, /hubs, /operators, /lines/{operator}/{lineCode}, /fares/{from}/{to}?at=
 // Id stasiun API berbentuk `{operator}-{code}` (mis. KCI-SUD); kunci lin `OPERATOR:KODE` (mis. KCI:C).
 
 import { UpstreamError } from "../../errors";
 import type { Mode } from "../../domain/models";
-import type { CommuteSource, UpExit, UpExitRef, UpFare, UpHeadway, UpHub, UpHubTransfer, UpLeg, UpLine, UpOperator, UpPlatformService, UpStation, UpStopRef } from "./types";
+import type { CommuteSource, UpDeparture, UpExit, UpExitRef, UpFare, UpHeadway, UpHub, UpHubTransfer, UpLeg, UpLine, UpOperator, UpPlatformService, UpStation, UpStopRef } from "./types";
 
 export interface HttpCommuteOptions {
   baseUrl: string;
@@ -78,6 +78,16 @@ interface ApiGroupedTimetable {
   line: string;
   /** Label arah berupa daftar stasiun yang dilewati, mis. ["Manggarai", "Jatinegara", "Cikarang"]. */
   timetable: { key: string; label?: string[] | string | null; platformCode?: string | null }[];
+}
+
+/** /timetable: satu keberangkatan. `estimatedArrival` adalah jam tiba di tujuan akhir, bukan di stasiun berikutnya. */
+interface ApiDeparture {
+  tripNumber: string;
+  estimatedDeparture: string;
+  /** Jam tiba di tujuan akhir (`boundFor`). Untuk sebagian operator sama dengan jam berangkat (tidak diketahui). */
+  estimatedArrival?: string | null;
+  boundFor?: string | null;
+  lineCode?: string | null;
 }
 
 interface ApiExit extends ApiExitRef {
@@ -261,6 +271,26 @@ export class HttpCommuteSource implements CommuteSource {
     });
   }
 
+  async getTimetable(operator: string, code: string, day: "WD" | "SAT" | "SUN"): Promise<UpDeparture[] | null> {
+    // from = to berarti sehari penuh.
+    const rows = await this.get<ApiDeparture[]>(`stations/${encodeURIComponent(operator)}/${encodeURIComponent(code)}/timetable?day=${day}&from=00:00&to=00:00`);
+    if (!rows) return null;
+    return rows.flatMap((r) => {
+      const minutes = clockMinutes(r.estimatedDeparture);
+      if (!r.tripNumber || minutes === undefined) return [];
+      const arrive = clockMinutes(r.estimatedArrival);
+      return [
+        {
+          tripNumber: String(r.tripNumber),
+          minutes,
+          ...(r.boundFor ? { boundFor: r.boundFor } : {}),
+          ...(arrive !== undefined && arrive !== minutes ? { arriveFinal: arrive } : {}),
+          ...(r.lineCode ? { line: r.lineCode } : {}),
+        },
+      ];
+    });
+  }
+
   async getPlatforms(operator: string, code: string): Promise<UpPlatformService[] | null> {
     // Jendela jam sempit agar respons kecil; pengelompokan arah tetap dihitung dari jadwal sehari penuh.
     const path = `stations/${encodeURIComponent(operator)}/${encodeURIComponent(code)}/timetable/grouped?compact=1&from=04:00&to=05:00`;
@@ -432,7 +462,12 @@ function mapExit(e: ApiExitRef): UpExitRef {
   return { ref: e.ref, ...(e.name ? { name: e.name } : {}), ...(e.signs?.length ? { signs: e.signs.map((x) => x.text) } : {}) };
 }
 
-/** Hari layanan (WD/SAT/SUN) dan jam menurut waktu Jakarta (UTC+7, tanpa DST). */
+/** "HH:MM[:SS]" menjadi menit sejak tengah malam (0–1439); undefined bila bukan jam. */
+function clockMinutes(v: string | null | undefined): number | undefined {
+  const m = /^(\d{1,2}):(\d{2})/.exec(v ?? "");
+  return m ? (Number(m[1]) * 60 + Number(m[2])) % 1440 : undefined;
+}
+
 /** Label arah dari /timetable/grouped (daftar stasiun yang dilewati) menjadi teks, mis. "Arah Manggarai – Jatinegara – Cikarang". */
 export function directionLabel(label: unknown): string | undefined {
   const parts = (Array.isArray(label) ? label : [label]).filter((x): x is string => typeof x === "string" && x.trim() !== "").map((x) => x.trim());
@@ -441,6 +476,7 @@ export function directionLabel(label: unknown): string | undefined {
   return text.length > 120 ? `${text.slice(0, 119)}…` : text;
 }
 
+/** Hari layanan (WD/SAT/SUN) dan jam menurut waktu Jakarta (UTC+7, tanpa DST). */
 export function jakartaDayHour(d: Date): { day: "WD" | "SAT" | "SUN"; hour: number } {
   const local = new Date(d.getTime() + 7 * 3600_000);
   const dow = local.getUTCDay();

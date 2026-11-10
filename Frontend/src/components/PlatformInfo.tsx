@@ -3,7 +3,7 @@
 // Peron: lin/arah yang dilayani, fasilitas per peron, eskalator dan lift, serta celah peron dengan kendaraan.
 
 import { AMENITY_LABEL, useNetwork } from "@/lib/network";
-import type { AccessSegment, AccessVia, ConcourseRoute, DetailStatus, EscalatorGroup, LiftInfo, Platform, PlatformGap, SegmentMeans, StationDetailData } from "@/lib/types";
+import type { AccessSegment, AccessVia, AmenityStatus, AmenityType, ConcourseRoute, DetailStatus, EscalatorGroup, LiftInfo, Platform, PlatformGap, SegmentMeans, StationDetailData } from "@/lib/types";
 
 const TYPE_TEXT = { island: "peron pulau (island)", side: "peron samping (side)", bay: "peron ujung (bay)" } as const;
 const STATUS_TEXT: Record<DetailStatus, string> = { available: "tersedia", absent: "tidak ada", unknown: "belum ada data", out_of_service: "tidak berfungsi" };
@@ -50,10 +50,17 @@ export function verticalText(escalators?: EscalatorGroup[], lift?: LiftInfo): st
   return out;
 }
 
-/** Rincian satu peron. `compact` dipakai pada langkah rute (tanpa daftar lin). */
-export function PlatformDetails({ p, compact }: { p: Platform; compact?: boolean }) {
-  const { lineById } = useNetwork();
-  const amenities = Object.entries(p.amenities) as [keyof typeof AMENITY_LABEL, DetailStatus][];
+/** Fasilitas mobilitas yang dicatat per peron; fasilitas lain (toilet, petugas, dll.) adalah info umum stasiun. */
+const MOBILITY: AmenityType[] = ["lift", "eskalator", "ramp"];
+
+/**
+ * Rincian satu peron. `compact` dipakai pada langkah rute (tanpa daftar lin). `station` = fasilitas umum stasiun, dipakai
+ * untuk fasilitas mobilitas yang belum diisi pada peron ini.
+ */
+export function PlatformDetails({ p, compact, station }: { p: Platform; compact?: boolean; station?: Record<AmenityType, AmenityStatus> }) {
+  const { lineById, amenityLabel } = useNetwork();
+  const amenities = Object.entries(p.amenities) as [string, DetailStatus][];
+  const fallback = station ? MOBILITY.filter((k) => !(k in p.amenities) && !(k === "lift" && p.lift) && !(k === "eskalator" && p.escalators?.length)) : [];
   const vertical = verticalText(p.escalators, p.lift);
   return (
     <>
@@ -72,9 +79,14 @@ export function PlatformDetails({ p, compact }: { p: Platform; compact?: boolean
           {amenities.map(([k, s], i) => (
             <span key={k} className={s === "available" ? "text-[var(--ok)]" : "text-[var(--warn)]"}>
               {i > 0 && " · "}
-              <span aria-hidden>{s === "available" ? "✔" : "⚠"}</span> {AMENITY_LABEL[k]} {STATUS_TEXT[s]}
+              <span aria-hidden>{s === "available" ? "✔" : "⚠"}</span> {amenityLabel(k)} {STATUS_TEXT[s]}
             </span>
           ))}
+        </p>
+      )}
+      {fallback.length > 0 && station && (
+        <p className="text-[var(--muted)]">
+          Belum diisi untuk peron ini, mengikuti data umum stasiun: {fallback.map((k) => `${AMENITY_LABEL[k]} ${STATUS_TEXT[station[k]]}`).join(" · ")}
         </p>
       )}
       {vertical.length > 0 && <p className="text-[var(--muted)]">{vertical.join(" · ")}</p>}
@@ -89,7 +101,17 @@ export function PlatformDetails({ p, compact }: { p: Platform; compact?: boolean
   );
 }
 
-export function PlatformList({ platforms, entrances = [], concourses = [] }: { platforms: Platform[]; entrances?: StationDetailData["entrances"]; concourses?: StationDetailData["concourses"] }) {
+export function PlatformList({
+  platforms,
+  entrances = [],
+  concourses = [],
+  station,
+}: {
+  platforms: Platform[];
+  entrances?: StationDetailData["entrances"];
+  concourses?: StationDetailData["concourses"];
+  station?: Record<AmenityType, AmenityStatus>;
+}) {
   return (
     <ul className="mt-1 flex flex-col gap-2">
       {platforms.map((p) => (
@@ -99,7 +121,7 @@ export function PlatformList({ platforms, entrances = [], concourses = [] }: { p
             {p.type && <span className="font-normal text-[var(--muted)]"> · {TYPE_TEXT[p.type]}</span>}
             {p.tracks?.length ? <span className="font-normal text-[var(--muted)]"> · jalur {p.tracks.join(", ")}</span> : null}
           </p>
-          <PlatformDetails p={p} />
+          <PlatformDetails p={p} station={station} />
           {(() => {
             const gates = entrances.flatMap((e) => (e.platformLinks ?? []).filter((l) => l.platform === p.code).map((l) => `${e.name} (${VIA_TEXT[l.via]})`));
             // Gate yang tidak langsung ke peron: gate → concourse → peron.
@@ -112,12 +134,12 @@ export function PlatformList({ platforms, entrances = [], concourses = [] }: { p
             );
             return (
               <>
-                {gates.length > 0 && <p className="text-[var(--muted)]">Dari gate: {gates.join(" · ")}</p>}
+                {gates.length > 0 && <p className="text-[var(--muted)]">Akses ke pintu keluar: {gates.join(" · ")}</p>}
                 {viaConcourse.length > 0 && <p className="text-[var(--muted)]">Lewat concourse: {viaConcourse.join(" · ")}</p>}
               </>
             );
           })()}
-          {p.source === "dataset" && <p className="text-xs text-[var(--muted)]">Fasilitas peron ini belum disurvei tim NTD.</p>}
+          {p.source === "dataset" && <p className="text-xs text-[var(--muted)]">Fasilitas mobilitas peron ini belum disurvei tim NTD; skor memakai fasilitas umum stasiun.</p>}
         </li>
       ))}
     </ul>

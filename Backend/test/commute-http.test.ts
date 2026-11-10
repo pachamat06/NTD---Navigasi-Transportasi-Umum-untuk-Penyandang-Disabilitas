@@ -3,7 +3,7 @@
 
 import request from "supertest";
 import { HttpCommuteSource, refOfId, stopParam } from "../src/data/commute/HttpCommuteSource";
-import { makeTestApp } from "./helpers";
+import { datasetOption, makeTestApp } from "./helpers";
 
 const st = (id: string, name: string, lines: string[], amenities: { type: string; text?: string }[] = [], extra: object = {}) => {
   const [operator, code] = [id.slice(0, id.indexOf("-")), id.slice(id.indexOf("-") + 1)];
@@ -115,6 +115,10 @@ async function setup(extraFares: Record<string, unknown> = {}, operators?: strin
   const api = fakeApi(extraFares);
   const source = new HttpCommuteSource({ baseUrl: "https://api.test", timeoutMs: 1000, fetchImpl: api.fetchImpl, operators });
   const t = await makeTestApp({ source });
+  // Karet sudah tidak beroperasi (daftar bawaan NTD); di uji ini dipakai sebagai stasiun KRL biasa, jadi diaktifkan
+  // kembali lewat status stasiun dari admin.
+  await t.store.content.saveDraft({ kind: "station_status", stationId: "kci:kat", data: { inactive: false }, by: "uji" });
+  await t.store.content.publish("all", "uji");
   return { ...t, api };
 }
 
@@ -167,7 +171,7 @@ describe("HttpCommuteSource (bentuk Commute Data API asli)", () => {
     const res = await request(app).post("/api/plan").send({ originId: "tanah-abang", destinationId: "dukuh-atas-mrt" });
     expect(res.status).toBe(200);
     expect(api.calls).toContain("fares/KCI-THB/MRTJ-DKA");
-    const r = res.body.data.route;
+    const r = datasetOption(res.body.data).route;
     expect(r).toMatchObject({ totalFare: 3000, totalDistanceM: 4500, transfers: 1 });
     expect(r.legs[0]).toMatchObject({ type: "RIDE", lineId: "krl-cikarang", stops: ["tanah-abang", "kci:kat", "bni-city", "sudirman"], minutes: 9, fare: 3000 });
     expect(r.legs[1]).toMatchObject({ type: "TRANSFER", stops: ["sudirman", "dukuh-atas-mrt"], distanceM: 300 });
@@ -213,21 +217,22 @@ describe("Rute lintas operator dari API asli", () => {
     const { app } = await setup({ "fares/KCI-JAKK/MRTJ-DKA": FARE_JAKK_DKA });
     const res = await plan(app);
     expect(res.status).toBe(200);
-    const r = res.body.data.route;
+    const r = datasetOption(res.body.data).route;
     expect(r).toMatchObject({ totalFare: 6500, transfers: 2 });
     expect(r.legs.map((l: { type: string; lineId?: string }) => l.lineId ?? l.type)).toEqual(["TRANSFER", "tj:1", "TRANSFER", "mrt-ns"]);
     expect(r.legs[1]).toMatchObject({ stops: expect.arrayContaining(["tj:h00275p", "tj:h00022p"]), fare: 3500 });
     expect(r.legs[3]).toMatchObject({ stops: ["bundaran-hi", "dukuh-atas-mrt"], fare: 3000 });
     expect(r.stopNames["tj:h00068p"]).toBe("Glodok");
-    expect(res.body.data.assessments.map((a: { stationId: string }) => a.stationId)).toContain("tj:h00022p");
+    expect((datasetOption(res.body.data) as { assessments: { stationId: string }[] }).assessments.map((a) => a.stationId)).toContain("tj:h00022p");
   });
 
   it("tetap berhasil walau TransJakarta dikeluarkan lewat COMMUTE_OPERATORS", async () => {
     const { app } = await setup({ "fares/KCI-JAKK/MRTJ-DKA": FARE_JAKK_DKA }, ["KCI", "MRTJ"]);
     const res = await plan(app);
     expect(res.status).toBe(200);
-    expect(res.body.data.route.stopNames["tj:h00275p"]).toBe("Kota");
-    expect(res.body.data.notification.text).toContain("Kota");
+    const opt = datasetOption(res.body.data) as { route: { stopNames: Record<string, string> }; notification: { text: string } };
+    expect(opt.route.stopNames["tj:h00275p"]).toBe("Kota");
+    expect(opt.notification.text).toContain("Kota");
   });
 });
 
@@ -293,7 +298,7 @@ describe("Filter moda", () => {
 
   it("tanpa filter, rute bus dari dataset tetap dipakai", async () => {
     const { app } = await setup(FARES);
-    const r = (await plan(app, [])).body.data.route;
+    const r = datasetOption((await plan(app, [])).body.data).route;
     expect(r.legs[1]).toMatchObject({ mode: "BUS", lineId: "tj:1" });
   });
 

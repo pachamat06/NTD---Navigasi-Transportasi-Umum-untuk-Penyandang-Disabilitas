@@ -43,3 +43,8 @@ export async function makeTestApp(opts: { store?: Store; llm?: LlmClient | null;
   };
   return { app, store, services, source, login };
 }
+
+/** Rute dasar dari dataset (/fares) di antara pilihan rute; rute utama bisa berupa pilihan lain yang lebih aksesibel. */
+export function datasetOption(plan: { route: unknown; warnings: string[]; options?: { origin: string; route: unknown; warnings: string[] }[] }) {
+  return plan.options?.find((o) => o.origin === "dataset") ?? plan;
+}

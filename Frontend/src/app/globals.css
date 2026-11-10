@@ -108,6 +108,13 @@ body {
   .mode-chip-on {
     @apply border-[var(--accent)] text-[var(--accent)] no-underline;
   }
+  /* Pilihan tunggal (mis. waktu berangkat): tanpa coretan untuk pilihan yang tidak aktif. */
+  .choice-chip {
+    @apply inline-flex min-h-11 cursor-pointer items-center gap-1 rounded-full border-2 border-[var(--border)] px-3 font-semibold text-[var(--muted)];
+  }
+  .choice-chip:has(:focus-visible) {
+    @apply outline-2 outline-offset-2 outline-[var(--accent)];
+  }
   .mode-chip:has(:focus-visible) {
     @apply outline-2 outline-offset-2 outline-[var(--accent)];
   }

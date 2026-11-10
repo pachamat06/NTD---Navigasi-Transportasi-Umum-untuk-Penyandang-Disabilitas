@@ -11,18 +11,40 @@ import { DEFAULT_SETTINGS, SCHEMAS, SETTINGS_ID, settingsSchema, type Settings }
 import { AppError } from "../errors";
 import type { ContentItem, ContentKind } from "../store/types";
 import type { Services } from "../services";
-import { lineRefOf } from "../data/commute/station-index";
-import { defaultsFromGtfs, defaultsFromSequences } from "../domain/routePatterns";
+import { applyHubs } from "../domain/hubs";
+import type { DefaultPattern } from "../domain/routePatterns";
+import type { SyncSource } from "../domain/routeSync";
 import { buildSuggestions, FLOOR_PLAN_JSON_SCHEMA, FLOOR_PLAN_SYSTEM, floorPlanPrompt, MAX_IMAGES, parseFloorPlan, sniffImage, type FloorPlanResult } from "../ai/vision/floorPlan";
 import { VisionError } from "../ai/vision/VisionClient";
 import { visionSettingsInput } from "../ai/vision/VisionService";
 import { ok, parse, rateLimit, requireAdmin } from "./middleware";
 
-const kindSchema = z.enum(["facility", "entrance", "notice", "station_info", "platform", "concourse", "map_stop", "map_track", "route_pattern"]);
+const kindSchema = z.enum(["facility", "entrance", "notice", "station_info", "platform", "concourse", "map_stop", "map_track", "route_pattern", "hub", "station_status"]);
 const idParam = z.string().min(1).max(80);
 
 /** Item yang terikat stasiun wajib punya stationId yang dikenal; pengumuman memakai targetId. */
-const STATION_BOUND: ContentKind[] = ["facility", "entrance", "station_info", "platform", "concourse", "map_stop"];
+const STATION_BOUND: ContentKind[] = ["facility", "entrance", "station_info", "platform", "concourse", "map_stop", "station_status"];
+
+/** Isian pengaturan rute hasil sinkron: data dataset, dengan catatan admin dan catatan pemberhentian yang sama dipertahankan. */
+function syncedPattern(lineId: string, p: DefaultPattern, source: SyncSource, at: string, prev: Record<string, unknown> | null) {
+  const prevStops = (prev?.stops as { stationId: string; note?: string }[] | undefined) ?? [];
+  const noteOf = new Map(prevStops.filter((x) => x.note).map((x) => [x.stationId, x.note!]));
+  const headsign = p.headsign ?? (prev?.headsign as string | undefined);
+  const headway = p.headwayMinutes ?? (prev?.headwayMinutes as number | undefined);
+  const hours = p.serviceHours ?? (prev?.serviceHours as string | undefined);
+  return {
+    lineId,
+    direction: p.direction,
+    ...(headsign ? { headsign } : {}),
+    stops: p.stops.map((x, i) => ({ stationId: x.stationId, ...(i > 0 && typeof x.minutes === "number" ? { minutes: Math.min(240, x.minutes) } : {}), ...(noteOf.has(x.stationId) ? { note: noteOf.get(x.stationId) } : {}) })),
+    source,
+    syncedAt: at,
+    ...(headway ? { headwayMinutes: headway } : {}),
+    ...(hours ? { serviceHours: hours.slice(0, 60) } : {}),
+    ...(p.branches?.length ? { branches: p.branches.slice(0, 20) } : {}),
+    ...(prev?.note ? { note: prev.note } : {}),
+  };
+}
 
 function itemView(i: ContentItem) {
   const state = i.draftDeleted ? "akan_dihapus" : i.published === null ? "baru" : i.draft !== null ? "diubah" : "terbit";
@@ -232,7 +254,7 @@ export function adminRoutes(s: Services): Router {
     if (kind === "route_pattern") {
       const lines = new Set((await s.stations.lines(newContext({ preview: true }))).map((l) => l.id));
       if (!lines.has(String(parsed.lineId))) throw new AppError("INVALID", "lineId harus id lini yang dikenal.");
-      const unknown = (parsed.stops as { stationId: string }[]).filter((x) => !known.has(x.stationId));
+      const unknown = [...(parsed.stops as { stationId: string }[]), ...(((parsed.branches as string[][] | undefined) ?? []).flat().map((stationId) => ({ stationId })))].filter((x) => !known.has(x.stationId));
       if (unknown.length) throw new AppError("INVALID", `stationId tidak dikenal: ${[...new Set(unknown.map((x) => x.stationId))].join(", ")}.`);
       // Satu pengaturan per lini dan arah.
       const same = (await s.store.content.list({ kind: "route_pattern" })).find((it) => {
@@ -241,12 +263,27 @@ export function adminRoutes(s: Services): Router {
       });
       if (same) throw new AppError("CONFLICT", "Pengaturan rute untuk lini dan arah ini sudah ada; ubah entri yang ada.", { id: same.id });
     }
+    if (kind === "station_status") {
+      // Satu status per stasiun.
+      const same = (await s.store.content.list({ kind: "station_status", stationId: stationId ?? undefined })).find((it) => it.id !== selfId && !it.draftDeleted);
+      if (same) throw new AppError("CONFLICT", "Status stasiun ini sudah ada; ubah entri yang ada.", { id: same.id });
+    }
+    if (kind === "hub") {
+      const unknown = (parsed.memberIds as string[]).filter((x) => !known.has(x));
+      if (unknown.length) throw new AppError("INVALID", `Anggota hub tidak dikenal: ${[...new Set(unknown)].join(", ")}.`);
+      // Satu isian per id hub.
+      const same = (await s.store.content.list({ kind: "hub" })).find((it) => {
+        const v = (it.draft ?? it.published) as { hubId?: string } | null;
+        return it.id !== selfId && !it.draftDeleted && v?.hubId === parsed.hubId;
+      });
+      if (same) throw new AppError("CONFLICT", "Isian untuk hub ini sudah ada; ubah entri yang ada.", { id: same.id });
+    }
     return parsed;
   };
 
   r.post("/content", async (req, res) => {
     const body = parse(z.object({ kind: kindSchema, stationId: z.string().max(80).nullable().optional(), data: z.unknown() }), req.body ?? {});
-    const stationId = body.kind === "notice" || body.kind === "map_track" || body.kind === "route_pattern" ? null : (body.stationId ?? null);
+    const stationId = body.kind === "notice" || body.kind === "map_track" || body.kind === "route_pattern" || body.kind === "hub" ? null : (body.stationId ?? null);
     const data = await validateBody(body.kind, stationId, body.data);
     const item = await s.store.content.saveDraft({ kind: body.kind, stationId, data, by: actor(req) });
     await audit(req, "content.create", item.id, { kind: body.kind, stationId });
@@ -293,22 +330,91 @@ export function adminRoutes(s: Services): Router {
     );
   });
 
-  // Rute bawaan dua arah untuk sinkron ulang: dari GTFS Transjakarta (urutan halte dan waktu jadwal) atau dari
-  // Commute Data API (urutan stasiun lin; tanpa waktu tempuh). Hasilnya diisikan ke editor, lalu disimpan sebagai draft.
+  // Rute bawaan dua arah untuk sinkron ulang: dari GTFS Transjakarta (urutan halte, waktu jadwal, frekuensi, jam
+  // layanan) atau dari Commute Data API (urutan stasiun lin; waktu, frekuensi, dan jam layanan dari jadwal untuk moda
+  // rel, dari GTFS dan /headway untuk TransJakarta). Hasilnya diisikan ke editor, lalu disimpan sebagai draft.
   r.get("/routes/:lineId/defaults", async (req, res) => {
     const lineId = parse(idParam, req.params.lineId);
     const { source } = parse(z.object({ source: z.enum(["gtfs", "commute"]).default("commute") }), req.query);
     const ctx = newContext({ preview: true });
     if (!(await s.stations.lines(ctx)).some((l) => l.id === lineId)) throw new AppError("NOT_FOUND", `Lini "${lineId}" tidak ditemukan.`);
-    if (source === "gtfs") {
-      const ref = lineRefOf(lineId);
-      if (ref?.operator !== "TJ" || !s.gtfs.hasRoute(ref.code)) throw new AppError("NOT_FOUND", "Data GTFS hanya tersedia untuk koridor BRT TransJakarta yang tercantum di NTD.");
-      const idx = await s.commute.index(ctx);
-      const patterns = defaultsFromGtfs(s.gtfs, ref.code, (code) => idx.idOf({ operator: "TJ", code }));
-      return ok(res, { source, patterns, branches: [] });
+    if (source === "gtfs" && s.routeSync.autoSource(lineId) !== "gtfs") throw new AppError("NOT_FOUND", "Data GTFS hanya tersedia untuk koridor BRT TransJakarta yang tercantum di NTD.");
+    ok(res, await s.routeSync.defaults(lineId, source, ctx));
+  });
+
+  // Sinkron banyak rute sekaligus: tiap lini diisi dari dataset (otomatis = GTFS untuk koridor BRT yang ada di data
+  // GTFS, selain itu Commute) lalu disimpan sebagai draft kedua arah. Catatan admin dan catatan pemberhentian yang
+  // stasiunnya sama dipertahankan. Dikirim bertahap dari admin (paling banyak 10 lini per permintaan).
+  r.post("/routes/sync", async (req, res) => {
+    const body = parse(z.object({ lineIds: z.array(idParam).min(1).max(10), source: z.enum(["auto", "gtfs", "commute"]).default("auto") }), req.body ?? {});
+    const ctx = newContext({ preview: true });
+    const lines = new Map((await s.stations.lines(ctx)).map((l) => [l.id, l]));
+    const items = (await s.store.content.list({ kind: "route_pattern" })).filter((it) => !it.draftDeleted);
+    const itemOf = (lineId: string, direction: number) =>
+      items.find((it) => {
+        const v = (it.draft ?? it.published) as { lineId?: string; direction?: number } | null;
+        return v?.lineId === lineId && v?.direction === direction;
+      });
+    const results = [];
+    for (const lineId of [...new Set(body.lineIds)]) {
+      if (!lines.has(lineId)) {
+        results.push({ lineId, ok: false, saved: [], notes: [`Lini "${lineId}" tidak ditemukan.`] });
+        continue;
+      }
+      const source: SyncSource = body.source === "auto" ? s.routeSync.autoSource(lineId) : body.source;
+      try {
+        const d = await s.routeSync.defaults(lineId, source, ctx);
+        if (!d.patterns.length) {
+          results.push({ lineId, ok: false, source, saved: [], notes: d.notes.length ? d.notes : ["Dataset tidak memuat rute lini ini."] });
+          continue;
+        }
+        const saved: number[] = [];
+        const errors: string[] = [];
+        const at = new Date().toISOString();
+        for (const p of d.patterns) {
+          const it = itemOf(lineId, p.direction);
+          const prev = (it ? (it.draft ?? it.published) : null) as Record<string, unknown> | null;
+          try {
+            const data = await validateBody("route_pattern", null, syncedPattern(lineId, p, source, at, prev), it?.id);
+            const item = await s.store.content.saveDraft({ id: it?.id, kind: "route_pattern", stationId: null, data, by: actor(req) });
+            if (!it) items.push(item);
+            saved.push(p.direction);
+          } catch (e) {
+            errors.push(`Arah ${p.direction + 1}: ${(e as Error).message}`);
+          }
+        }
+        await audit(req, "routes.sync", lineId, { source, saved });
+        results.push({ lineId, ok: saved.length > 0, source, saved, notes: [...d.notes, ...errors] });
+      } catch (e) {
+        results.push({ lineId, ok: false, source, saved: [], notes: [(e as Error).message] });
+      }
     }
-    const seq = (await s.commute.getLineSequences(ctx)).find((x) => x.lineId === lineId);
-    ok(res, { source, ...defaultsFromSequences(seq) });
+    ok(res, results);
+  });
+
+  // ---------- Hub transfer ----------
+  // Hub yang berlaku di pratinjau (Commute + hub bawaan NTD + isian admin) dan hub bawaan sebelum isian admin.
+  r.get("/hubs", async (_req, res) => {
+    const ctx = newContext({ preview: true });
+    const [effective, base, stations] = await Promise.all([s.stations.hubs(ctx), s.commute.getHubs(ctx), s.stations.list(ctx)]);
+    ok(res, { hubs: effective, base: applyHubs(base, [], new Set(stations.map((x) => x.id))) });
+  });
+
+  // Data Commute untuk satu hub: anggota dan jalan kaki bila hub itu ada di /hubs, ditambah jalan kaki antaranggota
+  // `members` dari /stations/{op}/{code}/transfers (untuk hub buatan admin).
+  r.get("/hubs/defaults", async (req, res) => {
+    const q = parse(z.object({ hubId: z.string().max(60).optional(), members: z.string().max(2000).optional() }), req.query);
+    const ctx = newContext({ preview: true });
+    const hub = q.hubId ? (await s.commute.getHubs(ctx)).find((h) => h.id === q.hubId) : undefined;
+    const members = [...new Set([...(hub?.memberIds ?? []), ...(q.members ?? "").split(",").map((x) => x.trim()).filter(Boolean)])].slice(0, 20);
+    const walks = [...(hub?.walks ?? [])];
+    for (const a of members)
+      for (const b of members) {
+        if (a === b || walks.some((w) => w.from === a && w.to === b)) continue;
+        const w = await s.commute.getWalk(a, b, ctx).catch(() => undefined);
+        if (w) walks.push(w);
+      }
+    ok(res, { hub: hub ?? null, memberIds: members, walks: walks.map(({ from, to, distanceM, minutes, notes }) => ({ from, to, distanceM, minutes, ...(notes ? { notes: notes.slice(0, 300) } : {}) })) });
   });
 
   // ---------- Pengaturan (bobot skor, ambang, disclaimer, LLM, TTL cache) ----------

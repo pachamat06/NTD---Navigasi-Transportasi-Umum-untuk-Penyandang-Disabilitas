@@ -19,6 +19,7 @@ import type { CommuteSource } from "./data/commute/types";
 import { AlternativeService } from "./domain/AlternativeService";
 import { ContentService } from "./domain/content";
 import { FacilityAnalysisService } from "./domain/FacilityAnalysisService";
+import { RouteSyncService } from "./domain/routeSync";
 import { RoutePlannerService } from "./domain/RoutePlannerService";
 import { StationService } from "./domain/StationService";
 import type { Logger } from "./http/middleware";
@@ -34,6 +35,8 @@ export interface Services {
   content: ContentService;
   stations: StationService;
   planner: RoutePlannerService;
+  /** Sinkron pengaturan rute admin dari GTFS / Commute (urutan, waktu, frekuensi, jam layanan). */
+  routeSync: RouteSyncService;
   facilities: FacilityAnalysisService;
   alternatives: AlternativeService;
   tools: ToolRegistry;
@@ -70,9 +73,13 @@ export function createServices(opts: { config: Config; store: Store; log: Logger
   const content = new ContentService(store.content);
   // Pengaturan rute per lini dan arah dari admin (draft hanya untuk pratinjau admin).
   const patterns = async (ctx: RequestContext) => (await content.snapshot(ctx)).routePatterns();
+  // Hub transfer yang dibuat/diubah admin, di atas hub Commute dan hub bawaan NTD.
+  const hubOverrides = async (ctx: RequestContext) => (await content.snapshot(ctx)).hubOverrides();
   const facilities = new FacilityAnalysisService(commute);
-  const stations = new StationService(commute, facilities, patterns);
-  const planner = new RoutePlannerService(commute, gtfs, patterns);
+  const stationStatuses = async (ctx: RequestContext) => (await content.snapshot(ctx)).stationStatuses();
+  const stations = new StationService(commute, facilities, patterns, hubOverrides, stationStatuses);
+  const planner = new RoutePlannerService(commute, gtfs, patterns, hubOverrides);
+  const routeSync = new RouteSyncService(commute, planner, gtfs);
   const alternatives = new AlternativeService(planner, facilities);
   const tools = new ToolRegistry({ stations, planner, facilities, alternatives });
   const guard = new GroundingGuard();
@@ -81,5 +88,5 @@ export function createServices(opts: { config: Config; store: Store; log: Logger
   const vision = new VisionService(config.vision, store.serverConfig, opts.visionFactory);
   const auth = new AuthService(store.admins, config.admin.tokenSecret, config.admin.tokenTtlMinutes);
   const tests = new TestRunner(agent, store.tests);
-  return { config, store, log, source, commute, gtfs, content, stations, planner, facilities, alternatives, tools, guard, llm, agent, vision, auth, tests, startedAt: new Date() };
+  return { config, store, log, source, commute, gtfs, content, stations, planner, routeSync, facilities, alternatives, tools, guard, llm, agent, vision, auth, tests, startedAt: new Date() };
 }

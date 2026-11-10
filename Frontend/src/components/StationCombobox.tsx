@@ -123,6 +123,7 @@ export function StationCombobox({
                   <span className="block text-sm text-[var(--muted)]">
                     {s.operator}
                     {line && ` · ${line.name}`}
+                    {s.inactive && <span className="font-semibold text-[var(--bad)]"> · tidak beroperasi</span>}
                   </span>
                 </span>
               </li>

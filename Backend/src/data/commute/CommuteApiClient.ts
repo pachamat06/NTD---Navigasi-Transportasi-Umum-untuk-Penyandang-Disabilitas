@@ -12,12 +12,14 @@ import { UpstreamError } from "../../errors";
 import type { CacheRepository } from "../../store/types";
 import { directionLabel, jakartaDayHour } from "./HttpCommuteSource";
 import { buildStationIndex, lineIdOf, liveIdsOf, type StationIndex } from "./station-index";
-import type { CommuteSource, UpAmenity, UpExitRef, UpFare, UpHubTransfer, UpLeg, UpLine, UpStation } from "./types";
+import type { CommuteSource, UpAmenity, UpDeparture, UpExitRef, UpFare, UpHubTransfer, UpLeg, UpLine, UpStation } from "./types";
 import type { TjGtfs } from "../gtfs/TjGtfs";
 
 export const DEFAULT_TTL_SECONDS = 24 * 3600;
 /** Data kedaluwarsa masih disajikan (sambil diperbarui) sampai umur ini; lebih tua dari itu ditunggu. */
 export const MAX_STALE_SECONDS = 7 * 24 * 3600;
+/** Jadwal keberangkatan sehari penuh jarang berubah; cukup diperbarui beberapa kali sehari. */
+const TIMETABLE_TTL_SECONDS = 6 * 3600;
 /** Frekuensi bergantung jam, jadi di-cache singkat (sama dengan Commute Data API: 10 menit). */
 const HEADWAY_TTL_SECONDS = 600;
 
@@ -419,6 +421,23 @@ export class CommuteApiClient {
           source: h.source ?? "LINE",
           ...(h.serviceHours ? { serviceHours: "allDay" in h.serviceHours ? "24 jam" : `${h.serviceHours.start}–${h.serviceHours.end}` } : {}),
         });
+    }
+    return out;
+  }
+
+  /**
+   * Jadwal keberangkatan sehari penuh di stasiun `stationId` untuk tiap kode operator stasiun itu (selain TransJakarta,
+   * yang memakai GTFS). [] = dataset tidak menyediakan. Galat dianggap data belum ada agar rute tetap tampil.
+   */
+  async getTimetables(stationId: string, day: "WD" | "SAT" | "SUN", ctx: RequestContext): Promise<{ operator: string; code: string; departures: UpDeparture[] }[]> {
+    const getTimetable = this.source.getTimetable?.bind(this.source);
+    if (!getTimetable) return [];
+    const idx = await this.index(ctx);
+    const out: { operator: string; code: string; departures: UpDeparture[] }[] = [];
+    for (const r of idx.refsOf(stationId)) {
+      if (r.operator.toUpperCase() === "TJ") continue;
+      const rows = await this.cached(`timetable:${r.operator}:${r.code}:${day}`, ctx, TIMETABLE_TTL_SECONDS, () => getTimetable(r.operator, r.code, day)).catch(supplementary);
+      if (rows?.length) out.push({ operator: r.operator, code: r.code, departures: rows });
     }
     return out;
   }

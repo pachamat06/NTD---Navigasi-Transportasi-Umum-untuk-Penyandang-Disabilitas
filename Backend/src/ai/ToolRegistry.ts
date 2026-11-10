@@ -19,6 +19,7 @@ interface Tools {
   cari_stasiun: { in: { query: string }; out: Station[] };
   ambil_rute: { in: { fromId: string; toId: string; viaId?: string; at?: string; avoidModes?: Mode[]; needs?: TransferNeed[] }; out: Route | null };
   lengkapi_rute: { in: { route: Route; at?: string }; out: Route };
+  variasi_rute: { in: { fromId: string; toId: string; avoidModes?: Mode[]; known: Route[]; at?: string; avoid?: string[] }; out: Route[] };
   cek_fasilitas: { in: { stationId: string }; out: Awaited<ReturnType<FacilityAnalysisService["assess"]>> };
   cari_alternatif: {
     in: { originId: string; destinationId: string; route: Route; assessments: Map<string, StationAssessment>; hubs: Hub[]; avoid?: string[]; at?: string; needs?: TransferNeed[] };
@@ -56,6 +57,11 @@ export class ToolRegistry {
         description:
           "Melengkapi rute: jarak dan petunjuk jalan kaki saat pindah, lin paralel yang bisa dinaiki pada ruas yang sama, dan frekuensi kendaraan bila jadwal tidak tersedia (bukan jadwal).",
         input_schema: obj({ at: { type: "string" } }, []),
+      },
+      {
+        name: "variasi_rute",
+        description: "Mencari rute lain antara dua stasiun (paling sedikit pindah, tanpa titik pindah tertentu, jalan kaki minimal) untuk pilihan rute.",
+        input_schema: obj({ fromId: { type: "string" }, toId: { type: "string" } }, ["fromId", "toId"]),
       },
       {
         name: "cek_fasilitas",
@@ -96,6 +102,10 @@ export class ToolRegistry {
       case "lengkapi_rute": {
         const i = input as Tools["lengkapi_rute"]["in"];
         return (await d.planner.annotate(i.route, ctx, i.at)) as Tools[N]["out"];
+      }
+      case "variasi_rute": {
+        const i = input as Tools["variasi_rute"]["in"];
+        return (await d.planner.routeVariants(i.fromId, i.toId, i.avoidModes ?? [], i.known, ctx, i.at, 3, i.avoid ?? [])) as Tools[N]["out"];
       }
       case "cek_fasilitas":
         return (await d.facilities.assess((input as Tools["cek_fasilitas"]["in"]).stationId, ctx, snap)) as Tools[N]["out"];

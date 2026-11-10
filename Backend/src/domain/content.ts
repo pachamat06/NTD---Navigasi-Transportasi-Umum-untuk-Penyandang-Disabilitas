@@ -5,6 +5,7 @@
 import { z } from "zod";
 import type { RequestContext } from "../context";
 import type { ContentItem, ContentKind, ContentRepository } from "../store/types";
+import type { StationStatusContent } from "./stationStatus";
 import { CORE_AMENITIES, EXTRA_AMENITIES, SEGMENT_MEANS, type AmenityDetail, type AmenityType, type AnyAmenityType, type Concourse, type Entrance, type ExtraAmenityType, type Notice, type Platform, type StationInfo } from "./models";
 
 const isoDate = z.string().refine((v) => !Number.isNaN(Date.parse(v)), "harus tanggal ISO 8601");
@@ -41,7 +42,24 @@ export const platformSchema = z.object({
   type: z.enum(["island", "side", "bay"]).optional(),
   tracks: z.array(z.string().min(1).max(10)).max(6).optional(),
   serves: z.array(z.object({ lineId: z.string().min(1).max(80), direction: z.string().max(120).optional() })).max(20).optional(),
-  amenities: z.object({ lift: detailStatus, eskalator: detailStatus, toilet: detailStatus, ramp: detailStatus }).partial().default({}),
+  /**
+   * Fasilitas mobilitas di peron ini. `toilet` hanya diterima dari data lama: toilet adalah informasi umum stasiun
+   * sehingga dipindahkan ke fasilitas stasiun (lihat ContentSnapshot.platformStationFacilities).
+   */
+  amenities: z.object({ lift: detailStatus, eskalator: detailStatus, ramp: detailStatus, guiding_block: detailStatus, toilet: detailStatus }).partial().default({}),
+  /** Akses dari peron ini ke pintu keluar tertentu. */
+  exitAccess: z
+    .array(
+      z.object({
+        gate: z.string().min(1).max(120),
+        via: z.enum(["langsung", "crosswalk", "sebidang", "jpo", "terowongan"]),
+        stepFree: z.boolean().optional(),
+        dedicated: z.boolean().optional(),
+        note: z.string().max(200).optional(),
+      }),
+    )
+    .max(20)
+    .optional(),
   escalators: z.array(escalatorSchema).max(10).optional(),
   lift: liftSchema.optional(),
   gap: z
@@ -137,6 +155,12 @@ export const stationInfoSchema = z.object({
   body: z.string().min(1).max(2000),
 });
 
+/** Status operasional stasiun (satu isian per stasiun): nonaktif = sudah tidak beroperasi, aktif = membatalkan status bawaan. */
+export const stationStatusSchema = z.object({
+  inactive: z.boolean(),
+  note: z.string().trim().max(300).optional(),
+});
+
 /** Titik pada Aset Peta Transit (satuan pt peta FDTJ 2026-08c, 9513.57 x 6726.88). */
 const mapPoint = z.tuple([z.number().min(-500).max(10_500), z.number().min(-500).max(7_500)]);
 
@@ -189,6 +213,8 @@ export const routePatternSchema = z
     /** Frekuensi rata-rata (menit) bila dataset tidak punya. */
     headwayMinutes: z.number().min(1).max(240).optional(),
     serviceHours: z.string().max(60).optional(),
+    /** Ruas cabang/ramp tambahan untuk arah ini (urutan stasiun searah arah ini), mis. cabang dari dataset. */
+    branches: z.array(z.array(z.string().min(1).max(80)).min(2).max(200)).max(20).optional(),
     note: z.string().max(500).optional(),
   })
   .refine((p) => p.stops.every((s, i) => i === 0 || s.stationId !== p.stops[i - 1].stationId), {
@@ -197,6 +223,46 @@ export const routePatternSchema = z
   });
 
 export type RoutePattern = z.infer<typeof routePatternSchema> & { id: string };
+
+/**
+ * Hub transfer dari admin: membuat hub baru atau menggantikan hub dataset dengan `hubId` yang sama (anggota, jalan
+ * kaki antaranggota, nama). `disabled` menghapus hub dataset yang keliru dari perencanaan rute.
+ */
+export const hubSchema = z
+  .object({
+    hubId: z
+      .string()
+      .min(2)
+      .max(60)
+      .regex(/^[a-z0-9][a-z0-9-]*$/, "huruf kecil, angka, dan tanda hubung"),
+    name: z.string().min(1).max(120),
+    kind: z.enum(["hub", "integrated"]).default("hub"),
+    memberIds: z.array(z.string().min(1).max(80)).max(20).default([]),
+    walks: z
+      .array(
+        z.object({
+          from: z.string().min(1).max(80),
+          to: z.string().min(1).max(80),
+          distanceM: z.number().min(0).max(5000),
+          minutes: z.number().min(0).max(120).nullable().optional(),
+          notes: z.string().max(300).optional(),
+        }),
+      )
+      .max(200)
+      .default([]),
+    /** Asal data terakhir: diisi sendiri, atau hasil sinkron dari Commute Data API. */
+    source: z.enum(["manual", "commute"]).default("manual"),
+    syncedAt: isoDate.optional(),
+    disabled: z.boolean().optional(),
+    note: z.string().max(500).optional(),
+  })
+  .refine((h) => h.disabled || new Set(h.memberIds).size >= 2, { message: "hub minimal punya dua anggota", path: ["memberIds"] })
+  .refine((h) => h.walks.every((w) => w.from !== w.to && h.memberIds.includes(w.from) && h.memberIds.includes(w.to)), {
+    message: "jalan kaki hanya antaranggota hub yang berbeda",
+    path: ["walks"],
+  });
+
+export type HubContent = z.infer<typeof hubSchema> & { id: string };
 export type MapTrack = z.infer<typeof mapTrackSchema> & { id: string };
 
 export const DEFAULT_DISCLAIMER =
@@ -259,6 +325,8 @@ export const SCHEMAS: Record<Exclude<ContentKind, "settings">, z.ZodType> = {
   map_stop: mapStopSchema,
   map_track: mapTrackSchema,
   route_pattern: routePatternSchema,
+  hub: hubSchema,
+  station_status: stationStatusSchema,
 };
 
 /** Konten yang terlihat: published untuk pengguna; draft (bila ada) untuk mode pratinjau admin. */
@@ -273,11 +341,15 @@ export class ContentSnapshot {
   private entrances = new Map<string, Entrance[]>();
   private platforms = new Map<string, Platform[]>();
   private concourses = new Map<string, Concourse[]>();
+  /** Status toilet yang dulu diisi per peron (data lama), per stasiun. */
+  private legacyToilet = new Map<string, { code: string; status: AmenityDetail["status"] }[]>();
   private info = new Map<string, StationInfo[]>();
   private noticeList: Notice[] = [];
   private stops = new Map<string, MapStop>();
   private tracks: MapTrack[] = [];
   private patterns = new Map<string, RoutePattern>();
+  private hubs = new Map<string, HubContent>();
+  private statuses = new Map<string, StationStatusContent>();
   readonly settings: Settings;
 
   constructor(items: ContentItem[], preview: boolean, now: Date) {
@@ -305,7 +377,10 @@ export class ContentSnapshot {
           // Satu entri per nomor peron; entri terbaru menang.
           const p = v as z.infer<typeof platformSchema>;
           const list = (this.platforms.get(sid) ?? []).filter((x) => x.code !== p.code);
-          list.push({ ...p, serves: p.serves ?? [], amenities: p.amenities ?? {}, source: "ntd" });
+          // Toilet (data lama) bukan fasilitas peron: dipindahkan ke fasilitas umum stasiun.
+          const { toilet, ...mobility } = p.amenities ?? {};
+          if (toilet) this.legacyToilet.set(sid, [...(this.legacyToilet.get(sid) ?? []).filter((x) => x.code !== p.code), { code: p.code, status: toilet }]);
+          list.push({ ...p, serves: p.serves ?? [], amenities: mobility, source: "ntd" });
           this.platforms.set(sid, list);
           break;
         }
@@ -339,6 +414,18 @@ export class ContentSnapshot {
           this.patterns.set(`${p.lineId}|${p.direction}`, { ...p, id: it.id });
           break;
         }
+        case "station_status": {
+          if (!it.stationId) break;
+          const v2 = v as z.infer<typeof stationStatusSchema>;
+          this.statuses.set(it.stationId, { stationId: it.stationId, inactive: v2.inactive, ...(v2.note ? { note: v2.note } : {}) });
+          break;
+        }
+        case "hub": {
+          // Satu isian per id hub; entri terbaru menang.
+          const h = v as z.infer<typeof hubSchema>;
+          this.hubs.set(h.hubId, { ...h, id: it.id });
+          break;
+        }
         case "map_track":
           this.tracks.push({ ...(v as z.infer<typeof mapTrackSchema>), id: it.id });
           break;
@@ -356,6 +443,11 @@ export class ContentSnapshot {
 
   platformsOf(stationId: string): Platform[] {
     return this.platforms.get(stationId) ?? [];
+  }
+
+  /** Toilet yang dulu diisi per peron (data lama); kini informasi umum stasiun. */
+  legacyPlatformToilet(stationId: string): { code: string; status: AmenityDetail["status"] }[] {
+    return this.legacyToilet.get(stationId) ?? [];
   }
 
   entrancesOf(stationId: string): Entrance[] {
@@ -394,6 +486,16 @@ export class ContentSnapshot {
     return [...this.patterns.values()];
   }
 
+  /** Status operasional stasiun dari admin (nonaktif/aktif kembali). */
+  stationStatuses(): StationStatusContent[] {
+    return [...this.statuses.values()];
+  }
+
+  /** Hub transfer yang dibuat/diubah admin. */
+  hubOverrides(): HubContent[] {
+    return [...this.hubs.values()];
+  }
+
   allNotices(): Notice[] {
     return [...this.noticeList];
   }
@@ -415,14 +517,18 @@ export class ContentService {
 
   constructor(private repo: ContentRepository) {}
 
-  async snapshot(ctx: RequestContext): Promise<ContentSnapshot> {
-    if (ctx.preview) return new ContentSnapshot(await this.repo.list(), true, ctx.now);
+  /**
+   * `at`: waktu yang dipakai menilai isian berjadwal (pengumuman startsAt/endsAt, fasilitas rusak sampai `until`), mis.
+   * waktu berangkat pilihan pengguna. Bawaan: waktu permintaan.
+   */
+  async snapshot(ctx: RequestContext, at: Date = ctx.now): Promise<ContentSnapshot> {
+    if (ctx.preview) return new ContentSnapshot(await this.repo.list(), true, at);
     const version = await this.repo.version();
     // Batas waktu 60 dtk agar pengumuman berjadwal (startsAt/endsAt) tetap ter-evaluasi meski tidak ada publikasi.
     if (!this.cached || this.cached.version !== version || Date.now() - this.cached.at > 60_000) {
       this.cached = { version, at: Date.now(), items: await this.repo.list() };
     }
-    return new ContentSnapshot(this.cached.items, false, ctx.now);
+    return new ContentSnapshot(this.cached.items, false, at);
   }
 
   invalidate(): void {

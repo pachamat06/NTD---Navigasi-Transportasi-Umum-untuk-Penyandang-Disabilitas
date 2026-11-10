@@ -22,6 +22,11 @@ export interface DefaultPattern {
   direction: 0 | 1;
   headsign?: string;
   stops: { stationId: string; minutes: number | null }[];
+  /** Frekuensi rata-rata (menit) dan jam layanan dari sumber data, bila ada. */
+  headwayMinutes?: number;
+  serviceHours?: string;
+  /** Ruas cabang/ramp lini yang tidak tersambung ke urutan arah ini (urutan stasiun searah arah ini). */
+  branches?: string[][];
 }
 
 const dedupe = <T>(xs: T[]) => [...new Set(xs)];
@@ -38,8 +43,13 @@ export function applyPatternsToLines(lines: Line[], patterns: RoutePattern[]): L
   const set = byLine(patterns);
   return lines.map((l) => {
     const ps = set.get(l.id);
-    return ps ? { ...l, stationIds: dedupe(ps.flatMap((p) => p.stops.map((s) => s.stationId))) } : l;
+    return ps ? { ...l, stationIds: dedupe(ps.flatMap((p) => [...p.stops.map((s) => s.stationId), ...(p.branches ?? []).flat()])) } : l;
   });
+}
+
+/** Urutan tiap arah beserta ruas cabangnya (cabang mengikuti arah pengaturannya). */
+function patternSequences(ps: RoutePattern[]): string[][] {
+  return ps.flatMap((p) => [p.stops.map((x) => x.stationId), ...(p.branches ?? []).filter((b) => b.length >= 2)]);
 }
 
 /**
@@ -54,10 +64,10 @@ export function applyPatternsToSequences(sequences: LineSequences[], patterns: R
     const ps = set.get(s.lineId);
     if (!ps) return s;
     set.delete(s.lineId);
-    return { lineId: s.lineId, sequences: ps.map((p) => p.stops.map((x) => x.stationId)), directed: ps.length > 1 };
+    return { lineId: s.lineId, sequences: patternSequences(ps), directed: ps.length > 1 };
   });
   // Lini yang tidak punya urutan bawaan tetapi diatur admin.
-  for (const [lineId, ps] of set) out.push({ lineId, sequences: ps.map((p) => p.stops.map((x) => x.stationId)), directed: ps.length > 1 });
+  for (const [lineId, ps] of set) out.push({ lineId, sequences: patternSequences(ps), directed: ps.length > 1 });
   return out;
 }
 
@@ -111,10 +121,38 @@ function collapse(stops: { stationId: string; minutes: number | null }[]) {
 
 const tenth = (secs: number) => Math.round(secs / 6) / 10;
 
+const clockMin = (hhmm: string) => {
+  const [h, m] = hhmm.split(":").map(Number);
+  return h * 60 + (m || 0);
+};
+
+/**
+ * Frekuensi rata-rata (menit, ditimbang lama tiap jendela) dan jam layanan dari jendela frekuensi GTFS
+ * ([mulai, selesai, headway detik]). Jendela 00:00–23:59 berarti layanan 24 jam.
+ */
+export function gtfsFrequency(freq: [string, string, number][]): { headwayMinutes?: number; serviceHours?: string } {
+  const wins = freq.filter(([a, b, h]) => h > 0 && clockMin(b) > clockMin(a));
+  if (!wins.length) return {};
+  let span = 0;
+  let sum = 0;
+  for (const [a, b, h] of wins) {
+    const len = clockMin(b) - clockMin(a);
+    span += len;
+    sum += len * (h / 60);
+  }
+  const start = Math.min(...wins.map(([a]) => clockMin(a)));
+  const end = Math.max(...wins.map(([, b]) => clockMin(b)));
+  const fmt = (m: number) => `${String(Math.floor(m / 60)).padStart(2, "0")}:${String(m % 60).padStart(2, "0")}`;
+  return {
+    headwayMinutes: Math.min(240, Math.max(1, Math.round(sum / span))),
+    serviceHours: start === 0 && end >= 23 * 60 + 59 ? "24 jam" : `${fmt(start)}–${fmt(end)}`,
+  };
+}
+
 /**
  * Rute bawaan dua arah dari GTFS Transjakarta untuk koridor `code`: pola reguler terpanjang sebagai arah 0, dan
  * pola terpanjang yang berjalan berlawanan sebagai arah 1. Waktu tempuh = selisih jadwal tiba dan berangkat
- * antarhalte (menit, satu desimal).
+ * antarhalte (menit, satu desimal); frekuensi dan jam layanan dari jendela frekuensi pola itu.
  */
 export function defaultsFromGtfs(gtfs: TjGtfs, code: string, idOf: (code: string) => string): DefaultPattern[] {
   const all = gtfs.patterns(code);
@@ -123,6 +161,7 @@ export function defaultsFromGtfs(gtfs: TjGtfs, code: string, idOf: (code: string
     direction,
     headsign: p.headsign,
     stops: collapse(p.stops.map((c, i) => ({ stationId: idOf(c), minutes: i ? tenth(p.arr[i] - p.dep[i - 1]) : null }))),
+    ...gtfsFrequency(p.freq),
   });
   const rank = (a: TjGtfsPattern, b: TjGtfsPattern) => Number(b.trip.includes("-R")) - Number(a.trip.includes("-R")) || b.stops.length - a.stops.length;
   const sorted = [...all].sort(rank);
@@ -141,13 +180,55 @@ export function defaultsFromGtfs(gtfs: TjGtfs, code: string, idOf: (code: string
 }
 
 /**
- * Rute bawaan dua arah dari Commute Data API: batang utama lin sebagai arah 0 dan kebalikannya sebagai arah 1.
- * Commute tidak memuat waktu tempuh antarstasiun, jadi waktunya kosong. Ruas cabang/ramp satu arah
- * dikembalikan terpisah agar admin bisa menambahkannya ke arah yang benar.
+ * Sambungkan ruas cabang yang berawal di ujung akhir (atau berakhir di ujung awal) urutan ke urutan itu, berulang.
+ * Mis. Lin Cikarang: Cikarang → Jatinegara, lalu putaran Jatinegara → Kampung Bandan → Manggarai → Jatinegara menjadi
+ * satu urutan, karena keretanya memang berjalan terus. Cabang lain dikembalikan apa adanya.
+ */
+export function chainBranches(trunk: string[], branches: string[][]): { trunk: string[]; branches: string[][] } {
+  let main = [...trunk];
+  const rest = branches.filter((b) => b.length >= 2).map((b) => [...b]);
+  for (let changed = true; changed; ) {
+    changed = false;
+    for (let i = 0; i < rest.length; i++) {
+      const b = rest[i];
+      if (b[0] === main[main.length - 1]) main = [...main, ...b.slice(1)];
+      else if (b[b.length - 1] === main[0]) main = [...b.slice(0, -1), ...main];
+      else continue;
+      rest.splice(i, 1);
+      changed = true;
+      break;
+    }
+  }
+  return { trunk: main, branches: rest };
+}
+
+/** Pasangan stasiun bersebelahan (tanpa arah) pada urutan-urutan. */
+function pairsOf(seqs: string[][]): Set<string> {
+  const out = new Set<string>();
+  for (const q of seqs) for (let i = 1; i < q.length; i++) out.add([q[i - 1], q[i]].sort().join("|"));
+  return out;
+}
+
+/**
+ * Lampirkan ruas cabang dataset ke pola dua arah: arah 0 memakai urutan cabang apa adanya, arah 1 kebalikannya,
+ * sehingga cabang tetap bisa dilalui dua arah seperti pada data bawaan. Cabang yang semua ruasnya sudah ada di
+ * urutan pola tidak dilampirkan.
+ */
+export function attachBranches(patterns: DefaultPattern[], branches: string[][]): DefaultPattern[] {
+  const covered = pairsOf(patterns.map((p) => p.stops.map((s) => s.stationId)));
+  const extra = branches.filter((b) => b.length >= 2 && [...pairsOf([b])].some((k) => !covered.has(k)));
+  if (!extra.length) return patterns;
+  return patterns.map((p) => ({ ...p, branches: p.direction === 0 ? extra.map((b) => [...b]) : extra.map((b) => [...b].reverse()) }));
+}
+
+/**
+ * Urutan bawaan dua arah dari Commute Data API: batang utama lin (disambung dengan cabang yang berawal di ujungnya,
+ * mis. putaran Lin Cikarang) sebagai arah 0 dan kebalikannya sebagai arah 1. /lines tidak memuat waktu tempuh; waktu,
+ * frekuensi, dan jam layanan dilengkapi RouteSyncService. Cabang/ramp lain dikembalikan terpisah sebagai `branches`.
  */
 export function defaultsFromSequences(seq: LineSequences | undefined): { patterns: DefaultPattern[]; branches: string[][] } {
   if (!seq?.sequences.length) return { patterns: [], branches: [] };
-  const [trunk, ...branches] = seq.sequences;
+  const { trunk, branches } = chainBranches(seq.sequences[0], seq.sequences.slice(1));
   const stops = (ids: string[]) => ids.map((stationId) => ({ stationId, minutes: null }));
   return {
     patterns: [

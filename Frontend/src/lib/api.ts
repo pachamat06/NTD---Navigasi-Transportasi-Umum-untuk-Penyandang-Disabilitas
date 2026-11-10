@@ -23,13 +23,20 @@ export const fetchMeta = () => call<Meta>("/api/meta");
 export const fetchNotices = () => call<Notice[]>("/api/notices");
 export const fetchStationDetail = (id: string) => call<StationDetailData>(`/api/stations/${encodeURIComponent(id)}`);
 
-export function planJourney(originId: string, destinationId: string, opts: { avoid?: string[]; avoidModes?: Mode[]; needs?: TransferNeed[]; signal?: AbortSignal } = {}) {
+export function planJourney(
+  originId: string,
+  destinationId: string,
+  opts: { avoid?: string[]; avoidModes?: Mode[]; needs?: TransferNeed[]; entranceId?: string; exitId?: string; at?: string; signal?: AbortSignal } = {},
+) {
   const body = {
     originId,
     destinationId,
     ...(opts.avoid?.length ? { avoid: opts.avoid } : {}),
     ...(opts.avoidModes?.length ? { avoidModes: opts.avoidModes } : {}),
     ...(opts.needs?.length ? { needs: opts.needs } : {}),
+    ...(opts.entranceId ? { entranceId: opts.entranceId } : {}),
+    ...(opts.exitId ? { exitId: opts.exitId } : {}),
+    ...(opts.at ? { at: opts.at } : {}),
   };
   return call<JourneyPlan>("/api/plan", { method: "POST", body: JSON.stringify(body), signal: opts.signal });
 }

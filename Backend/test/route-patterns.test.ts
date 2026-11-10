@@ -70,8 +70,12 @@ describe("pengaturan rute per arah", () => {
       { direction: 0, headsign: "C", stops: [{ stationId: "a", minutes: null }, { stationId: "b", minutes: 2 }, { stationId: "c", minutes: 2.5 }] },
       { direction: 1, headsign: "A", stops: [{ stationId: "c", minutes: null }, { stationId: "a", minutes: 6.7 }] },
     ]);
-    const c = defaultsFromSequences({ lineId: "x", sequences: [["a", "b"], ["b", "z"]] });
-    expect(c.patterns.map((p) => p.stops.map((s) => s.stationId))).toEqual([["a", "b"], ["b", "a"]]);
+    // Cabang yang berawal di ujung batang utama disambung (mis. putaran Lin Cikarang); cabang lain tetap terpisah.
+    const c = defaultsFromSequences({ lineId: "x", sequences: [["a", "b", "c"], ["b", "z"], ["c", "d", "c2", "c"]] });
+    expect(c.patterns.map((p) => p.stops.map((s) => s.stationId))).toEqual([
+      ["a", "b", "c", "d", "c2", "c"],
+      ["c", "c2", "d", "c", "b", "a"],
+    ]);
     expect(c.branches).toEqual([["b", "z"]]);
   });
 

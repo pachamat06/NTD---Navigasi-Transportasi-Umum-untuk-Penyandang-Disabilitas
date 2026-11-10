@@ -8,6 +8,7 @@ import {
   CORE_AMENITIES,
   EXTRA_AMENITIES,
   LEVEL_CONNECTIONS,
+  PLATFORM_AMENITIES,
   isStepFree,
   type AccessSegment,
   type AccessVia,
@@ -18,9 +19,11 @@ import {
   type Concourse,
   type ConcourseRoute,
   type Entrance,
+  type GateChoice,
   type GatePlatformLink,
   type LayoutAccess,
   type Platform,
+  type PlatformAmenityType,
   type PlatformConnection,
   type ScoreFactor,
   type SegmentMeans,
@@ -68,13 +71,21 @@ export class FacilityAnalysisService {
     }
     const overrides = snap.facilityOverrides(stationId);
     for (const o of overrides) details.set(o.type, o);
+    // Fasilitas yang diisi pada peron otomatis mengisi fasilitas umum stasiun (peron punya lift = stasiun punya lift).
+    const derived = fromPlatforms(snap.platformsOf(stationId), snap.legacyPlatformToilet(stationId));
+    for (const d of derived) {
+      const cur = details.get(d.type);
+      // Isian tim untuk stasiun yang menyatakan sedang tidak berfungsi tetap dipakai.
+      if (cur?.source === "ntd" && cur.status === "out_of_service") continue;
+      if (d.status === "available" ? cur?.status !== "available" : !cur || cur.status === "unknown") details.set(d.type, d);
+    }
 
     const amenities = {} as Record<AmenityType, AmenityStatus>;
     for (const t of CORE_AMENITIES) {
       const d = details.get(t);
       amenities[t] = !d ? "unknown" : d.status === "out_of_service" ? "absent" : d.status;
     }
-    const dataAvailable = !!dataset || overrides.some((o) => (CORE_AMENITIES as readonly string[]).includes(o.type) && o.status !== "unknown");
+    const dataAvailable = !!dataset || [...overrides, ...derived].some((o) => (CORE_AMENITIES as readonly string[]).includes(o.type) && o.status !== "unknown");
     return { amenities, amenityDetails: [...details.values()], dataAvailable };
   }
 
@@ -82,12 +93,20 @@ export class FacilityAnalysisService {
     const f = await this.facilities(stationId, ctx, snap);
     // Jalur gate ke peron dan celah peron dari isian tim. Peron dataset ikut diperiksa, tetapi hanya untuk stasiun yang
     // sudah diisi tim, agar daftar stasiun tidak memicu permintaan peron untuk ratusan stasiun.
-    const entrances = snap.entrancesOf(stationId);
     const concourses = snap.concoursesOf(stationId);
     const own = snap.platformsOf(stationId);
-    const linked = [...entrances.flatMap((e) => (e.platformLinks ?? []).map((l) => l.platform)), ...concourses.flatMap((c) => c.platformLinks.map((l) => l.platform))];
+    const ntdEntrances = snap.entrancesOf(stationId);
+    const linked = [
+      ...ntdEntrances.flatMap((e) => (e.platformLinks ?? []).map((l) => l.platform)),
+      ...concourses.flatMap((c) => c.platformLinks.map((l) => l.platform)),
+      ...own.flatMap((p) => (p.exitAccess?.length ? [p.code] : [])),
+    ];
     const surveyed = own.length > 0 || linked.length > 0;
-    const dataset = surveyed ? await this.commute.getPlatforms(stationId, ctx).catch(() => [] as Platform[]) : [];
+    const [dataset, exits] = surveyed
+      ? await Promise.all([this.commute.getPlatforms(stationId, ctx).catch(() => [] as Platform[]), this.commute.getExits(stationId, ctx).catch(() => [] as Entrance[])])
+      : [[] as Platform[], [] as Entrance[]];
+    // Pintu dataset ikut dipakai agar akses peron ke "Pintu A" dari data peron menempel ke pintu yang sama dengan detail stasiun.
+    const entrances = applyPlatformExits(mergeGates(exits, ntdEntrances), own);
     const codes = [...new Set([...dataset.map((p) => p.code), ...own.map((p) => p.code), ...linked])];
     // Bila ada peron yang belum diketahui jalurnya, faktor jalur diabaikan: skor memakai bobot fasilitas biasa.
     const layout = layoutAccess(entrances, codes, concourses);
@@ -122,6 +141,82 @@ export class FacilityAnalysisService {
 }
 
 const VERTICAL: AmenityType[] = ["lift", "eskalator"];
+
+const STATUS_ORDER: Record<AmenityDetailStatus, number> = { out_of_service: 0, absent: 1, unknown: 2, available: 3 };
+
+/**
+ * Fasilitas umum stasiun dari isian peron: fasilitas mobilitas yang tersedia di peron mana pun (termasuk lift dan
+ * eskalator yang dicatat jumlahnya) berarti stasiun itu memilikinya. Bila semua peron yang diisi mencatat tidak ada,
+ * status itu dipakai hanya bila stasiun belum punya data. Toilet dari data lama per peron dipindahkan ke stasiun.
+ */
+export function fromPlatforms(platforms: Platform[], legacyToilet: { code: string; status: AmenityDetailStatus }[] = []): AmenityDetail[] {
+  const out: AmenityDetail[] = [];
+  const statusOf = (p: Platform, t: PlatformAmenityType): AmenityDetailStatus | undefined => {
+    const own = p.amenities[t];
+    if (own) return own;
+    if (t === "lift" && p.lift) return p.lift.count > 0 ? (p.lift.status ?? "available") : "absent";
+    if (t === "eskalator" && p.escalators?.length) return p.escalators.some((g) => !g.status || g.status === "available") ? "available" : (p.escalators[0].status ?? "available");
+    return undefined;
+  };
+  for (const t of PLATFORM_AMENITIES) {
+    const known = platforms.flatMap((p) => {
+      const st = statusOf(p, t);
+      return st ? [{ code: p.code, st }] : [];
+    });
+    if (!known.length) continue;
+    const yes = known.filter((k) => k.st === "available");
+    if (yes.length) out.push({ type: t, status: "available", source: "ntd", note: `Dari data peron ${yes.map((k) => k.code).join(", ")}.` });
+    else {
+      const best = known.reduce((a, b) => (STATUS_ORDER[b.st] > STATUS_ORDER[a.st] ? b : a));
+      out.push({ type: t, status: best.st, source: "ntd", note: `Dari data peron ${known.map((k) => k.code).join(", ")}.` });
+    }
+  }
+  if (legacyToilet.length) {
+    const best = legacyToilet.reduce((a, b) => (STATUS_ORDER[b.status] > STATUS_ORDER[a.status] ? b : a));
+    out.push({ type: "toilet", status: best.status, source: "ntd" });
+  }
+  return out;
+}
+
+/** Pintu dataset (/exits) yang belum dilengkapi tim ikut dipakai; yang sudah dilengkapi memakai isian tim. */
+export function mergeGates(dataset: Entrance[], ntd: Entrance[]): Entrance[] {
+  const refOf = (e: Entrance) => e.id.slice(e.id.lastIndexOf(":") + 1);
+  const covered = new Set(ntd.flatMap((e) => (e.exitRef ? [e.exitRef] : [])));
+  const filled = ntd.map((e) => {
+    const d = e.exitRef ? dataset.find((x) => refOf(x) === e.exitRef) : undefined;
+    return d?.signs && !e.signs ? { ...e, signs: d.signs } : e;
+  });
+  return [...filled, ...dataset.filter((d) => !covered.has(refOf(d)))];
+}
+
+const gateKey = (x: string) => x.toLowerCase().replace(/^(pintu|gate|exit)\s+/, "").replace(/[^a-z0-9]+/g, " ").trim();
+
+/**
+ * Akses peron ke pintu keluar tertentu (isian data peron) digabung ke data gate sebagai jalur gate → peron. Pintu
+ * dicocokkan lewat nama, `exitRef`, atau nama pintu dataset ("Pintu A" = "A"); pintu yang belum ada dibuat sebagai
+ * gate isian tim. Jalur yang sudah dicatat pada gate tidak ditimpa.
+ */
+export function applyPlatformExits(entrances: Entrance[], platforms: Platform[]): Entrance[] {
+  const list = entrances.map((e) => ({ ...e, platformLinks: [...(e.platformLinks ?? [])] }));
+  const stationId = list[0]?.stationId ?? "";
+  for (const p of platforms)
+    for (const a of p.exitAccess ?? []) {
+      const key = gateKey(a.gate);
+      let gate = list.find((e) => gateKey(e.name) === key || (e.exitRef && gateKey(e.exitRef) === key) || gateKey(e.name.replace(/\s*\(.*\)$/, "")) === key);
+      if (!gate) {
+        gate = { id: `peron:${p.code}:${key}`, stationId, name: a.gate, accessible: true, features: [], source: "ntd", platformLinks: [] };
+        list.push(gate);
+      }
+      if (gate.platformLinks.some((l) => l.platform === p.code)) continue;
+      gate.platformLinks.push({ platform: p.code, via: a.via, ...(a.stepFree ? { stepFree: true } : {}), ...(a.dedicated ? { dedicated: true } : {}), ...(a.note ? { note: a.note } : {}) });
+    }
+  // Gate yang semula tanpa platformLinks dan tidak mendapat jalur baru dikembalikan tanpa field itu.
+  return list.map((e, i) => {
+    if (e.platformLinks.length || entrances[i]?.platformLinks) return e;
+    const { platformLinks: _, ...rest } = e;
+    return rest;
+  });
+}
 
 /** Kebutuhan pengguna terpenuhi: fasilitasnya tersedia, atau lift/eskalator tidak dibutuhkan karena semua peron dicapai tanpa anak tangga. */
 export function needMet(need: AmenityType, amenities: Record<AmenityType, AmenityStatus>, layout?: LayoutAccess): boolean {
@@ -337,6 +432,66 @@ function gapPenalty(platforms: (Platform | undefined)[], snap: ContentSnapshot):
   return worst;
 }
 
+/** Jalur satu gate ke peron-peron yang dipakai (jalur terburuk di antara jalur terbaik tiap peron); undefined bila belum didata. */
+function gatePath(gate: Entrance, codes: string[], concourses: Concourse[]): PathOption | undefined {
+  let worst: PathOption | undefined;
+  for (const code of codes) {
+    const paths = platformPaths([gate], code, concourses);
+    if (!paths.length) return undefined;
+    const best = paths.reduce((x, y) => (y.rank < x.rank ? y : x));
+    if (!worst || best.rank > worst.rank) worst = best;
+  }
+  return worst;
+}
+
+/** Peringkat gate untuk peron yang dipakai: jalur (lebih kecil lebih baik), ditambah bila gate tidak aksesibel dari jalan. */
+const gateRank = (gate: Entrance, path: PathOption) => path.rank + (gate.accessible || path.dedicated ? 0 : 4);
+
+const LIFT_REASON: Record<AmenityDetailStatus, string> = { available: "", absent: "tanpa lift", unknown: "lift belum ada datanya", out_of_service: "lift sedang tidak berfungsi" };
+
+/** Alasan singkat sebuah gate kurang aksesibel dibanding gate yang disarankan. */
+function gateReason(gate: Entrance, path: PathOption, liftAt: AmenityDetailStatus | undefined): string {
+  const parts: string[] = [];
+  if (!path.level) {
+    const lift = path.pathLift ?? liftAt;
+    parts.push(`harus ${viaText(path).replace(/^lewat /, "lewat ")}${lift && lift !== "available" ? ` (${LIFT_REASON[lift]})` : ""}`);
+  } else if (path.via === "sebidang" || path.via === "crosswalk") parts.push(`harus ${VIA_LABEL[path.via].replace(/^lewat /, "lewat ")}`);
+  if (!gate.accessible && !path.dedicated) parts.push("pintunya belum ditandai aksesibel");
+  return parts.join(" dan ") || "jalurnya lebih sulit";
+}
+
+/**
+ * Pintu pilihan pengguna untuk masuk (asal) atau keluar (tujuan): skor memakai jalur pintu itu ke peron yang dipakai,
+ * dan pintu lain yang jalurnya lebih mudah (tanpa pindah lantai, ber-lift, atau aksesibel dari jalan) disarankan.
+ * Bila jalur pintu pilihan belum didata, skor memakai pintu terbaik dan pintu terbaik itu disarankan.
+ */
+export function gateChoice(d: Pick<StationDetail, "entrances" | "concourses">, codes: string[], chosenId: string, role: GateChoice["role"], liftAt?: AmenityDetailStatus): { choice: GateChoice; entrances?: Entrance[] } | undefined {
+  const chosen = d.entrances.find((e) => e.id === chosenId);
+  if (!chosen) return undefined;
+  const concourses = d.concourses ?? [];
+  const ranked = d.entrances
+    .flatMap((g) => {
+      const p = codes.length ? gatePath(g, codes, concourses) : undefined;
+      return p ? [{ g, p, r: gateRank(g, p) }] : [];
+    })
+    .sort((a, b) => a.r - b.r);
+  const mine = ranked.find((x) => x.g.id === chosenId);
+  const best = ranked[0];
+  const base: GateChoice = { role, chosenId, chosen: chosen.name, known: !!mine };
+  // Disarankan bila jalur pintu lain jelas lebih mudah (selisih peringkat ≥ 2: mis. langsung vs JPO, gate aksesibel vs tidak).
+  const better = best && best.g.id !== chosenId && (!mine || mine.r - best.r >= 2) ? best : undefined;
+  const choice: GateChoice = better
+    ? {
+        ...base,
+        recommendedId: better.g.id,
+        recommended: better.g.name,
+        reason: mine ? gateReason(chosen, mine.p, liftAt) : "jalurnya ke peron belum didata",
+        recommendedVia: viaText(better.p).replace(/^lewat /, "lewat "),
+      }
+    : base;
+  return { choice, ...(mine ? { entrances: [chosen] } : {}) };
+}
+
 /**
  * Skor stasiun untuk satu perjalanan. Bila semua peron yang dipakai dapat dicapai dari gate tanpa anak tangga
  * (langsung, crosswalk, pelintasan sebidang, atau JPO/terowongan beramp), lift dan eskalator tidak dibutuhkan sehingga
@@ -347,31 +502,49 @@ function gapPenalty(platforms: (Platform | undefined)[], snap: ContentSnapshot):
  * diabaikan (bobot fasilitas biasa). Celah peron yang dipakai memotong skor; celah peron lain di stasiun tidak.
  * Tanpa data jalur maupun celah peron, skor stasiun dipakai apa adanya.
  */
-export function journeyAssessment(a: StationAssessment, d: StationDetail, codes: string[], snap: ContentSnapshot): StationAssessment {
-  if (!codes.length) return a;
-  const layout = layoutAccess(d.entrances, codes, d.concourses ?? []);
+export function journeyAssessment(
+  a: StationAssessment,
+  d: StationDetail,
+  codes: string[],
+  snap: ContentSnapshot,
+  gate?: { id: string; role: GateChoice["role"] },
+): StationAssessment {
+  if (!codes.length) return gate ? withGateOnly(a, d, gate) : a;
+  // Pintu pilihan pengguna: jalur pintu itu yang dinilai (bila sudah didata).
+  const chosen = gate ? gateChoice(d, codes, gate.id, gate.role, d.amenities.lift) : undefined;
+  const layout = layoutAccess(chosen?.entrances ?? d.entrances, codes, d.concourses ?? []);
   const platforms = codes.map((c) => d.platforms.find((p) => p.code === c));
   const penalty = gapPenalty(platforms, snap);
   // Skor stasiun mungkin memuat jalur atau celah peron lain, jadi dihitung ulang dari peron yang dipakai.
-  if (!layout && !penalty && !a.layout && !a.penalties?.length) return a;
+  if (!layout && !penalty && !a.layout && !a.penalties?.length && !chosen) return a;
+  const fromStation = new Set<AmenityType>();
   const statusOf = (t: AmenityType): AmenityStatus => {
     // Jalur lewat concourse yang pindah lantai: lift/eskalator ruas itu yang dipakai.
     const path = pathStatus(layout, t);
     if (path) return path;
-    const own = platforms.map((p) => p?.amenities[t]);
+    // Toilet dan fasilitas umum lain selalu dari data stasiun; fasilitas mobilitas dari peron bila sudah diisi.
+    if (!(PLATFORM_AMENITIES as readonly string[]).includes(t)) return d.amenities[t];
+    const own = platforms.map((p) => p?.amenities[t as PlatformAmenityType]);
     // Fasilitas peron dipakai bila tersedia untuk semua peron yang dipakai; status terburuk yang dihitung.
     if (own.every((x) => x)) return own.some((x) => x !== "available") ? (own.includes("unknown") ? "unknown" : "absent") : "available";
+    // Detail peron belum ada: dihitung dari fasilitas umum stasiun.
+    fromStation.add(t);
     return d.amenities[t];
   };
   const level = !!layout?.level;
   const excluded = level ? VERTICAL : [];
   const penalties = penalty ? [penalty] : [];
   const { score, factors } = computeScore({ statusOf, details: d.amenityDetails, excluded, penalties }, snap);
+  const lift = level ? undefined : statusOf("lift");
+  // Lift/eskalator yang tidak dibutuhkan tidak dicatat sebagai "dari data stasiun".
+  const derived = [...fromStation].filter((t) => !excluded.includes(t));
   // Catatan jalur dan celah peron tingkat stasiun diganti dengan yang untuk peron yang dipakai.
   const stationPenalties = new Set((a.penalties ?? []).map(penaltyNote));
   const notes = (a.notes ?? []).filter((n) => !n.startsWith(STATION_NOTE) && !stationPenalties.has(n));
   if (layout) notes.push(layoutNote(JOURNEY_NOTE, `peron ${codes.join(", ")}`, layout));
+  if (layout && !level && derived.some((t) => VERTICAL.includes(t))) notes.push(`Fasilitas peron ${codes.join(", ")} belum diisi tim; lift dan eskalator dihitung dari fasilitas umum stasiun.`);
   if (penalty) notes.push(penaltyNote(penalty));
+  if (chosen && !chosen.choice.known) notes.push(`Jalur dari ${chosen.choice.chosen} ke peron ${codes.join(", ")} belum didata; skor memakai pintu dengan jalur terbaik.`);
   const { penalties: _, layout: __, ...rest } = a;
   return {
     ...rest,
@@ -380,6 +553,16 @@ export function journeyAssessment(a: StationAssessment, d: StationDetail, codes:
     factors,
     ...(penalties.length ? { penalties } : {}),
     notes,
-    ...(layout ? { journey: { ...layout, platforms: codes, excluded, ...(level ? {} : { lift: statusOf("lift") }), stationScore: a.score } } : {}),
+    ...(layout
+      ? { journey: { ...layout, platforms: codes, excluded, ...(lift ? { lift } : {}), ...(derived.length ? { fromStation: derived } : {}), stationScore: a.score } }
+      : {}),
+    ...(chosen ? { gateChoice: chosen.choice } : {}),
   };
+}
+
+/** Pintu pilihan di stasiun yang peron perjalanannya tidak diketahui: dinilai terhadap semua peron stasiun. */
+function withGateOnly(a: StationAssessment, d: StationDetail, gate: { id: string; role: GateChoice["role"] }): StationAssessment {
+  const codes = a.layout?.platforms ?? d.platforms.map((p) => p.code);
+  const chosen = gateChoice(d, codes, gate.id, gate.role, d.amenities.lift);
+  return chosen ? { ...a, gateChoice: chosen.choice } : a;
 }

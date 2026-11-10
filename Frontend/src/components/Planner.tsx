@@ -1,11 +1,11 @@
 "use client";
 
 import { useEffect, useRef, useState } from "react";
-import { fetchNotices, planJourney } from "@/lib/api";
+import { fetchNotices, fetchStationDetail, planJourney } from "@/lib/api";
 import { useNetwork } from "@/lib/network";
-import type { Alternative, JourneyPlan, Mode, Notice, TransferNeed } from "@/lib/types";
+import type { Alternative, Entrance, GateChoice, JourneyPlan, Mode, Notice, TransferNeed } from "@/lib/types";
 import { AboutDialog, SettingsDialog, StationDetail, type DisplaySettings } from "./Dialogs";
-import { NoticeBanner, ResultPanel } from "./ResultPanel";
+import { NoticeBanner, planForOption, ResultPanel } from "./ResultPanel";
 import { StationCombobox } from "./StationCombobox";
 import { TransitMap } from "./TransitMap";
 
@@ -41,6 +41,29 @@ const MODE_ORDER: Mode[] = ["RAIL", "SUBWAY", "TRAM", "BUS", "MONORAIL"];
 const MODE_LABEL: Record<Mode, string> = { RAIL: "KRL", SUBWAY: "MRT", TRAM: "LRT", BUS: "TransJakarta", MONORAIL: "Kalayang" };
 const NEED_LABEL: Record<TransferNeed, string> = { lift: "Lift", eskalator: "Eskalator", ramp: "Ramp" };
 
+const WIB = 7 * 3600_000;
+const DAY = 86_400_000;
+/** Tanggal (YYYY-MM-DD) dan jam (HH:MM) WIB untuk waktu `ms`. */
+const wibParts = (ms: number) => {
+  const iso = new Date(ms + WIB).toISOString();
+  return { date: iso.slice(0, 10), time: iso.slice(11, 16) };
+};
+/** Isian awal "pilih waktu": sekarang, dibulatkan ke 5 menit berikutnya (WIB). */
+const nextFiveMinutes = () => wibParts(Math.ceil(Date.now() / 300_000) * 300_000);
+/** Waktu ISO dari tanggal dan jam WIB pilihan pengguna; undefined bila belum lengkap. */
+const departIso = (date: string, time: string) => (/^\d{4}-\d{2}-\d{2}$/.test(date) && /^\d{2}:\d{2}$/.test(time) ? `${date}T${time}:00+07:00` : undefined);
+/** Batas yang diterima Backend: paling awal 1 hari lalu, paling lambat 90 hari lagi. */
+function departProblem(iso: string | undefined, now: number): string | null {
+  if (!iso) return "Isi tanggal dan jam berangkat.";
+  const t = Date.parse(iso);
+  if (Number.isNaN(t)) return "Tanggal atau jam berangkat tidak valid.";
+  if (t < now - DAY) return "Waktu berangkat paling awal kemarin.";
+  if (t > now + 90 * DAY) return "Waktu berangkat paling lambat 90 hari lagi.";
+  return null;
+}
+const longDate = (iso: string) =>
+  new Date(iso).toLocaleString("id-ID", { weekday: "long", day: "numeric", month: "long", hour: "2-digit", minute: "2-digit", timeZone: "Asia/Jakarta" });
+
 export function Planner() {
   const { stationById, lineById, hubById, meta, lines } = useNetwork();
   // Moda yang ada di jaringan, urut tetap agar pilihan tidak berpindah tempat.
@@ -48,6 +71,14 @@ export function Planner() {
   const [avoidModes, setAvoidModes] = useState<Mode[]>([]);
   // Fasilitas yang wajib ada di titik pindah; Backend mencari transfer lain bila tidak terpenuhi.
   const [needs, setNeeds] = useState<TransferNeed[]>([]);
+  // Waktu berangkat: sekarang, atau tanggal dan jam tertentu (WIB). Jadwal dan rute tercepat dihitung dari waktu ini.
+  const [timeMode, setTimeMode] = useState<"now" | "at">("now");
+  const [departDate, setDepartDate] = useState("");
+  const [departTime, setDepartTime] = useState("");
+  // Waktu saat pengguna terakhir mengubah pilihan waktu: acuan batas tanggal (render tidak membaca jam).
+  const [timeRef, setTimeRef] = useState(0);
+  const chosenAt = timeMode === "at" ? departIso(departDate, departTime) : undefined;
+  const timeProblem = timeMode === "at" ? departProblem(chosenAt, timeRef) : null;
   const noticeTarget = (n: Notice) =>
     n.scope === "station" ? stationById(n.targetId ?? "")?.name : n.scope === "line" ? lineById(n.targetId ?? "")?.name : n.scope === "hub" ? `Hub ${hubById(n.targetId ?? "")?.name ?? n.targetId}` : undefined;
   const [origin, setOrigin] = useState<string | null>(null);
@@ -58,6 +89,13 @@ export function Planner() {
   const [settingsOpen, setSettingsOpen] = useState(false);
   const [settings, setSettings] = useState<DisplaySettings>(DEFAULT_SETTINGS);
   const [notices, setNotices] = useState<Notice[]>([]);
+  // Pintu masuk (asal) dan keluar (tujuan) pilihan pengguna; kosong = otomatis (jalur paling aksesibel).
+  const [entranceId, setEntranceId] = useState("");
+  const [exitId, setExitId] = useState("");
+  const originGates = useGates(origin);
+  const destinationGates = useGates(destination);
+  // Pilihan rute yang ditampilkan (0 = paling aksesibel).
+  const [optionIndex, setOptionIndex] = useState(0);
   const runId = useRef(0);
   const mapRef = useRef<HTMLDivElement>(null);
   const resultRef = useRef<HTMLDivElement>(null);
@@ -90,14 +128,17 @@ export function Planner() {
   }, [settings]);
 
   const sameStation = origin !== null && origin === destination;
-  const canSearch = origin !== null && destination !== null && !sameStation;
+  // Stasiun yang sudah tidak beroperasi (ditandai tim NTD) tidak bisa dipakai untuk rute.
+  const closed = [origin, destination].map((id) => (id ? stationById(id) : undefined)).filter((s) => s?.inactive);
+  const canSearch = origin !== null && destination !== null && !sameStation && !timeProblem && closed.length === 0;
   const wait = (ms: number) => new Promise((r) => setTimeout(r, settings.reduceMotion ? 0 : ms));
 
-  async function search(avoid: string[] = []) {
+  async function search(avoid: string[] = [], gates: { entranceId?: string; exitId?: string } = {}) {
     if (!origin || !destination) return;
     const id = ++runId.current;
+    const gate = { entranceId: gates.entranceId ?? entranceId, exitId: gates.exitId ?? exitId };
     // Permintaan ke Backend berjalan sejak awal; langkah di layar hanya penanda kemajuan.
-    const request = planJourney(origin, destination, { avoid, avoidModes, needs });
+    const request = planJourney(origin, destination, { avoid, avoidModes, needs, entranceId: gate.entranceId || undefined, exitId: gate.exitId || undefined, at: chosenAt });
     let done = false;
     request.finally(() => (done = true));
     for (let step = 0; step < STEPS.length - 1 && !done; step++) {
@@ -108,6 +149,7 @@ export function Planner() {
     setPhase({ kind: "loading", step: STEPS.length - 1 });
     const res = await request;
     if (runId.current !== id) return;
+    setOptionIndex(0);
     setPhase(res.status === "ok" ? { kind: "result", plan: res.data } : { kind: "error", code: res.code, message: res.message });
     requestAnimationFrame(() => resultRef.current?.focus());
   }
@@ -119,14 +161,23 @@ export function Planner() {
 
   const chooseOrigin = (id: string | null) => {
     setOrigin(id);
+    setEntranceId("");
     if (phase.kind !== "idle") reset();
   };
   const chooseDestination = (id: string | null) => {
     setDestination(id);
+    setExitId("");
     if (phase.kind !== "idle") reset();
+  };
+  // Pakai pintu yang disarankan pada hasil: pilih pintu itu lalu cari ulang.
+  const applyGate = (role: GateChoice["role"], gateId: string) => {
+    if (role === "masuk") setEntranceId(gateId);
+    else setExitId(gateId);
+    search([], role === "masuk" ? { entranceId: gateId } : { exitId: gateId });
   };
 
   const plan = phase.kind === "result" ? phase.plan : null;
+  const shown = plan ? planForOption(plan, optionIndex) : null;
 
   return (
     <div className="flex min-h-full flex-col">
@@ -164,6 +215,15 @@ export function Planner() {
               }}
             >
               <StationCombobox label="Dari" marker="●" value={origin} onChange={chooseOrigin} />
+              <GateSelect
+                label="Masuk lewat pintu"
+                gates={originGates}
+                value={entranceId}
+                onChange={(v) => {
+                  setEntranceId(v);
+                  if (phase.kind !== "idle") reset();
+                }}
+              />
               <button
                 type="button"
                 className="btn btn-link self-center"
@@ -171,17 +231,104 @@ export function Planner() {
                 onClick={() => {
                   setOrigin(destination);
                   setDestination(origin);
+                  setEntranceId("");
+                  setExitId("");
                   if (phase.kind !== "idle") reset();
                 }}
               >
                 ⇅ Tukar
               </button>
               <StationCombobox label="Ke" marker="◆" value={destination} onChange={chooseDestination} />
+              <GateSelect
+                label="Keluar lewat pintu"
+                gates={destinationGates}
+                value={exitId}
+                onChange={(v) => {
+                  setExitId(v);
+                  if (phase.kind !== "idle") reset();
+                }}
+              />
               {sameStation && (
                 <p className="text-sm text-[var(--bad)]" role="alert">
                   Asal dan tujuan tidak boleh sama.
                 </p>
               )}
+              {closed.map((s) => (
+                <p key={s!.id} className="text-sm text-[var(--bad)]" role="alert">
+                  Stasiun {s!.name} sudah tidak beroperasi.{s!.inactiveNote ? ` ${s!.inactiveNote}` : ""} Pilih stasiun lain.
+                </p>
+              ))}
+              <fieldset className="mt-2">
+                <legend className="mb-1 font-semibold">Waktu berangkat</legend>
+                <div className="flex flex-wrap gap-2">
+                  {(["now", "at"] as const).map((m) => {
+                    const on = timeMode === m;
+                    return (
+                      <label key={m} className={`choice-chip ${on ? "mode-chip-on" : ""}`}>
+                        <input
+                          type="radio"
+                          name="waktu-berangkat"
+                          className="sr-only"
+                          checked={on}
+                          onChange={() => {
+                            setTimeMode(m);
+                            setTimeRef(Date.now());
+                            if (m === "at" && (!departDate || !departTime)) {
+                              const d = nextFiveMinutes();
+                              setDepartDate(d.date);
+                              setDepartTime(d.time);
+                            }
+                            if (phase.kind !== "idle") reset();
+                          }}
+                        />
+                        <span aria-hidden>{on ? "●" : "○"}</span> {m === "now" ? "Sekarang" : "Pilih waktu"}
+                      </label>
+                    );
+                  })}
+                </div>
+                {timeMode === "at" && (
+                  <>
+                    <div className="mt-2 grid grid-cols-2 gap-2">
+                      <label className="flex flex-col gap-1 text-sm">
+                        <span className="font-semibold">Tanggal</span>
+                        <input
+                          type="date"
+                          className="min-h-11 rounded-lg border-2 border-[var(--border)] bg-[var(--surface)] px-2"
+                          value={departDate}
+                          min={wibParts(timeRef - DAY).date}
+                          max={wibParts(timeRef + 90 * DAY).date}
+                          onChange={(e) => {
+                            setDepartDate(e.target.value);
+                            setTimeRef(Date.now());
+                            if (phase.kind !== "idle") reset();
+                          }}
+                        />
+                      </label>
+                      <label className="flex flex-col gap-1 text-sm">
+                        <span className="font-semibold">Jam (WIB)</span>
+                        <input
+                          type="time"
+                          className="min-h-11 rounded-lg border-2 border-[var(--border)] bg-[var(--surface)] px-2"
+                          value={departTime}
+                          step={300}
+                          onChange={(e) => {
+                            setDepartTime(e.target.value);
+                            setTimeRef(Date.now());
+                            if (phase.kind !== "idle") reset();
+                          }}
+                        />
+                      </label>
+                    </div>
+                    {timeProblem ? (
+                      <p className="mt-1 text-sm text-[var(--bad)]" role="alert">
+                        {timeProblem}
+                      </p>
+                    ) : (
+                      chosenAt && <p className="mt-1 text-sm text-[var(--muted)]">Rute tercepat dan jam kendaraan dihitung dari jadwal {longDate(chosenAt)} WIB.</p>
+                    )}
+                  </>
+                )}
+              </fieldset>
               {modes.length > 1 && (
                 <fieldset className="mt-2">
                   <legend className="mb-1 font-semibold">Moda yang dipakai</legend>
@@ -248,7 +395,7 @@ export function Planner() {
           <TransitMap
             originId={origin}
             destinationId={destination}
-            route={plan?.route ?? null}
+            route={shown?.route ?? null}
             onSetOrigin={chooseOrigin}
             onSetDestination={chooseDestination}
             onShowDetail={setDetailId}
@@ -318,8 +465,11 @@ export function Planner() {
             {plan && (
               <ResultPanel
                 plan={plan}
+                selected={optionIndex}
+                onSelect={setOptionIndex}
                 onShowDetail={setDetailId}
                 onUseAlternative={(alt: Alternative) => search(alt.avoid)}
+                onUseGate={applyGate}
                 onShowMap={() => mapRef.current?.scrollIntoView({ behavior: settings.reduceMotion ? "auto" : "smooth" })}
               />
             )}
@@ -361,5 +511,38 @@ export function NetworkStatus({ error, retry }: { error?: string; retry: () => v
         )}
       </section>
     </main>
+  );
+}
+
+/** Pintu/gate stasiun (dataset dan isian tim) untuk pilihan pintu masuk/keluar. */
+function useGates(stationId: string | null): Entrance[] {
+  const [gates, setGates] = useState<{ id: string; list: Entrance[] } | null>(null);
+  useEffect(() => {
+    if (!stationId) return;
+    let alive = true;
+    fetchStationDetail(stationId).then((r) => alive && setGates({ id: stationId, list: r.status === "ok" ? r.data.entrances : [] }));
+    return () => {
+      alive = false;
+    };
+  }, [stationId]);
+  return gates && gates.id === stationId ? gates.list : [];
+}
+
+/** Pilihan pintu masuk/keluar; "Otomatis" = Backend memilih jalur paling aksesibel ke peron. */
+function GateSelect({ label, gates, value, onChange }: { label: string; gates: Entrance[]; value: string; onChange: (id: string) => void }) {
+  if (gates.length < 2) return null;
+  return (
+    <label className="flex flex-col gap-1 text-sm">
+      <span className="font-semibold">{label}</span>
+      <select className="min-h-11 rounded-lg border-2 border-[var(--border)] bg-[var(--surface)] px-2" value={value} onChange={(e) => onChange(e.target.value)}>
+        <option value="">Otomatis (jalur paling aksesibel)</option>
+        {gates.map((g) => (
+          <option key={g.id} value={g.id}>
+            {g.name}
+            {g.accessible ? " ♿" : ""}
+          </option>
+        ))}
+      </select>
+    </label>
   );
 }

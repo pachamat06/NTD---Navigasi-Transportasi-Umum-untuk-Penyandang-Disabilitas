@@ -25,6 +25,9 @@ export interface Station {
   hubId?: string;
   /** Station id Commute (mis. "KCI-SUDB"), dipakai untuk posisi pada peta. */
   commuteIds?: string[];
+  /** Stasiun sudah tidak beroperasi (ditandai tim NTD); tidak bisa dipakai untuk rute. */
+  inactive?: boolean;
+  inactiveNote?: string;
 }
 
 /** Rincian fasilitas, termasuk informasi tim NTD yang tidak ada di dataset. */
@@ -129,8 +132,24 @@ export interface StationAssessment {
     pathLift?: DetailStatus;
     excluded: AmenityType[];
     lift?: AmenityStatus;
+    /** Fasilitas peron yang belum diisi tim sehingga dihitung dari fasilitas umum stasiun. */
+    fromStation?: AmenityType[];
     stationScore: number;
   };
+  /** Pintu masuk/keluar pilihan pengguna dan pintu yang disarankan bila fasilitasnya kurang. */
+  gateChoice?: GateChoice;
+}
+
+export interface GateChoice {
+  role: "masuk" | "keluar";
+  chosenId: string;
+  chosen: string;
+  /** false = jalur pintu ini ke peron belum didata; skor memakai pintu terbaik. */
+  known: boolean;
+  recommendedId?: string;
+  recommended?: string;
+  reason?: string;
+  recommendedVia?: string;
 }
 
 export interface Notice {
@@ -236,7 +255,10 @@ export interface Platform {
   type?: "island" | "side" | "bay";
   tracks?: string[];
   serves: { lineId: string; direction?: string }[];
-  amenities: Partial<Record<"lift" | "eskalator" | "toilet" | "ramp", DetailStatus>>;
+  /** Fasilitas mobilitas di peron ini (lift, eskalator, ramp, guiding block). Toilet dll. adalah info umum stasiun. */
+  amenities: Partial<Record<"lift" | "eskalator" | "ramp" | "guiding_block", DetailStatus>>;
+  /** Akses dari peron ini ke pintu keluar tertentu. */
+  exitAccess?: { gate: string; via: PlatformConnection; stepFree?: boolean; dedicated?: boolean; note?: string }[];
   escalators?: EscalatorGroup[];
   lift?: LiftInfo;
   gap?: PlatformGap;
@@ -272,6 +294,24 @@ export interface RouteLeg {
   minutes: number | null;
   /** true = waktu tempuh perkiraan dari jadwal GTFS Transjakarta (koridor BRT), bukan dari dataset rute. */
   minutesEstimated?: boolean;
+  /** Waktu tempuh dan jam dari jadwal keberangkatan Commute (moda rel). */
+  fromTimetable?: boolean;
+  /** Ruas pindah: waktu sudah termasuk menunggu kereta berikutnya. */
+  includesWait?: boolean;
+  /** Nomor perjalanan kereta yang dipakai untuk jam berangkat/tiba. */
+  tripNumber?: string;
+  /** Jam berangkat dan tiba (ISO) bila jadwal diketahui. */
+  departureAt?: string;
+  arrivalAt?: string;
+  /** true = jam berangkat/tiba perkiraan (TransJakarta: rata-rata waktu tunggu + waktu GTFS). */
+  scheduleEstimated?: boolean;
+  /** Perkiraan menunggu kendaraan (menit) di pemberhentian naik. */
+  waitMinutes?: number;
+  /** Kereta pertama berakhir di stasiun ini; ganti ke kereta sambungan yang berangkat `changeDepartureAt`. */
+  changeAt?: string;
+  changeDepartureAt?: string;
+  /** Layanan hari itu sudah habis pada waktu berangkat; dipakai keberangkatan pertama keesokan harinya. */
+  nextDayService?: boolean;
   fare: number;
   /** Arah/tujuan akhir kendaraan. */
   headsign?: string;
@@ -297,7 +337,8 @@ export type TransferNeed = "lift" | "eskalator" | "ramp";
 
 export interface Frequency {
   headwayMinutes: number;
-  source: "STOP" | "LINE";
+  /** "TIMETABLE" = dihitung dari jadwal keberangkatan Commute (moda rel). */
+  source: "STOP" | "LINE" | "TIMETABLE";
   serviceHours?: string;
 }
 
@@ -345,6 +386,28 @@ export interface Notification {
   grounded: boolean;
 }
 
+export type RouteOptionKind = "aksesibel" | "moderat" | "tercepat";
+
+export interface RouteOption {
+  kinds: RouteOptionKind[];
+  origin: "dataset" | "alternatif" | "variasi";
+  route: Route;
+  assessments: StationAssessment[];
+  warnings: string[];
+  summary: {
+    accessScore: number;
+    minScore: number;
+    minutes: number | null;
+    departureAt?: string;
+    arrivalAt?: string;
+    transfers: number;
+    unmetNeeds: number;
+    usesAvoidedModes: boolean;
+  };
+  notification: Notification;
+  alternatives: Alternative[];
+}
+
 export interface JourneyPlan {
   originId: string;
   destinationId: string;
@@ -357,6 +420,12 @@ export interface JourneyPlan {
   fromCache?: string;
   notices?: Notice[];
   attribution?: string;
+  /** Waktu berangkat yang dipakai menghitung jadwal (ISO). */
+  departAt?: string;
+  /** "now" = berangkat sekarang; "at" = waktu tertentu pilihan pengguna. */
+  departMode?: "now" | "at";
+  /** Pilihan rute: paling aksesibel (sama dengan `route`), moderat, tercepat, lalu rute lain. */
+  options?: RouteOption[];
 }
 
 export type ErrorCode = "NOT_FOUND" | "INVALID" | "API_DOWN" | "RATE_LIMITED" | "INTERNAL" | "NETWORK";

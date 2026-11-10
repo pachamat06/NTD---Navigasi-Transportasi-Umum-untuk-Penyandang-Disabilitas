@@ -93,6 +93,11 @@ export function StationDetail({
             {st.operator} · {st.lineIds.map((l) => lineById(l)?.name ?? l).join(", ")} · {st.codes.join("/")}
             {st.hubId && ` · Hub ${hubById(st.hubId)?.name ?? st.hubId}`}
           </p>
+          {(st.inactive || base?.inactive) && (
+            <p className="banner banner-warn" role="status">
+              <span aria-hidden>⚠</span> Stasiun ini sudah tidak beroperasi.{(st.inactiveNote ?? base?.inactiveNote) ? ` ${st.inactiveNote ?? base?.inactiveNote}` : ""}
+            </p>
+          )}
           {full?.data?.notices.map((n) => <NoticeBanner key={n.id} notice={n} />)}
           <div>
             <p className="text-sm font-semibold">Skor aksesibilitas</p>
@@ -121,7 +126,7 @@ export function StationDetail({
             )}
           </div>
           <div>
-            <p className="text-sm font-semibold">Fasilitas</p>
+            <p className="text-sm font-semibold">Fasilitas umum stasiun</p>
             <ul className="mt-1 divide-y divide-[var(--border)]">
               {(Object.keys(AMENITY_LABEL) as AmenityType[]).map((k) => {
                 const d = details.find((x) => x.type === k);
@@ -136,7 +141,8 @@ export function StationDetail({
           {full?.data?.platforms && full.data.platforms.length > 0 && (
             <div>
               <p className="text-sm font-semibold">Peron ({full.data.platforms.length})</p>
-              <PlatformList platforms={full.data.platforms} entrances={full.data.entrances} concourses={full.data.concourses} />
+              <p className="text-xs text-[var(--muted)]">Per peron: hanya mobilitas (lift, eskalator, ramp, celah peron, akses ke pintu keluar).</p>
+              <PlatformList platforms={full.data.platforms} entrances={full.data.entrances} concourses={full.data.concourses} station={st.amenities} />
             </div>
           )}
           {full?.data && full.data.entrances.length > 0 && (

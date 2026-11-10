@@ -112,6 +112,19 @@ export interface UpHeadway {
   serviceHours?: { start: string; end: string } | { allDay: true };
 }
 
+/** Satu keberangkatan di satu stasiun (/stations/{op}/{code}/timetable). Nomor perjalanan sama di semua stasiun yang dilewati. */
+export interface UpDeparture {
+  tripNumber: string;
+  /** Menit sejak tengah malam, waktu Jakarta (0–1439). */
+  minutes: number;
+  /** Tujuan akhir perjalanan. */
+  boundFor?: string;
+  /** Jam tiba di tujuan akhir (menit sejak tengah malam), bila dataset memuatnya berbeda dari jam berangkat. */
+  arriveFinal?: number;
+  /** Kode lin operator, mis. "B" (KRL Bogor) atau "BK" (LRT Jabodebek Bekasi). */
+  line?: string;
+}
+
 export interface UpStopTime {
   stop: UpStopRef;
   arrivalAt?: string | null;
@@ -167,6 +180,11 @@ export interface CommuteSource {
   getTransfers?(operator: string, code: string): Promise<UpHubTransfer[] | null>;
   /** Frekuensi lin di satu pemberhentian pada waktu `at` (default sekarang). Tidak diisi = sumber tidak menyediakan. */
   getHeadways?(operator: string, code: string, at?: string): Promise<UpHeadway[] | null>;
+  /**
+   * Jadwal keberangkatan satu stasiun sehari penuh (hari layanan WD/SAT/SUN). Dipakai untuk waktu tempuh dan frekuensi
+   * moda rel: waktu tempuh = selisih jam berangkat pada nomor perjalanan yang sama. Tidak diisi = sumber tidak menyediakan.
+   */
+  getTimetable?(operator: string, code: string, day: "WD" | "SAT" | "SUN"): Promise<UpDeparture[] | null>;
   /** Nomor peron tiap lin dan arah di satu stasiun. Tidak diisi = sumber tidak menyediakan. */
   getPlatforms?(operator: string, code: string): Promise<UpPlatformService[] | null>;
   /** Pintu keluar/gate satu stasiun. Tidak diisi = sumber tidak menyediakan. */

@@ -161,6 +161,13 @@ export class GroundingGuard {
       const st = f.stations.get(a.stationId);
       if (!st) continue;
       const liftNtd = st.amenityDetails.find((d) => d.type === "lift" && d.source === "ntd");
+      // Peron dicapai tanpa JPO/terowongan (tanpa pindah lantai): lift dan eskalator tidak dibutuhkan, jadi tidak disebut
+      // (aturan yang sama dengan skor).
+      const level = a.journey ? a.journey.level : !!a.layout?.level;
+      if (level) {
+        if (!a.dataAvailable) notes.push(`Data fasilitas ${st.name} belum tersedia.`);
+        continue;
+      }
       if (liftNtd?.status === "out_of_service") notes.push(`Lift di ${st.name} dilaporkan sedang tidak berfungsi.`);
       else if (!a.dataAvailable) notes.push(`Data fasilitas ${st.name} belum tersedia.`);
       else if (st.amenities.lift === "available") notes.push(`Lift tercatat tersedia di ${st.name}.`);
@@ -226,7 +233,10 @@ export function factsForPrompt(f: PlanFacts): unknown {
         skor: a.score,
         memadai: a.adequate,
         dataTersedia: a.dataAvailable,
-        fasilitas: Object.fromEntries(CORE_AMENITIES.map((t) => [AMENITY_LABEL[t], s?.amenities[t] ?? "unknown"])),
+        // Lift/eskalator yang tidak dibutuhkan (peron dicapai tanpa JPO/terowongan) tidak dikirim agar tidak disebut "tidak ada".
+        fasilitas: Object.fromEntries(
+          CORE_AMENITIES.filter((t) => !((a.journey ? a.journey.level : a.layout?.level) && (t === "lift" || t === "eskalator"))).map((t) => [AMENITY_LABEL[t], s?.amenities[t] ?? "unknown"]),
+        ),
         catatan: a.notes,
         ...(a.journey ? {
               jalurGatePeron: {
@@ -239,6 +249,9 @@ export function factsForPrompt(f: PlanFacts): unknown {
                 tidakDihitung: a.journey.excluded.map((t) => AMENITY_LABEL[t]),
               },
             } : {}),
+        ...(a.gateChoice
+          ? { pintuDipilih: { peran: a.gateChoice.role, pintu: a.gateChoice.chosen, ...(a.gateChoice.recommended ? { disarankan: a.gateChoice.recommended, alasan: a.gateChoice.reason } : {}) } }
+          : {}),
       };
     }),
     alternatif: f.alternatives.map((a) => ({ melalui: st(a.viaStationId)?.name, menggantikan: st(a.replacesStationId)?.name, skor: a.assessment.score })),

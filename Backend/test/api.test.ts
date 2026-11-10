@@ -1,5 +1,5 @@
 import request from "supertest";
-import { EDITOR, FakeLlm, makeTestApp } from "./helpers";
+import { datasetOption, EDITOR, FakeLlm, makeTestApp } from "./helpers";
 
 const plan = (app: Parameters<typeof request>[0], body: object, headers: Record<string, string> = {}) =>
   request(app).post("/api/plan").set(headers).send(body);
@@ -51,10 +51,15 @@ describe("API publik", () => {
     // Jakarta Kota → Dukuh Atas BNI: rute dasar transfer di Sudirman (lift tidak tercatat).
     const res = await plan(app, { originId: "jakarta-kota", destinationId: "dukuh-atas-mrt" });
     const d = res.body.data;
-    const transfers = d.route.legs.filter((l: { type: string }) => l.type === "TRANSFER").flatMap((l: { stops: string[] }) => l.stops);
+    const base = datasetOption(d) as typeof d;
+    const transfers = base.route.legs.filter((l: { type: string }) => l.type === "TRANSFER").flatMap((l: { stops: string[] }) => l.stops);
     expect(transfers).toContain("sudirman");
-    expect(d.alternatives[0]).toMatchObject({ hubId: "dukuh-atas", viaStationId: "bni-city", replacesStationId: "sudirman", avoid: ["sudirman"] });
-    expect(d.alternatives[0].route.legs.length).toBeGreaterThan(1);
+    expect(base.alternatives[0]).toMatchObject({ hubId: "dukuh-atas", viaStationId: "bni-city", replacesStationId: "sudirman", avoid: ["sudirman"] });
+    expect(base.alternatives[0].route.legs.length).toBeGreaterThan(1);
+    // Pilihan utama = paling aksesibel: transfer lewat BNI City, rute dataset tetap ada sebagai pilihan lain.
+    expect(d.options[0].kinds).toContain("aksesibel");
+    const primary = d.route.legs.filter((l: { type: string }) => l.type === "TRANSFER").flatMap((l: { stops: string[] }) => l.stops);
+    expect(primary).not.toContain("sudirman");
 
     // GUI memilih alternatif dengan mengirim avoid.
     const again = await plan(app, { originId: "jakarta-kota", destinationId: "dukuh-atas-mrt", avoid: ["sudirman"] });
@@ -269,7 +274,10 @@ describe("API admin", () => {
 describe("Fasilitas saat pindah dan posisi peta", () => {
   it("needs: status lift di titik pindah, peringatan, dan alternatif yang punya lift", async () => {
     const { app } = await makeTestApp();
-    const d = (await plan(app, { originId: "jakarta-kota", destinationId: "dukuh-atas-mrt", needs: ["lift"] })).body.data;
+    const plan1 = (await plan(app, { originId: "jakarta-kota", destinationId: "dukuh-atas-mrt", needs: ["lift"] })).body.data;
+    const d = datasetOption(plan1) as typeof plan1;
+    // Pilihan utama (paling aksesibel) tidak pindah di Sudirman yang tidak tercatat punya lift.
+    expect(plan1.route.legs.some((l: { type: string; stops: string[] }) => l.type === "TRANSFER" && l.stops.includes("sudirman"))).toBe(false);
     const transfer = d.route.legs.find((l: { type: string; stops: string[] }) => l.type === "TRANSFER" && l.stops.includes("sudirman"));
     expect(transfer.access).toEqual(expect.arrayContaining([{ stationId: "sudirman", need: "lift", status: "absent" }]));
     expect(d.warnings.some((w: string) => w.includes("Lift tidak tercatat di Sudirman"))).toBe(true);

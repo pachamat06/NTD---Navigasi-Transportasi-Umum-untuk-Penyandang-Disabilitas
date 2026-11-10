@@ -70,6 +70,10 @@ export interface Station {
   /** Koordinat dari dataset (bila ada); hanya dipakai backend untuk memilih stasiun transit alternatif. */
   lat?: number;
   lng?: number;
+  /** Stasiun sudah tidak beroperasi (daftar bawaan NTD atau isian admin); tidak bisa dipilih untuk rute. */
+  inactive?: boolean;
+  /** Keterangan status nonaktif untuk pengguna. */
+  inactiveNote?: string;
 }
 
 export interface Amenity {
@@ -108,6 +112,8 @@ export interface Hub {
   kind?: "hub" | "integrated";
   memberIds: string[];
   walks: HubWalk[];
+  /** Asal hub: "commute" = /hubs Commute Data API, "ntd" = hub bawaan NTD, "admin" = dibuat/diubah admin. */
+  source?: "commute" | "ntd" | "admin";
 }
 
 /** Fasilitas yang dibutuhkan pengguna saat pindah (mis. pengguna kursi roda butuh lift). */
@@ -118,8 +124,11 @@ export type TransferNeed = (typeof TRANSFER_NEEDS)[number];
 export interface Frequency {
   /** Rata-rata jarak antarkendaraan (menit). Untuk pilihan gabungan: frekuensi gabungan semua lin. */
   headwayMinutes: number;
-  /** "STOP" = diukur di pemberhentian naik, "LINE" = rata-rata se-lin. */
-  source: "STOP" | "LINE";
+  /**
+   * "STOP" = diukur di pemberhentian naik, "LINE" = rata-rata se-lin, "TIMETABLE" = dihitung dari jadwal keberangkatan
+   * Commute (moda rel): selisih keberangkatan berurutan yang sampai ke tujuan ruas.
+   */
+  source: "STOP" | "LINE" | "TIMETABLE";
   /** Jam operasional lin di hari itu, bila diketahui ("05:00–22:00" atau "24 jam"). */
   serviceHours?: string;
 }
@@ -214,11 +223,31 @@ export interface StationAssessment {
   layout?: LayoutAccess;
   /** Skor dihitung untuk perjalanan ini: jalur gate ke peron yang dipakai menentukan perlu tidaknya lift/eskalator. */
   journey?: JourneyAccess;
+  /** Pintu masuk (asal) atau keluar (tujuan) yang dipilih pengguna, beserta rekomendasi pintu bila ada yang lebih baik. */
+  gateChoice?: GateChoice;
+}
+
+/** Pintu yang dipilih pengguna di stasiun asal/tujuan dan pintu yang disarankan bila fasilitas pintu pilihan kurang. */
+export interface GateChoice {
+  /** "masuk" di stasiun asal, "keluar" di stasiun tujuan. */
+  role: "masuk" | "keluar";
+  chosenId: string;
+  chosen: string;
+  /** false = jalur dari pintu ini ke peron yang dipakai belum didata, sehingga skor memakai pintu terbaik. */
+  known: boolean;
+  recommendedId?: string;
+  recommended?: string;
+  /** Alasan rekomendasi, mis. "harus lewat JPO tanpa lift". */
+  reason?: string;
+  /** Jalur pintu yang disarankan ke peron, mis. "langsung". */
+  recommendedVia?: string;
 }
 
 export interface JourneyAccess extends AccessPath {
   /** Peron yang dipakai di stasiun ini pada perjalanan. */
   platforms: string[];
+  /** Fasilitas yang belum diisi untuk peron itu sehingga dihitung dari fasilitas umum stasiun. */
+  fromStation?: AmenityType[];
   /** Jenis fasilitas yang tidak dibutuhkan pada jalur ini, sehingga dianggap terpenuhi pada skor. */
   excluded: AmenityType[];
   /** Status lift untuk jalur ini bila harus pindah lantai (dari peron bila diisi tim). */
@@ -242,9 +271,27 @@ export interface RouteLeg {
   minutes: number | null;
   /** true = `minutes` adalah perkiraan dari jadwal GTFS Transjakarta, bukan waktu dari dataset rute. */
   minutesEstimated?: boolean;
+  /**
+   * Ruas naik moda rel: waktu tempuh dan jam dari jadwal keberangkatan Commute (nomor perjalanan yang sama di stasiun
+   * naik dan turun). Ruas pindah di dalam stasiun: `minutes` adalah jeda sampai kereta berikutnya berangkat.
+   */
+  fromTimetable?: boolean;
+  /** Ruas pindah: `minutes` sudah termasuk menunggu kendaraan berikutnya. */
+  includesWait?: boolean;
+  /** Ruas naik: nomor perjalanan (kereta) yang dipakai untuk jam berangkat/tiba. */
+  tripNumber?: string;
   fare: number;
   departureAt?: string;
   arrivalAt?: string;
+  /** true = jam berangkat/tiba ruas ini perkiraan (TransJakarta: waktu tunggu rata-rata separuh frekuensi + waktu GTFS). */
+  scheduleEstimated?: boolean;
+  /** Ruas naik: perkiraan menunggu kendaraan (menit) sejak siap di pemberhentian naik sampai berangkat. */
+  waitMinutes?: number;
+  /** Ruas naik rel: kereta pertama berakhir di stasiun ini; ganti ke kereta sambungan yang berangkat `changeDepartureAt`. */
+  changeAt?: string;
+  changeDepartureAt?: string;
+  /** Ruas naik: layanan hari itu sudah habis pada waktu berangkat pilihan; dipakai keberangkatan pertama keesokan harinya. */
+  nextDayService?: boolean;
   /** Ruas naik: tujuan akhir kendaraan. */
   headsign?: string;
   /** Ruas naik: nomor peron naik dari dataset, mis. "2" (hanya untuk sebagian stasiun). */
@@ -355,6 +402,25 @@ export interface PlatformGap {
 export type PlatformType = "island" | "side" | "bay";
 
 /**
+ * Fasilitas yang dicatat per peron: hanya yang menggambarkan mobilitas di peron itu (pindah lantai, ramp, guiding
+ * block). Toilet disabilitas, petugas bantuan, kursi roda, dll. adalah informasi umum stasiun, bukan per peron.
+ */
+export const PLATFORM_AMENITIES = ["lift", "eskalator", "ramp", "guiding_block"] as const;
+export type PlatformAmenityType = (typeof PLATFORM_AMENITIES)[number];
+
+/** Akses dari peron ke pintu keluar/gate tertentu, diisi tim pada data peron. */
+export interface PlatformExitAccess {
+  /** Nama gate/pintu keluar seperti di papan, mis. "Pintu A" atau "Gate Utara". */
+  gate: string;
+  via: PlatformConnection;
+  /** JPO/terowongan yang dapat dilalui tanpa anak tangga. */
+  stepFree?: boolean;
+  /** Jalur khusus pengguna disabilitas. */
+  dedicated?: boolean;
+  note?: string;
+}
+
+/**
  * Peron satu stasiun/halte. Bawaan dari dataset (nomor peron dan arah yang dilayani, /timetable/grouped);
  * jenis, fasilitas per peron, eskalator, lift, dan celah peron diisi tim NTD bila dataset tidak memuatnya.
  */
@@ -367,8 +433,13 @@ export interface Platform {
   tracks?: string[];
   /** Lin dan arah yang berhenti di peron ini. */
   serves: { lineId: string; direction?: string }[];
-  /** Status fasilitas inti di peron ini (bukan stasiun keseluruhan). */
-  amenities: Partial<Record<AmenityType, AmenityDetailStatus>>;
+  /**
+   * Status fasilitas mobilitas di peron ini (bukan stasiun keseluruhan). Fasilitas yang tersedia di peron mana pun
+   * otomatis mengisi fasilitas umum stasiun; yang belum diisi dihitung dari fasilitas umum stasiun.
+   */
+  amenities: Partial<Record<PlatformAmenityType, AmenityDetailStatus>>;
+  /** Akses dari peron ini ke pintu keluar tertentu (melengkapi `platformLinks` pada gate). */
+  exitAccess?: PlatformExitAccess[];
   escalators?: EscalatorGroup[];
   lift?: LiftInfo;
   gap?: PlatformGap;
@@ -499,6 +570,41 @@ export interface StationDetail extends StationWithAmenities {
   notices: Notice[];
 }
 
+/** Jenis pilihan rute: paling aksesibel (prioritas, mengikuti filter), seimbang, dan paling cepat. */
+export type RouteOptionKind = "aksesibel" | "moderat" | "tercepat";
+
+export interface RouteOptionSummary {
+  /** Skor aksesibilitas rute 0–100: skor stasiun perjalanan terendah dan rata-rata, dikurangi kendala di rute. */
+  accessScore: number;
+  /** Nilai pembanding untuk memilih pilihan rute (boleh negatif); `accessScore` adalah nilai ini yang dibatasi 0–100. */
+  rankScore: number;
+  /** Skor stasiun perjalanan terendah di antara stasiun naik, turun, dan pindah. */
+  minScore: number;
+  /** Total waktu tempuh (menit); null bila tidak ada data waktu. */
+  minutes: number | null;
+  /** Jam berangkat ruas naik pertama dan jam tiba ruas terakhir, bila jadwal diketahui. */
+  departureAt?: string;
+  arrivalAt?: string;
+  transfers: number;
+  /** Fasilitas yang dibutuhkan pengguna yang tidak terpenuhi di titik pindah. */
+  unmetNeeds: number;
+  /** Rute memakai moda yang ingin dihindari (tidak ada rute lain). */
+  usesAvoidedModes: boolean;
+}
+
+/** Satu pilihan rute (gaya TfL): rute, penilaian stasiun untuk rute itu, peringatan, dan ringkasan. */
+export interface RouteOption {
+  kinds: RouteOptionKind[];
+  /** Asal rute: "dataset" = rute dasar dari /fares (atau filter moda), "alternatif" = transfer alternatif di hub, "variasi" = rute lain yang disusun NTD. */
+  origin: "dataset" | "alternatif" | "variasi";
+  route: Route;
+  assessments: StationAssessment[];
+  warnings: string[];
+  summary: RouteOptionSummary;
+  notification: Notification;
+  alternatives: Alternative[];
+}
+
 export interface JourneyPlan {
   originId: string;
   destinationId: string;
@@ -514,6 +620,15 @@ export interface JourneyPlan {
   stations: StationDetail[];
   attribution: string;
   preview?: boolean;
+  /** Waktu berangkat yang dipakai menghitung jadwal (ISO): waktu pilihan pengguna, atau waktu permintaan untuk "sekarang". */
+  departAt: string;
+  /** "now" = berangkat sekarang; "at" = waktu berangkat tertentu pilihan pengguna. */
+  departMode: "now" | "at";
+  /**
+   * Beberapa pilihan rute, urut: paling aksesibel (sama dengan `route`), moderat, tercepat, lalu rute lain (`kinds`
+   * kosong). Pilihan yang sama digabung (`kinds` lebih dari satu). Field utama rencana (`route`, `assessments`, `warnings`, ...) = pilihan pertama.
+   */
+  options?: RouteOption[];
 }
 
 export type ErrorCode =
