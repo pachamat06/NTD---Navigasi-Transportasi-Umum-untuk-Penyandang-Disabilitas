@@ -20,7 +20,7 @@ export interface CacheRepository {
  * hanya terlihat di mode pratinjau admin) dan "published" (terlihat oleh pengguna). Publikasi menyalin
  * draft ke published, sehingga perubahan dapat diuji coba lebih dulu sebelum sampai ke pengguna.
  */
-export type ContentKind = "facility" | "entrance" | "notice" | "station_info" | "settings" | "map_stop" | "map_track" | "platform" | "route_pattern" | "concourse" | "hub" | "station_status";
+export type ContentKind = "facility" | "entrance" | "notice" | "station_info" | "settings" | "map_stop" | "map_track" | "platform" | "route_pattern" | "concourse" | "hub" | "station_status" | "station" | "line";
 
 export interface ContentItem<T = unknown> {
   id: string;

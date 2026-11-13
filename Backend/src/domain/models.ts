@@ -51,6 +51,8 @@ export interface Line {
   mode: Mode;
   color: string;
   stationIds: string[];
+  /** Asal lini: "commute" = Commute Data API, "admin" = ditambah admin. */
+  source?: "commute" | "admin";
 }
 
 export interface StationRef {
@@ -74,6 +76,11 @@ export interface Station {
   inactive?: boolean;
   /** Keterangan status nonaktif untuk pengguna. */
   inactiveNote?: string;
+  /**
+   * Asal stasiun: "commute" = /stations Commute Data API, "gtfs" = halte dari GTFS Transjakarta, "ntd" = stasiun
+   * bawaan NTD, "admin" = ditambah admin. Stasiun "ntd" dan "admin" tidak dikenal Commute: rutenya dari urutan lini.
+   */
+  source?: "commute" | "gtfs" | "ntd" | "admin";
 }
 
 export interface Amenity {

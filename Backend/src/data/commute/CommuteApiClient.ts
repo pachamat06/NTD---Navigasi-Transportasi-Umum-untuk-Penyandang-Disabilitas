@@ -14,8 +14,12 @@ import { directionLabel, jakartaDayHour } from "./HttpCommuteSource";
 import { buildStationIndex, lineIdOf, liveIdsOf, type StationIndex } from "./station-index";
 import type { CommuteSource, UpAmenity, UpDeparture, UpExitRef, UpFare, UpHubTransfer, UpLeg, UpLine, UpStation } from "./types";
 import type { TjGtfs } from "../gtfs/TjGtfs";
+import { applyLines, applyStations, BUILTIN_STATIONS, type DatasetOverlay, type OverlayProvider } from "../../domain/datasetOverlay";
 
 export const DEFAULT_TTL_SECONDS = 24 * 3600;
+
+/** Bagian dataset yang bisa dimuat ulang dari admin. */
+export type DatasetPart = "stations" | "lines" | "hubs";
 /** Data kedaluwarsa masih disajikan (sambil diperbarui) sampai umur ini; lebih tua dari itu ditunggu. */
 export const MAX_STALE_SECONDS = 7 * 24 * 3600;
 /** Jadwal keberangkatan sehari penuh jarang berubah; cukup diperbarui beberapa kali sehari. */
@@ -116,6 +120,25 @@ export class CommuteApiClient {
 
   private memo?: { raw: UpStation[]; index: StationIndex };
 
+  /** Stasiun dan lini dari admin serta stasiun bawaan NTD, di atas dataset (lihat datasetOverlay.ts). */
+  private overlayProvider?: OverlayProvider;
+
+  setOverlay(provider: OverlayProvider): void {
+    this.overlayProvider = provider;
+  }
+
+  /** Isian admin dibaca sekali per permintaan. */
+  private overlay(ctx: RequestContext): Promise<DatasetOverlay> {
+    if (!this.overlayProvider) return Promise.resolve({ stations: [], lines: [] });
+    const memo = (ctx.memo ??= new Map());
+    const known = memo.get("overlay") as Promise<DatasetOverlay> | undefined;
+    if (known) return known;
+    const p = this.overlayProvider(ctx);
+    memo.set("overlay", p);
+    p.catch(() => memo.delete("overlay"));
+    return p;
+  }
+
   /** Indeks slug NTD <-> kode upstream, dibangun dari daftar stasiun (cache) sumber data. */
   async index(ctx: RequestContext): Promise<StationIndex> {
     const raw = await this.rawStations(ctx);
@@ -198,10 +221,11 @@ export class CommuteApiClient {
   }
 
   async getLines(ctx: RequestContext): Promise<Line[]> {
-    const [lines, ops, idx] = await Promise.all([
+    const [lines, ops, idx, overlay] = await Promise.all([
       this.rawLines(ctx),
       this.getOperators(ctx),
       this.index(ctx),
+      this.overlay(ctx),
     ]);
     // Beberapa lin upstream bisa dipetakan ke satu lini NTD (mis. LRT Jabodebek); stasiunnya digabung.
     const out = new Map<string, Line>();
@@ -221,8 +245,43 @@ export class CommuteApiClient {
         mode: (l.mode ?? op?.mode ?? "RAIL") as Mode,
         color: l.color ?? "#555555",
         stationIds: dedupe(stationIds),
+        source: "commute",
       });
     }
+    return applyLines([...out.values()], overlay.lines);
+  }
+
+  /**
+   * Muat ulang daftar dari sumber data sekarang juga, tanpa menunggu cache kedaluwarsa (sinkron dari admin), mis.
+   * agar stasiun yang baru beroperasi segera dikenal. Bila sumber gagal, cache lama tetap dipakai.
+   */
+  async refreshDataset(parts: readonly DatasetPart[], ctx: RequestContext): Promise<void> {
+    const ttl = this.ttl(ctx);
+    const jobs: Promise<unknown>[] = [];
+    if (parts.includes("stations") || parts.includes("lines")) jobs.push(this.refresh("operators", ttl, () => this.source.getOperators()));
+    if (parts.includes("stations")) jobs.push(this.refresh("stations", ttl, () => this.source.getStations()));
+    if (parts.includes("lines") || parts.includes("stations")) jobs.push(this.refresh("lines", ttl, () => this.source.getLines()));
+    if (parts.includes("hubs")) jobs.push(this.refresh("hubs", ttl, () => this.source.getHubs()));
+    await Promise.all(jobs);
+  }
+
+  /**
+   * Stasiun yang tercantum di lin (/lines) tetapi belum ada di daftar stasiun NTD, mis. stasiun perpanjangan yang
+   * belum dimuat /stations. Admin bisa menambahkannya bila sudah beroperasi.
+   */
+  async lineOnlyStations(ctx: RequestContext): Promise<{ id: string; name: string; operator: string; code: string; number?: string; lineIds: string[] }[]> {
+    const [lines, idx, stations] = await Promise.all([this.rawLines(ctx), this.index(ctx), this.getStations(ctx)]);
+    const known = new Set(stations.map((s) => s.id));
+    const out = new Map<string, { id: string; name: string; operator: string; code: string; number?: string; lineIds: string[] }>();
+    for (const l of lines)
+      l.stations.forEach((r, i) => {
+        const id = idx.idOf(r);
+        if (known.has(id)) return;
+        const lineId = lineIdOf(l.operator, l.code);
+        const prev = out.get(id);
+        if (prev) prev.lineIds = dedupe([...prev.lineIds, lineId]);
+        else out.set(id, { id, name: l.stationNames?.[i] ?? r.code, operator: r.operator, code: r.code, ...(l.stationNumbers?.[i] ? { number: l.stationNumbers[i]! } : {}), lineIds: [lineId] });
+      });
     return [...out.values()];
   }
 
@@ -254,6 +313,14 @@ export class CommuteApiClient {
   }
 
   async getStations(ctx: RequestContext): Promise<Station[]> {
+    const [base, overlay, upLines] = await Promise.all([this.datasetStations(ctx), this.overlay(ctx), this.rawLines(ctx)]);
+    // Stasiun bawaan NTD hanya untuk lini yang ada di sumber data (sumber offline tidak memuat LRT Jakarta).
+    const lineIds = new Set(upLines.map((l) => lineIdOf(l.operator, l.code)));
+    return applyStations(base, overlay.stations, BUILTIN_STATIONS.filter((b) => b.lineIds.some((id) => lineIds.has(id))));
+  }
+
+  /** Stasiun dataset saja (Commute + halte GTFS), tanpa stasiun bawaan NTD dan isian admin. */
+  async datasetStations(ctx: RequestContext): Promise<Station[]> {
     const [raw, ops, idx, upLines] = await Promise.all([this.rawStations(ctx), this.getOperators(ctx), this.index(ctx), this.rawLines(ctx)]);
     // Nomor stasiun dari /lines (mis. C12, 1-13) dipakai GUI untuk menemukan posisi di peta.
     const numbers = new Map<string, string[]>();
@@ -285,6 +352,7 @@ export class CommuteApiClient {
           codes,
           commuteIds: commuteIdsOf(id, idx),
           ...(typeof s.lat === "number" && typeof s.lng === "number" ? { lat: s.lat, lng: s.lng } : {}),
+          source: "commute",
         });
       } else {
         if (!prev.operator.split(" · ").includes(opName)) prev.operator += ` · ${opName}`;
@@ -330,6 +398,7 @@ export class CommuteApiClient {
           commuteIds: commuteIdsOf(id, idx),
           lat: g.lat,
           lng: g.lng,
+          source: "gtfs",
         });
       }
     }

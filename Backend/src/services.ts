@@ -71,6 +71,8 @@ export function createServices(opts: { config: Config; store: Store; log: Logger
   const gtfs = new TjGtfs();
   const commute = new CommuteApiClient(source, store.cache, gtfs);
   const content = new ContentService(store.content);
+  // Stasiun dan lini dari admin (tambah manual / impor GTFS / koreksi) di atas dataset.
+  commute.setOverlay(async (ctx) => (await content.snapshot(ctx)).datasetOverlay());
   // Pengaturan rute per lini dan arah dari admin (draft hanya untuk pratinjau admin).
   const patterns = async (ctx: RequestContext) => (await content.snapshot(ctx)).routePatterns();
   // Hub transfer yang dibuat/diubah admin, di atas hub Commute dan hub bawaan NTD.

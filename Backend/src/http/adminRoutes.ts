@@ -7,7 +7,9 @@ import { z } from "zod";
 import { hashPassword, PASSWORD_MIN, publicUser, verifyPassword } from "../admin/auth";
 import { testCaseSchema, testExpectSchema, testRequestSchema } from "../admin/TestRunner";
 import { newContext } from "../context";
-import { DEFAULT_SETTINGS, SCHEMAS, SETTINGS_ID, settingsSchema, type Settings } from "../domain/content";
+import { DEFAULT_SETTINGS, SCHEMAS, SETTINGS_ID, settingsSchema, stationIdSchema, type Settings } from "../domain/content";
+import { diffDataset, gtfsHalteNear, gtfsHubSuggestions, gtfsLineCandidates, gtfsStationCandidates, gtfsStationDifferences, stalePatterns, type StationCandidate } from "../domain/datasetSync";
+import type { DatasetPart } from "../data/commute/CommuteApiClient";
 import { AppError } from "../errors";
 import type { ContentItem, ContentKind } from "../store/types";
 import type { Services } from "../services";
@@ -19,7 +21,7 @@ import { VisionError } from "../ai/vision/VisionClient";
 import { visionSettingsInput } from "../ai/vision/VisionService";
 import { ok, parse, rateLimit, requireAdmin } from "./middleware";
 
-const kindSchema = z.enum(["facility", "entrance", "notice", "station_info", "platform", "concourse", "map_stop", "map_track", "route_pattern", "hub", "station_status"]);
+const kindSchema = z.enum(["facility", "entrance", "notice", "station_info", "platform", "concourse", "map_stop", "map_track", "route_pattern", "hub", "station_status", "station", "line"]);
 const idParam = z.string().min(1).max(80);
 
 /** Item yang terikat stasiun wajib punya stationId yang dikenal; pengumuman memakai targetId. */
@@ -118,6 +120,78 @@ export function adminRoutes(s: Services): Router {
         return { ...st, facilities: count("facility"), entrances: count("entrance"), platforms: count("platform"), concourses: count("concourse"), info: count("station_info"), pending: mine.filter((i) => i.draft !== null || i.draftDeleted).length };
       }),
     );
+  });
+
+  // Lini yang berlaku di pratinjau (dataset + rute tambahan/koreksi admin + urutan dari pengaturan rute).
+  r.get("/lines", async (_req, res) => ok(res, await s.stations.lines(newContext({ preview: true }))));
+
+  // ---------- Sinkron dataset: stasiun, rute, dan hub ----------
+  // Muat ulang daftar stasiun, lini, dan hub dari Commute Data API sekarang juga (tanpa menunggu cache kedaluwarsa)
+  // dan laporkan perubahannya: stasiun/lini/hub baru dan hilang, stasiun yang bertambah di lini (mis. stasiun yang
+  // baru beroperasi), serta pengaturan rute admin yang tertinggal dari dataset.
+  r.post("/dataset/refresh", requireAdmin("admin"), async (req, res) => {
+    const { parts } = parse(z.object({ parts: z.array(z.enum(["stations", "lines", "hubs"])).min(1).default(["stations", "lines", "hubs"]) }), req.body ?? {});
+    const view = async () => {
+      const ctx = newContext({ preview: true });
+      const [stations, lines, hubs] = await Promise.all([s.commute.getStations(ctx), s.commute.getLines(ctx), s.commute.getHubs(ctx)]);
+      return { stations, lines, hubs };
+    };
+    const before = await view();
+    await s.commute.refreshDataset(parts as DatasetPart[], newContext({ preview: true }));
+    const after = await view();
+    const ctx = newContext({ preview: true });
+    const [base, snap, lineOnly] = await Promise.all([s.commute.getLineSequences(ctx), s.content.snapshot(ctx), s.commute.lineOnlyStations(ctx)]);
+    const stale = stalePatterns(base, snap.routePatterns(), new Set(after.stations.map((x) => x.id)));
+    const diff = diffDataset(before, after);
+    await audit(req, "dataset.refresh", null, { parts, stations: diff.stations.added.length, lines: diff.lines.added.length, hubs: diff.hubs.added.length });
+    ok(res, { parts, refreshedAt: new Date().toISOString(), diff, stalePatterns: stale, lineOnlyStations: lineOnly.length });
+  });
+
+  // Usulan stasiun dari sumber data yang belum ada di NTD:
+  // - commute: stasiun yang tercantum di lin (/lines) tetapi belum ada di /stations (mis. stasiun perpanjangan);
+  // - gtfs: halte koridor BRT di GTFS Transjakarta yang belum ada, serta halte yang nama/koordinatnya berbeda.
+  r.get("/stations/candidates", async (req, res) => {
+    const { source } = parse(z.object({ source: z.enum(["commute", "gtfs"]).default("commute") }), req.query);
+    const ctx = newContext({ preview: true });
+    if (source === "gtfs") {
+      const [idx, stations] = await Promise.all([s.commute.index(ctx), s.commute.getStations(ctx)]);
+      return ok(res, { source, candidates: gtfsStationCandidates(s.gtfs, idx, stations), differences: gtfsStationDifferences(s.gtfs, idx, stations) });
+    }
+    const [lineOnly, lines, ops] = await Promise.all([s.commute.lineOnlyStations(ctx), s.commute.getLines(ctx), s.commute.getOperators(ctx)]);
+    const lineName = new Map(lines.map((l) => [l.id, l.name]));
+    const opName = (code: string) => ops.find((o) => o.code === code)?.name ?? code;
+    const candidates: StationCandidate[] = lineOnly.map((x) => ({
+      id: x.id,
+      name: x.name,
+      operator: opName(x.operator),
+      codes: x.number ? [x.number] : [],
+      lineIds: x.lineIds,
+      source: "commute",
+      reason: `tercantum di ${x.lineIds.map((id) => lineName.get(id) ?? id).join(", ")}${x.number ? ` (${x.number})` : ""}, belum ada di daftar stasiun Commute`,
+    }));
+    ok(res, { source, candidates, differences: [] });
+  });
+
+  // Isian stasiun dari sumber data untuk satu stasiun (tambah manual: "Isi dari API Commute" / "Isi dari GTFS").
+  r.get("/stations/defaults", async (req, res) => {
+    const q = parse(z.object({ stationId: stationIdSchema, source: z.enum(["commute", "gtfs"]).default("commute") }), req.query);
+    const ctx = newContext({ preview: true });
+    const idx = await s.commute.index(ctx);
+    if (q.source === "gtfs") {
+      const codes = idx.refsOf(q.stationId).filter((x) => x.operator.toUpperCase() === "TJ").map((x) => x.code);
+      const stops = codes.map((c) => s.gtfs.stop(c)).filter((x) => !!x);
+      if (!stops.length) throw new AppError("NOT_FOUND", "Halte ini tidak ada di data GTFS Transjakarta NTD (koridor BRT).");
+      const g = stops[0]!;
+      const lineIds = [...new Set(stops.flatMap((x) => s.gtfs.routesAt(x!.code)).map((c) => `tj:${c.toLowerCase()}`))];
+      const known = new Set((await s.stations.lines(ctx)).map((l) => l.id));
+      return ok(res, { stationId: q.stationId, source: "gtfs", data: { name: stops.length > 1 ? (idx.nameOf?.(q.stationId) ?? g.name) : g.name, operator: "TransJakarta", codes: stops.map((x) => x!.code), lineIds: lineIds.filter((x) => known.has(x)), lat: g.lat, lng: g.lng } });
+    }
+    const st = (await s.commute.datasetStations(ctx)).find((x) => x.id === q.stationId);
+    if (st) return ok(res, { stationId: q.stationId, source: "commute", data: { name: st.name, operator: st.operator, codes: st.codes, lineIds: st.lineIds, ...(st.lat !== undefined ? { lat: st.lat, lng: st.lng } : {}) } });
+    const lineOnly = (await s.commute.lineOnlyStations(ctx)).find((x) => x.id === q.stationId);
+    if (!lineOnly) throw new AppError("NOT_FOUND", "Stasiun ini tidak ada di Commute Data API (daftar stasiun maupun lin).");
+    const ops = await s.commute.getOperators(ctx);
+    ok(res, { stationId: q.stationId, source: "commute", data: { name: lineOnly.name, operator: ops.find((o) => o.code === lineOnly.operator)?.name ?? lineOnly.operator, codes: lineOnly.number ? [lineOnly.number] : [], lineIds: lineOnly.lineIds } });
   });
 
   r.get("/stations/:id", async (req, res) => {
@@ -263,6 +337,24 @@ export function adminRoutes(s: Services): Router {
       });
       if (same) throw new AppError("CONFLICT", "Pengaturan rute untuk lini dan arah ini sudah ada; ubah entri yang ada.", { id: same.id });
     }
+    if (kind === "station") {
+      // Stasiun baru (tambah manual/impor) boleh belum dikenal; id harus slug NTD atau `operator:kode`.
+      parse(stationIdSchema, stationId ?? "");
+      const lines = new Set((await s.stations.lines(newContext({ preview: true }))).map((l) => l.id));
+      const unknown = ((parsed.lineIds as string[] | undefined) ?? []).filter((x) => !lines.has(x));
+      if (unknown.length) throw new AppError("INVALID", `lineId tidak dikenal: ${unknown.join(", ")}.`);
+      // Satu isian per stasiun.
+      const same = (await s.store.content.list({ kind: "station", stationId: stationId ?? undefined })).find((it) => it.id !== selfId && !it.draftDeleted);
+      if (same) throw new AppError("CONFLICT", "Isian untuk stasiun ini sudah ada; ubah entri yang ada.", { id: same.id });
+    }
+    if (kind === "line") {
+      // Satu isian per lini.
+      const same = (await s.store.content.list({ kind: "line" })).find((it) => {
+        const v = (it.draft ?? it.published) as { lineId?: string } | null;
+        return it.id !== selfId && !it.draftDeleted && v?.lineId === parsed.lineId;
+      });
+      if (same) throw new AppError("CONFLICT", "Isian untuk rute ini sudah ada; ubah entri yang ada.", { id: same.id });
+    }
     if (kind === "station_status") {
       // Satu status per stasiun.
       const same = (await s.store.content.list({ kind: "station_status", stationId: stationId ?? undefined })).find((it) => it.id !== selfId && !it.draftDeleted);
@@ -283,7 +375,7 @@ export function adminRoutes(s: Services): Router {
 
   r.post("/content", async (req, res) => {
     const body = parse(z.object({ kind: kindSchema, stationId: z.string().max(80).nullable().optional(), data: z.unknown() }), req.body ?? {});
-    const stationId = body.kind === "notice" || body.kind === "map_track" || body.kind === "route_pattern" || body.kind === "hub" ? null : (body.stationId ?? null);
+    const stationId = body.kind === "notice" || body.kind === "map_track" || body.kind === "route_pattern" || body.kind === "hub" || body.kind === "line" ? null : (body.stationId ?? null);
     const data = await validateBody(body.kind, stationId, body.data);
     const item = await s.store.content.saveDraft({ kind: body.kind, stationId, data, by: actor(req) });
     await audit(req, "content.create", item.id, { kind: body.kind, stationId });
@@ -322,12 +414,22 @@ export function adminRoutes(s: Services): Router {
   // satu arah (mis. putaran Kota Tua dan Blok M koridor 1), untuk editor rute dan editor peta.
   r.get("/routes", async (_req, res) => {
     const ctx = newContext({ preview: true });
-    const [base, effective] = await Promise.all([s.commute.getLineSequences(ctx), s.planner.sequences(ctx)]);
+    const [base, effective, snap, stations] = await Promise.all([s.commute.getLineSequences(ctx), s.planner.sequences(ctx), s.content.snapshot(ctx), s.stations.list(ctx)]);
     const baseBy = new Map(base.map((b) => [b.lineId, b.sequences]));
+    // Stasiun dataset (yang sudah dikenal NTD) yang belum masuk pengaturan rute admin: perlu sinkron ulang.
+    const missing = new Map(stalePatterns(base, snap.routePatterns(), new Set(stations.filter((x) => !x.inactive).map((x) => x.id))).map((x) => [x.lineId, x.missing]));
     ok(
       res,
-      effective.map((e) => ({ lineId: e.lineId, sequences: e.sequences, directed: !!e.directed, base: baseBy.get(e.lineId) ?? [] })),
+      effective.map((e) => ({ lineId: e.lineId, sequences: e.sequences, directed: !!e.directed, base: baseBy.get(e.lineId) ?? [], ...(missing.has(e.lineId) ? { missing: missing.get(e.lineId) } : {}) })),
     );
+  });
+
+  // Rute di sumber data yang belum ada di NTD, untuk "Tambah rute": koridor BRT GTFS Transjakarta yang belum menjadi
+  // lini NTD. Semua lin Commute Data API sudah otomatis menjadi lini NTD.
+  r.get("/routes/candidates", async (req, res) => {
+    const { source } = parse(z.object({ source: z.enum(["gtfs", "commute"]).default("gtfs") }), req.query);
+    const lines = await s.stations.lines(newContext({ preview: true }));
+    ok(res, { source, candidates: source === "gtfs" ? gtfsLineCandidates(s.gtfs, lines) : [] });
   });
 
   // Rute bawaan dua arah untuk sinkron ulang: dari GTFS Transjakarta (urutan halte, waktu jadwal, frekuensi, jam
@@ -403,8 +505,27 @@ export function adminRoutes(s: Services): Router {
   // Data Commute untuk satu hub: anggota dan jalan kaki bila hub itu ada di /hubs, ditambah jalan kaki antaranggota
   // `members` dari /stations/{op}/{code}/transfers (untuk hub buatan admin).
   r.get("/hubs/defaults", async (req, res) => {
-    const q = parse(z.object({ hubId: z.string().max(60).optional(), members: z.string().max(2000).optional() }), req.query);
+    const q = parse(z.object({ hubId: z.string().max(60).optional(), members: z.string().max(2000).optional(), source: z.enum(["commute", "gtfs"]).default("commute"), radius: z.coerce.number().min(50).max(600).default(300) }), req.query);
     const ctx = newContext({ preview: true });
+    if (q.source === "gtfs") {
+      // Halte koridor BRT (GTFS Transjakarta) di sekitar anggota hub; jarak garis lurus, perlu dicek di lapangan.
+      const [idx, stations, hubs] = await Promise.all([s.commute.index(ctx), s.stations.list(ctx), s.stations.hubs(ctx)]);
+      const byId = new Map(stations.map((x) => [x.id, x]));
+      const hub = q.hubId ? hubs.find((h) => h.id === q.hubId) : undefined;
+      const start = [...new Set([...(hub?.memberIds ?? []), ...(q.members ?? "").split(",").map((x) => x.trim()).filter(Boolean)])].slice(0, 20);
+      const nearby = new Map<string, { stationId: string; name: string; distanceM: number; nearId: string }>();
+      for (const id of start) {
+        const st = byId.get(id);
+        if (!st) continue;
+        for (const h of gtfsHalteNear(s.gtfs, idx, byId, st, q.radius)) {
+          if (start.includes(h.stationId)) continue;
+          const prev = nearby.get(h.stationId);
+          if (!prev || prev.distanceM > h.distanceM) nearby.set(h.stationId, { ...h, nearId: id });
+        }
+      }
+      const added = [...nearby.values()].sort((a, b) => a.distanceM - b.distanceM);
+      return ok(res, { hub: null, memberIds: [...start, ...added.map((x) => x.stationId)].slice(0, 20), walks: [], nearby: added, source: "gtfs" });
+    }
     const hub = q.hubId ? (await s.commute.getHubs(ctx)).find((h) => h.id === q.hubId) : undefined;
     const members = [...new Set([...(hub?.memberIds ?? []), ...(q.members ?? "").split(",").map((x) => x.trim()).filter(Boolean)])].slice(0, 20);
     const walks = [...(hub?.walks ?? [])];
@@ -415,6 +536,14 @@ export function adminRoutes(s: Services): Router {
         if (w) walks.push(w);
       }
     ok(res, { hub: hub ?? null, memberIds: members, walks: walks.map(({ from, to, distanceM, minutes, notes }) => ({ from, to, distanceM, minutes, ...(notes ? { notes: notes.slice(0, 300) } : {}) })) });
+  });
+
+  // Usulan hub dari GTFS Transjakarta: halte koridor BRT di dekat stasiun rel yang belum satu hub dengannya.
+  r.get("/hubs/suggestions", async (req, res) => {
+    const q = parse(z.object({ source: z.enum(["gtfs"]).default("gtfs"), radius: z.coerce.number().min(50).max(600).default(250) }), req.query);
+    const ctx = newContext({ preview: true });
+    const [idx, stations, hubs] = await Promise.all([s.commute.index(ctx), s.stations.list(ctx), s.stations.hubs(ctx)]);
+    ok(res, { source: q.source, radius: q.radius, suggestions: gtfsHubSuggestions(s.gtfs, idx, stations, hubs, q.radius) });
   });
 
   // ---------- Pengaturan (bobot skor, ambang, disclaimer, LLM, TTL cache) ----------

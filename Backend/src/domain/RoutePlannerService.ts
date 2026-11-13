@@ -9,6 +9,7 @@ import { lineIdOf, lineRefOf, type StationIndex } from "../data/commute/station-
 import type { TjGtfs } from "../data/gtfs/TjGtfs";
 import type { Frequency, Hub, Line, Mode, RideOption, Route, RouteLeg, Station } from "./models";
 import { applyHubs, straightDistanceM, walkBetween, type HubProvider } from "./hubs";
+import { isLocal } from "./datasetOverlay";
 import { applyPatternsToSequences, patternMinutes, type LineSequences, type PatternProvider } from "./routePatterns";
 import { jakartaDayHour } from "../data/commute/HttpCommuteSource";
 import { headwayAround, isoAt, jakartaMinutes, matchTrips, medianMinutes, nextTrip, serviceHours, terminusTrips, typicalMinutes, type TripMatch } from "./railTimetable";
@@ -60,11 +61,33 @@ export class RoutePlannerService {
     return applyPatternsToSequences(base, patterns);
   }
 
-  async getRoute(fromId: string, toId: string, ctx: RequestContext, at?: string): Promise<Route | null> {
-    const fare = await this.commute.getFare(fromId, toId, ctx, at);
-    if (!fare) return null;
+  /**
+   * Rute dari /fares. Bila asal atau tujuan bukan stasiun dataset (stasiun bawaan NTD atau tambahan admin, yang
+   * tidak dikenal Commute), rute disusun dari urutan stasiun lini (`topology: false` mematikannya).
+   */
+  async getRoute(fromId: string, toId: string, ctx: RequestContext, at?: string, opts: { topology?: boolean } = {}): Promise<Route | null> {
+    const local = await this.localStations([fromId, toId], ctx);
+    const fare = await this.commute.getFare(fromId, toId, ctx, at).catch((e) => {
+      if (local) return null;
+      throw e;
+    });
+    if (!fare) return local && opts.topology !== false ? this.topologyRoute(fromId, toId, ctx, at) : null;
     const lines = await this.commute.getLines(ctx);
     return this.fixDirections(this.enrich(fare, lines), lines, ctx);
+  }
+
+  /** true bila salah satu stasiun bukan stasiun dataset (lihat datasetOverlay.ts). */
+  private async localStations(ids: string[], ctx: RequestContext): Promise<boolean> {
+    const stations = await this.commute.getStations(ctx);
+    return ids.some((id) => isLocal(stations.find((s) => s.id === id)));
+  }
+
+  /** Rute di atas urutan stasiun lini (pengaturan rute admin + dataset): ruas naik dari /fares bila ada, selain itu dari urutan. */
+  private async topologyRoute(fromId: string, toId: string, ctx: RequestContext, at?: string): Promise<Route | null> {
+    const [stations, lines, hubs, sequences] = await Promise.all([this.commute.getStations(ctx), this.commute.getLines(ctx), this.hubs(ctx), this.sequences(ctx)]);
+    const rides = findRides(fromId, toId, sequences, hubs, new Map(stations.map((s) => [s.id, s])), WALK_WEIGHT.AVERAGE);
+    if (!rides) return null;
+    return this.routeFromRides(rides, [], new Map(lines.map((l) => [l.id, l])), stations, hubs, ctx, at);
   }
 
   /**
@@ -328,7 +351,7 @@ export class RoutePlannerService {
   private async rideRoute(ride: Ride, avoidModes: readonly Mode[], lineById: Map<string, Line>, stations: Station[], ctx: RequestContext, at?: string): Promise<Route> {
     const from = ride.stops[0];
     const to = ride.stops[ride.stops.length - 1];
-    const fromDataset = await this.getRoute(from, to, ctx, at).catch(() => null);
+    const fromDataset = await this.getRoute(from, to, ctx, at, { topology: false }).catch(() => null);
     if (fromDataset && !usesModes(fromDataset, avoidModes)) {
       // Ruas pindah di ujung tidak diperlukan; perpindahan disusun oleh pemanggil.
       const legs = fromDataset.legs.slice();

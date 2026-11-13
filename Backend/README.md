@@ -118,7 +118,13 @@ Hanya origin di `ADMIN_ORIGINS` yang boleh memanggil lewat browser. Peran `admin
 | POST | `/tests/run`, `/tests/:id/run`, `/tests/adhoc` · GET `/tests/runs` | Jalankan uji pada data `published` atau `preview` |
 | GET | `/routes` · `/routes/:lineId/defaults?source=gtfs\|commute` | Urutan stasiun lini; rute bawaan dua arah untuk sinkron (urutan, waktu antarpemberhentian, frekuensi, jam layanan, `notes` ringkasan) |
 | POST | `/routes/sync` | `{lineIds (1–10), source: auto\|gtfs\|commute}`: sinkron banyak rute sekaligus dan simpan sebagai draft kedua arah; catatan admin dipertahankan |
-| GET | `/hubs` · `/hubs/defaults?hubId=&members=` | Hub yang berlaku (pratinjau) dan hub bawaan; data Commute untuk satu hub (anggota dan jalan kaki dari `/transfers`) |
+| GET | `/hubs` · `/hubs/defaults?hubId=&members=&source=commute\|gtfs` | Hub yang berlaku (pratinjau) dan hub bawaan; data Commute untuk satu hub (anggota dan jalan kaki dari `/transfers`), atau halte koridor BRT GTFS dalam `radius` (bawaan 300 m) dari anggotanya |
+| GET | `/lines` | Lini yang berlaku di pratinjau (dataset + rute tambahan/koreksi admin) |
+| GET | `/hubs/suggestions?source=gtfs&radius=` | Usulan hub dari GTFS: halte koridor BRT dalam 250 m dari stasiun rel yang belum satu hub dengannya |
+| POST | `/dataset/refresh` | `{parts?: stations\|lines\|hubs}` (admin): muat ulang dari Commute sekarang juga tanpa menunggu cache; balikan perubahan (`diff`), pengaturan rute yang tertinggal (`stalePatterns`) |
+| GET | `/stations/candidates?source=commute\|gtfs` | Usulan stasiun yang belum ada di NTD: stasiun di lin Commute yang belum di `/stations`, atau halte GTFS (plus halte yang nama/koordinatnya berbeda) |
+| GET | `/stations/defaults?stationId=&source=commute\|gtfs` | Isian form stasiun dari Commute atau GTFS |
+| GET | `/routes/candidates?source=gtfs` | Koridor BRT GTFS yang belum menjadi rute NTD (untuk tambah rute) |
 | GET | `/system` · POST `/cache/purge` · GET `/audit` | Status layanan, kosongkan cache, log aktivitas |
 | POST | `/stations/:id/floor-plan` | `{images: [{data, name?}]}` (1–4 gambar base64, maks. 5 MB/gambar) → usulan fasilitas, peron, gate, dan info dari AI. Tidak menyimpan apa pun; dibatasi 20 kali per 10 menit |
 | GET, PUT | `/ai/vision` | Penyedia AI pembaca denah (provider, model, endpoint, batas waktu, kunci API). Kunci tidak pernah dikembalikan; PUT hanya admin |
@@ -127,6 +133,13 @@ Hanya origin di `ADMIN_ORIGINS` yang boleh memanggil lewat browser. Peran `admin
 
 - Sinkron rute dari GTFS Transjakarta mengisi waktu antarhalte, frekuensi rata-rata (ditimbang lama jendela frekuensi), dan jam layanan. Dari Commute, moda rel memakai jadwal hari kerja (`/stations/{op}/{code}/timetable`): waktu = median selisih jam berangkat pada nomor perjalanan yang sama di dua stasiun berurutan, frekuensi = rata-rata jarak keberangkatan dari stasiun awal, jam layanan = keberangkatan pertama–terakhir. TransJakarta lewat Commute memakai GTFS untuk waktu dan `/headway` (pukul 08.00) untuk frekuensi dan jam layanan. Pemberhentian yang belum dikenal NTD dibuang.
 - Hub transfer berlaku = `/hubs` Commute + hub bawaan NTD (`CURATED_HUBS`, mis. halte TransJakarta Cawang ↔ stasiun LRT Cawang, 170 m dari `/transfers`) + konten `hub` dari admin (id sama menggantikan, `disabled` menonaktifkan). Hub dipakai pencarian rute topologi, alternatif di hub, dan `hubId` stasiun. Hub tanpa data jalan kaki memakai jarak garis lurus antarkoordinat.
+
+#### Stasiun dan rute manual, sinkron dataset
+
+- Konten `station` (satu per stasiun, `stationId` = id stasiun) menambah stasiun yang belum ada di dataset (id baru, mis. `ntd:halte-baru`, atau id turunan `lrtj:kym` dari usulan) atau mengoreksi nama/operator/nomor/lini/koordinat stasiun dataset dengan id sama. Konten `line` (satu per `lineId`) menambah rute baru atau mengoreksi nama/operator/moda/warna. Urutan pemberhentian tetap lewat `route_pattern`.
+- Stasiun yang tidak dikenal Commute (`source` `admin` atau `ntd`) dirutekan di atas urutan lini (pengaturan rute admin + dataset); waktu dari pengaturan rute bila diisi.
+- Stasiun bawaan NTD (`BUILTIN_STATIONS`, `src/domain/datasetOverlay.ts`): LRT Jakarta Pramuka (S08, beroperasi 12 November 2026). Hanya dipakai bila lini `lrtj:s` ada di dataset tetapi stasiunnya belum (mis. cache lama); Commute Data API sudah memuatnya sejak 11 November.
+- `GET /routes` memberi `missing` untuk lini yang pengaturan rutenya tertinggal dari dataset (mis. urutan LRT Jakarta yang disinkron sebelum Pramuka dikenal). Sinkron ulang rute itu untuk memasukkannya.
 
 #### Isi fasilitas dari gambar denah
 

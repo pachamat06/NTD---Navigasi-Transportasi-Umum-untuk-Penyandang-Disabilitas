@@ -110,7 +110,7 @@ interface ApiOperator {
 }
 
 interface ApiLineDetail {
-  segments?: { kind?: string; joinsAtCode?: string | null; stations?: { id: string; code: string; stationNumber?: string }[] }[];
+  segments?: { kind?: string; joinsAtCode?: string | null; stations?: { id: string; code: string; name?: string; stationNumber?: string }[] }[];
 }
 
 interface ApiFareStation {
@@ -389,10 +389,11 @@ function mapStation(s: ApiStation, hub: string | null): UpStation {
 }
 
 /** Stasiun sebuah lin, urut dari stasiun awal; cabang (loop, ramp) ditambahkan setelah batang utama. */
-function lineStations(operator: string, detail: ApiLineDetail | null): Pick<UpLine, "stations" | "stationNumbers" | "segments"> {
+function lineStations(operator: string, detail: ApiLineDetail | null): Pick<UpLine, "stations" | "stationNumbers" | "stationNames" | "segments"> {
   const seen = new Set<string>();
   const stations: UpStopRef[] = [];
   const stationNumbers: (string | null)[] = [];
+  const stationNames: (string | null)[] = [];
   const segments: NonNullable<UpLine["segments"]> = [];
   for (const seg of detail?.segments ?? []) {
     const refs: UpStopRef[] = [];
@@ -404,12 +405,13 @@ function lineStations(operator: string, detail: ApiLineDetail | null): Pick<UpLi
         seen.add(key);
         stations.push(ref);
         stationNumbers.push(st.stationNumber || null);
+        stationNames.push(st.name || null);
       }
     }
     if (refs.length)
       segments.push({ stations: refs, ...(seg.joinsAtCode ? { joinsAt: { operator, code: seg.joinsAtCode } } : {}), ...(seg.kind === "LOOP" ? { loop: true } : {}) });
   }
-  return { stations, stationNumbers, segments };
+  return { stations, stationNumbers, stationNames, segments };
 }
 
 function mapFare(f: ApiFare): UpFare {

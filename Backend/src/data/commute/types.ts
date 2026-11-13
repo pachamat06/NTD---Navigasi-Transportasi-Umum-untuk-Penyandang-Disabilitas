@@ -48,6 +48,11 @@ export interface UpLine {
   /** Nomor stasiun pada lin ini (sejajar dengan `stations`), mis. "C12" atau "1-13"; dipakai untuk posisi di peta. */
   stationNumbers?: (string | null)[];
   /**
+   * Nama stasiun pada lin ini (sejajar dengan `stations`). Lin bisa memuat stasiun yang belum ada di /stations
+   * (mis. stasiun perpanjangan yang belum beroperasi); namanya dipakai admin untuk menambahkannya.
+   */
+  stationNames?: (string | null)[];
+  /**
    * Ruas lin berurutan (batang utama dan cabang). `joinsAt` = stasiun tempat cabang berpisah dari batang utama.
    * `loop` = ruas putaran (mis. lingkar Lin Cikarang Pondok Jati ... Matraman) yang tersambung ke `joinsAt` di
    * KEDUA ujungnya. Tidak diisi = `stations` adalah satu ruas lurus.

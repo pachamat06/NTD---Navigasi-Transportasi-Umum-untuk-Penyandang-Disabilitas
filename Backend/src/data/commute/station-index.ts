@@ -77,9 +77,10 @@ const LINE_BY_KEY = new Map<string, LineIndexEntry>();
 for (const l of LINE_INDEX) for (const k of [`${l.operator}:${l.code}`, ...l.live]) LINE_BY_KEY.set(k.toUpperCase(), l);
 const LINE_BY_ID = new Map(LINE_INDEX.map((l) => [l.id, l]));
 
+/** Id turunan `operator:kode`. Id berawalan `ntd:` (stasiun buatan admin) tidak punya padanan di sumber data. */
 function parseDerived(stationId: string): StationRef[] {
   const x = /^([a-z0-9]+):([a-z0-9-]+)$/i.exec(stationId);
-  return x ? [{ operator: x[1].toUpperCase(), code: x[2].toUpperCase() }] : [];
+  return x && x[1].toLowerCase() !== "ntd" ? [{ operator: x[1].toUpperCase(), code: x[2].toUpperCase() }] : [];
 }
 
 /** id NTD untuk sebuah stasiun pada sumber offline. */
