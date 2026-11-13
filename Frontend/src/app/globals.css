@@ -205,3 +205,257 @@ body {
     animation: none;
   }
 }
+
+/* ---------- Tata letak perencana: peta penuh + panel samping ---------- */
+.side-panel {
+  background: var(--surface);
+  box-shadow: 0 10px 30px rgb(0 0 0 / 0.18);
+}
+.form-zone {
+  background: var(--surface-2);
+}
+.field {
+  min-height: 2.75rem;
+  width: 100%;
+  border: 2px solid var(--border);
+  border-radius: 0.5rem;
+  background: var(--surface);
+  padding: 0 0.6rem;
+}
+.field:focus {
+  border-color: var(--accent);
+  outline: none;
+}
+/* Pilihan dua tombol Berangkat/Tiba */
+.seg {
+  display: grid;
+  grid-template-columns: 1fr 1fr;
+  gap: 0.5rem;
+}
+.seg label {
+  display: flex;
+  min-height: 2.75rem;
+  cursor: pointer;
+  align-items: center;
+  justify-content: center;
+  gap: 0.4rem;
+  border: 2px solid var(--border);
+  border-radius: 0.5rem;
+  background: var(--surface);
+  color: var(--accent);
+  font-weight: 600;
+}
+.seg label:has(input:checked) {
+  border-color: var(--foreground);
+  color: var(--foreground);
+}
+.seg label:has(:focus-visible) {
+  outline: 3px solid var(--accent);
+  outline-offset: 2px;
+}
+.pref-list {
+  border: 1px solid var(--border);
+  border-radius: 0.5rem;
+  background: var(--surface);
+}
+.pref-list > label {
+  display: flex;
+  min-height: 2.9rem;
+  cursor: pointer;
+  align-items: center;
+  gap: 0.75rem;
+  padding: 0.35rem 0.75rem;
+}
+.pref-list > label + label {
+  border-top: 1px solid var(--border);
+}
+.pref-list input {
+  margin-left: auto;
+  width: 1.3rem;
+  height: 1.3rem;
+  flex-shrink: 0;
+  accent-color: var(--accent);
+}
+.link-sm {
+  color: var(--accent);
+  font-weight: 600;
+  text-decoration: underline;
+  text-underline-offset: 3px;
+  min-height: 2rem;
+}
+.btn-ghost {
+  display: inline-flex;
+  min-height: 2.75rem;
+  align-items: center;
+  justify-content: center;
+  border: 1px solid var(--border);
+  border-radius: 0.4rem;
+  background: var(--surface);
+  padding: 0 0.9rem;
+  color: var(--accent);
+  font-weight: 600;
+  box-shadow: 0 1px 2px rgb(0 0 0 / 0.12);
+}
+.btn-ghost:hover {
+  background: var(--surface-2);
+}
+
+/* Kartu hasil perjalanan */
+.journey {
+  position: relative;
+  border: 1px solid var(--border);
+  border-radius: 0.6rem;
+  background: var(--surface);
+  padding: 0.9rem 1rem;
+}
+.journey-on {
+  border: 2px solid var(--accent);
+  padding: calc(0.9rem - 1px) calc(1rem - 1px);
+}
+.journey-hit {
+  position: absolute;
+  inset: 0;
+  z-index: 0;
+  border-radius: inherit;
+  cursor: pointer;
+}
+.journey-hit:hover {
+  background: rgb(10 88 202 / 0.04);
+}
+.walk-dots {
+  display: inline-block;
+  width: 1.6rem;
+  height: 4px;
+  background-image: radial-gradient(circle, var(--foreground) 1.6px, transparent 1.8px);
+  background-size: 6px 4px;
+}
+
+/* Langkah perjalanan: ikon di kolom kiri, garis warna lin di sepanjang ruas */
+.steps {
+  list-style: none;
+  margin: 0;
+  padding: 0;
+}
+.step-head {
+  display: flex;
+  align-items: flex-start;
+  gap: 0.6rem;
+}
+.step-icon {
+  display: grid;
+  width: 1.9rem;
+  min-height: 1.75rem;
+  flex-shrink: 0;
+  place-items: center;
+}
+.step-body {
+  display: flex;
+  flex-direction: column;
+  gap: 0.5rem;
+  margin: 0.25rem 0 0.35rem calc(0.95rem - 3px);
+  padding: 0.15rem 0 0.75rem calc(1.6rem - 3px);
+  border-left: 6px solid var(--leg);
+}
+.step[data-walk] > .step-body {
+  border-left: 6px dotted var(--foreground);
+}
+.steps-compact .step-body {
+  gap: 0.2rem;
+  padding-bottom: 0.4rem;
+}
+.step-name {
+  font-weight: 700;
+  text-align: left;
+}
+.step-name:hover {
+  text-decoration: underline;
+}
+
+/* Peringatan ringkas */
+.alert {
+  border-radius: 0.25rem;
+  background: #f8f2dd;
+  color: #1b1b1b;
+}
+/* Di dalam langkah: blok melebar sampai menutupi garis lin, ikon tepat di atas garis. */
+.step-body > .alert {
+  margin-left: calc(-2rem - 10px);
+}
+.alert-info {
+  background: var(--accent-soft);
+  color: var(--foreground);
+}
+.alert-head {
+  display: flex;
+  width: 100%;
+  min-height: 2.6rem;
+  align-items: center;
+  gap: 0.6rem;
+  padding: 0.3rem 0.75rem 0.3rem 0.4rem;
+  color: #0a4fb4;
+  font-weight: 600;
+  text-align: left;
+}
+.alert-info .alert-head {
+  color: var(--accent);
+}
+.alert-i {
+  display: grid;
+  width: 1.25rem;
+  height: 1.25rem;
+  place-items: center;
+  border-radius: 9999px;
+  background: var(--accent);
+  color: #fff;
+  font-size: 0.8rem;
+  font-weight: 800;
+}
+.alert-body {
+  padding: 0 0.75rem 0.7rem 2.3rem;
+  font-size: 0.875rem;
+  line-height: 1.45;
+}
+@media (prefers-color-scheme: dark) {
+  :root:not([data-contrast="high"]) .alert:not(.alert-info) {
+    background: #3a3218;
+    color: #f4ecd2;
+  }
+  :root:not([data-contrast="high"]) .alert:not(.alert-info) .alert-head {
+    color: #ffd466;
+  }
+}
+:root[data-contrast="high"] .alert {
+  border: 2px solid #000;
+}
+
+/* Bagian yang bisa dibuka/tutup (rincian aksesibilitas) */
+.disclosure {
+  border-radius: 0.25rem;
+  background: var(--surface-2);
+}
+.disclosure > summary {
+  display: flex;
+  min-height: 2.9rem;
+  cursor: pointer;
+  list-style: none;
+  align-items: center;
+  justify-content: space-between;
+  padding: 0 0.75rem;
+  color: var(--accent);
+  font-weight: 600;
+}
+.disclosure > summary::-webkit-details-marker {
+  display: none;
+}
+.disclosure[open] > summary svg {
+  transform: rotate(180deg);
+}
+.map-legend-btn {
+  min-height: 2.75rem;
+  border: 1px solid var(--border);
+  border-radius: 0.5rem;
+  background: var(--surface);
+  padding: 0 0.9rem;
+  font-weight: 600;
+  box-shadow: 0 2px 6px rgb(0 0 0 / 0.15);
+}

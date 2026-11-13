@@ -13,6 +13,12 @@ type Props = {
   onSetOrigin: (id: string) => void;
   onSetDestination: (id: string) => void;
   onShowDetail: (id: string) => void;
+  /** Peta penuh sebagai latar belakang halaman (panel pencarian menutupi sisi kiri). */
+  fullscreen?: boolean;
+  /** Lebar (px) sisi kiri peta yang tertutup panel; rute dan area awal dipusatkan di bagian yang terlihat. */
+  insetLeft?: number;
+  /** Naikkan angka ini untuk mengarahkan peta ke rute lagi (mis. tombol "Tampilkan di peta"). */
+  fitSignal?: number;
 };
 
 type View = { x: number; y: number; w: number };
@@ -26,13 +32,15 @@ const TOUCH_PX = 22; // radius area sentuh di layar (diameter 44 px)
  * di atasnya digambar titik stasiun yang bisa dipilih, sorotan rute, dan status aksesibilitas
  * memakai indeks posisi (kode stasiun -> x, y). Peta hanya untuk memilih dan menyorot, bukan menghitung rute.
  */
-export function TransitMap({ originId, destinationId, route, onSetOrigin, onSetDestination, onShowDetail }: Props) {
+export function TransitMap({ originId, destinationId, route, onSetOrigin, onSetDestination, onShowDetail, fullscreen = false, insetLeft = 0, fitSignal = 0 }: Props) {
   const { stations: STATIONS, lines: LINES, hubs: HUBS, lineById, assess, positionOf, positionOn, mapTracks } = useNetwork();
   const boxRef = useRef<HTMLDivElement>(null);
   const [size, setSize] = useState({ w: 800, h: 520 });
   const [view, setView] = useState<View>({ x: MAP_ASSET.initialView.x, y: MAP_ASSET.initialView.y, w: MAP_ASSET.initialView.width });
   const [loaded, setLoaded] = useState(false);
   const [popup, setPopup] = useState<string | null>(null);
+  const [legendOpen, setLegendOpen] = useState(false);
+  const [known, setKnown] = useState(false);
   const pointers = useRef(new Map<number, { x: number; y: number }>());
   const gesture = useRef<{ view: View; x: number; y: number; dist: number; moved: boolean } | null>(null);
 
@@ -49,7 +57,10 @@ export function TransitMap({ originId, destinationId, route, onSetOrigin, onSetD
   useEffect(() => {
     const el = boxRef.current;
     if (!el) return;
-    const ro = new ResizeObserver(([e]) => setSize({ w: e.contentRect.width, h: e.contentRect.height }));
+    const ro = new ResizeObserver(([e]) => {
+      setSize({ w: e.contentRect.width, h: e.contentRect.height });
+      setKnown(true);
+    });
     ro.observe(el);
     return () => ro.disconnect();
   }, []);
@@ -82,17 +93,46 @@ export function TransitMap({ originId, destinationId, route, onSetOrigin, onSetD
     return { x: view.x + (clientX - r.left) / scale, y: view.y + (clientY - r.top) / scale };
   };
 
+  // Bagian peta yang terlihat (tidak tertutup panel), dalam px layar.
+  const inset = Math.min(Math.max(insetLeft, 0), size.w * 0.7);
+  const visW = Math.max(size.w - inset, 1);
+
+  /** Tampilkan kotak (koordinat peta) di tengah bagian peta yang terlihat. */
+  const showBox = (minX: number, minY: number, maxX: number, maxY: number, pad: number) => {
+    const wv = Math.max(maxX - minX + pad * 2, ((maxY - minY + pad * 2) * visW) / Math.max(size.h, 1), (MIN_W * visW) / size.w);
+    const w = (wv * size.w) / visW;
+    const cx = (maxX + minX) / 2;
+    const cy = (maxY + minY) / 2;
+    setView(clamp({ w, x: cx - ((inset + visW / 2) * w) / size.w, y: cy - (w * aspect) / 2 }));
+  };
+
   const fitRoute = () => {
     if (!route) return;
     const pts = route.legs.flatMap((l) => l.stops).map((s) => positionOf(s)).filter((p) => !!p);
+    if (!pts.length) return;
     const xs = pts.map((p) => p.x);
     const ys = pts.map((p) => p.y);
-    const pad = 220;
-    const w = Math.max(Math.max(...xs) - Math.min(...xs) + pad * 2, (Math.max(...ys) - Math.min(...ys) + pad * 2) / aspect, MIN_W);
-    const cx = (Math.max(...xs) + Math.min(...xs)) / 2;
-    const cy = (Math.max(...ys) + Math.min(...ys)) / 2;
-    setView(clamp({ w, x: cx - w / 2, y: cy - (w * aspect) / 2 }));
+    showBox(Math.min(...xs), Math.min(...ys), Math.max(...xs), Math.max(...ys), 220);
   };
+
+  const homeView = () => {
+    const v = MAP_ASSET.initialView;
+    showBox(v.x, v.y, v.x + v.width, v.y + v.height, 0);
+  };
+
+  // Peta penuh: area awal dipusatkan di bagian yang terlihat setelah ukuran peta diketahui.
+  const homed = useRef(false);
+  useEffect(() => {
+    if (!fullscreen || homed.current || route || !known) return;
+    homed.current = true;
+    queueMicrotask(homeView);
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [fullscreen, known]);
+
+  useEffect(() => {
+    if (fitSignal > 0) queueMicrotask(fitRoute);
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [fitSignal]);
 
   // Saat hasil rute baru tiba, arahkan peta ke rute tersebut.
   const routeKey = route?.legs.map((l) => l.stops.join(">")).join("|") ?? "";
@@ -113,11 +153,11 @@ export function TransitMap({ originId, destinationId, route, onSetOrigin, onSetD
   };
 
   return (
-    <div className="relative overflow-hidden rounded-xl border border-[var(--border)] bg-white">
+    <div className={fullscreen ? "absolute inset-0 overflow-hidden bg-white" : "relative overflow-hidden rounded-xl border border-[var(--border)] bg-white"}>
       <a href="#hasil" className="sr-only focus:not-sr-only focus:absolute focus:left-2 focus:top-2 focus:z-30 focus:rounded focus:bg-[var(--surface)] focus:p-2">
         Lewati peta
       </a>
-      <div ref={boxRef} className="relative h-[360px] w-full md:h-[560px]">
+      <div ref={boxRef} className={fullscreen ? "absolute inset-0" : "relative h-[360px] w-full md:h-[560px]"}>
         {!loaded && (
           <p className="absolute inset-0 grid place-items-center text-sm text-[var(--muted)]" role="status">
             Memuat peta…
@@ -327,7 +367,8 @@ export function TransitMap({ originId, destinationId, route, onSetOrigin, onSetD
           <div
             role="dialog"
             aria-label={`Stasiun ${popupStation.name}`}
-            className="absolute left-1/2 top-3 z-20 w-[min(320px,calc(100%-24px))] -translate-x-1/2 rounded-xl border border-[var(--border)] bg-[var(--surface)] p-4 shadow-xl"
+            style={{ left: inset + visW / 2 }}
+            className="absolute top-3 z-20 w-[min(320px,calc(100%-24px))] -translate-x-1/2 rounded-xl border border-[var(--border)] bg-[var(--surface)] p-4 shadow-xl"
           >
             <div className="flex items-start justify-between gap-2">
               <div>
@@ -385,7 +426,7 @@ export function TransitMap({ originId, destinationId, route, onSetOrigin, onSetD
           <button
             className="map-btn"
             aria-label={route ? "Tampilkan seluruh rute" : "Kembali ke area hub"}
-            onClick={() => (route ? fitRoute() : setView({ x: MAP_ASSET.initialView.x, y: MAP_ASSET.initialView.y, w: MAP_ASSET.initialView.width }))}
+            onClick={() => (route ? fitRoute() : homeView())}
           >
             ⟲
           </button>
@@ -395,7 +436,26 @@ export function TransitMap({ originId, destinationId, route, onSetOrigin, onSetD
         </div>
       </div>
 
-      <div className="flex flex-wrap items-center gap-x-4 gap-y-1 border-t border-[var(--border)] bg-[var(--surface)] px-3 py-2 text-xs">
+      {fullscreen && (
+        <button
+          type="button"
+          className="map-legend-btn absolute bottom-3 right-3 z-10"
+          aria-expanded={legendOpen}
+          aria-controls="keterangan-peta"
+          onClick={() => setLegendOpen((v) => !v)}
+        >
+          {legendOpen ? "Tutup keterangan" : "Keterangan"}
+        </button>
+      )}
+      <div
+        id="keterangan-peta"
+        hidden={fullscreen && !legendOpen}
+        className={
+          fullscreen
+            ? "absolute bottom-16 right-3 z-10 flex w-[min(360px,calc(100%-24px))] flex-col gap-1 rounded-xl border border-[var(--border)] bg-[var(--surface)] p-3 text-xs shadow-lg"
+            : "flex flex-wrap items-center gap-x-4 gap-y-1 border-t border-[var(--border)] bg-[var(--surface)] px-3 py-2 text-xs"
+        }
+      >
         <span className="flex items-center gap-1">
           <span aria-hidden className="inline-block h-3 w-3 rounded-full border-2 border-[var(--accent)]" /> stasiun/halte dalam cakupan NTD
         </span>

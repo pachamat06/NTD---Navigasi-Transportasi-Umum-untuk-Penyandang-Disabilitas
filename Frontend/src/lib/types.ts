@@ -367,6 +367,8 @@ export interface Route {
   /** Sebagian waktu tempuh adalah perkiraan dari jadwal GTFS Transjakarta. */
   timeEstimated?: boolean;
   totalFare: number;
+  /** false = tarif sebagian ruas tidak ada di dataset. */
+  fareComplete?: boolean;
   transfers: number;
   /** Nama pemberhentian dari data rute, untuk halte/stasiun yang tidak ada di daftar stasiun. */
   stopNames?: Record<string, string>;
