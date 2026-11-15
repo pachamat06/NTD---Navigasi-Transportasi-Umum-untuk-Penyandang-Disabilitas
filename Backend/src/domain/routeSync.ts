@@ -66,10 +66,10 @@ export class RouteSyncService {
    * ke ruas berikutnya.
    */
   async defaults(lineId: string, source: SyncSource, ctx: RequestContext): Promise<SyncDefaults> {
-    const raw = await this.rawDefaults(lineId, source, ctx);
-    if (!raw.patterns.length) return raw;
     const known = new Set((await this.commute.getStations(ctx)).map((s) => s.id));
     const dropped = new Set<string>();
+    const raw = await this.rawDefaults(lineId, source, ctx, known, dropped);
+    if (!raw.patterns.length) return raw;
     const cleaned = raw.patterns.flatMap((p) => {
       const stops = dropUnknown(p.stops, known, dropped);
       return stops.length >= 2 ? [{ ...p, stops }] : [];
@@ -87,7 +87,7 @@ export class RouteSyncService {
     return { ...raw, patterns, branches: kept, notes };
   }
 
-  private async rawDefaults(lineId: string, source: SyncSource, ctx: RequestContext): Promise<SyncDefaults> {
+  private async rawDefaults(lineId: string, source: SyncSource, ctx: RequestContext, known: Set<string>, dropped: Set<string>): Promise<SyncDefaults> {
     const ref = lineRefOf(lineId);
     if (source === "gtfs") {
       if (ref?.operator !== "TJ" || !this.gtfs.hasRoute(ref.code)) return { source, patterns: [], branches: [], notes: ["Data GTFS hanya tersedia untuk koridor BRT TransJakarta yang tercantum di NTD."] };
@@ -98,7 +98,10 @@ export class RouteSyncService {
       return { source, patterns, branches: seq?.sequences.slice(1) ?? [], notes: [] };
     }
     const seq = (await this.commute.getLineSequences(ctx)).find((x) => x.lineId === lineId);
-    const base = defaultsFromSequences(seq);
+    const all = defaultsFromSequences(seq);
+    // Stasiun yang belum dikenal (belum beroperasi, tanpa jadwal) dibuang sebelum waktu dihitung, agar waktu rel diukur
+    // langsung antarstasiun yang dilayani (mis. Pramuka > Manggarai melewati Matraman dan Proklamasi yang belum dibuka).
+    const base = { ...all, patterns: all.patterns.flatMap((p) => { const stops = dropUnknown(p.stops, known, dropped); return stops.length >= 2 ? [{ ...p, stops }] : []; }) };
     if (!base.patterns.length || !ref) return { source, ...base, notes: base.patterns.length ? [] : ["Urutan stasiun lini ini tidak ada di Commute."] };
     const patterns = ref.operator === "TJ" ? await this.fillBus(base.patterns, ref.code, lineId, ctx) : await this.fillRail(base.patterns, ref, ctx);
     return { source, patterns, branches: base.branches, notes: [] };

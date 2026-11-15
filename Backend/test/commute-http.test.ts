@@ -3,6 +3,7 @@
 
 import request from "supertest";
 import { HttpCommuteSource, refOfId, stopParam } from "../src/data/commute/HttpCommuteSource";
+import { newContext } from "../src/context";
 import { datasetOption, makeTestApp } from "./helpers";
 
 const st = (id: string, name: string, lines: string[], amenities: { type: string; text?: string }[] = [], extra: object = {}) => {
@@ -18,7 +19,10 @@ const STATIONS = [
   st("KCI-MRI", "Manggarai", ["KCI:A", "KCI:B", "KCI:C"], [{ type: "ELEVATOR_PAID" }, { type: "ESCALATOR_PAID" }, { type: "TOILET_ACCESSIBLE" }]),
   st("MRTJ-DKA", "Dukuh Atas BNI", ["MRTJ:M"], [{ type: "ELEVATOR_UNPAID" }]),
   st("MRTJ-BNH", "Bendungan Hilir", ["MRTJ:M"]),
-  st("LRTJBDB-DKA", "Dukuh Atas BSI", ["LRTJBDB:C", "LRTJBDB:B"]),
+  st("LRTJBDB-DKA", "Dukuh Atas BSI", ["LRTJBDB:BK", "LRTJBDB:CB"]),
+  st("LRTJBDB-CWG", "Cawang", ["LRTJBDB:BK", "LRTJBDB:CB"]),
+  st("LRTJBDB-JTM", "Jatimulya", ["LRTJBDB:BK"]),
+  st("LRTJBDB-HAR", "Harjamukti", ["LRTJBDB:CB"]),
   st("TJ-B01", "Dukuh Atas 1", ["TJ:1"]),
   st("KCI-JAKK", "Jakarta Kota", ["KCI:B"], [{ type: "TOILET_ACCESSIBLE" }]),
   st("MRTJ-BHI", "Bundaran HI Bank Jakarta", ["MRTJ:M"], [{ type: "ELEVATOR_UNPAID" }]),
@@ -50,8 +54,8 @@ const OPERATORS = [
   ] },
   { code: "MRTJ", name: "MRT Jakarta", url: "https://jakartamrt.co.id/", timezone: "Asia/Jakarta", lang: "id", mode: "SUBWAY", lines: [{ name: "Lin Utara Selatan", lineCode: "M", colorCode: "#ca2a51", mode: "SUBWAY", searchable: true }] },
   { code: "LRTJBDB", name: "LRT Jabodebek", url: "https://lrtjabodebek.id/", timezone: "Asia/Jakarta", lang: "id", mode: "TRAM", lines: [
-    { name: "Lin Cibubur", lineCode: "C", colorCode: "#155a2a", mode: "TRAM", searchable: true },
-    { name: "Lin Bekasi", lineCode: "B", colorCode: "#155a2a", mode: "TRAM", searchable: true },
+    { name: "Lin Bekasi", lineCode: "BK", colorCode: "#006838", mode: "TRAM", searchable: true },
+    { name: "Lin Cibubur", lineCode: "CB", colorCode: "#21409A", mode: "TRAM", searchable: true },
   ] },
   { code: "TJ", name: "TransJakarta", url: "https://transjakarta.co.id/", timezone: "Asia/Jakarta", lang: "id", mode: "BUS", lines: [{ name: "Koridor 1", lineCode: "1", colorCode: "#ccc", mode: "BUS", searchable: true }] },
 ];
@@ -63,7 +67,8 @@ const LINES: Record<string, object> = {
   "KCI/B": { segments: [{ kind: "TRUNK", joinsAtCode: null, stations: [ls("KCI-JAKK", "B01"), ls("KCI-MRI", "B10")] }] },
   "TJ/1": { segments: [{ kind: "TRUNK", joinsAtCode: null, stations: [ls("TJ-H00275P", "1-20"), ls("TJ-H00022P", "1-8"), ls("TJ-B01", "1-6")] }] },
   "MRTJ/M": { segments: [{ kind: "TRUNK", joinsAtCode: null, stations: [ls("MRTJ-BNH", "M10"), ls("MRTJ-DKA", "M12")] }] },
-  "LRTJBDB/C": { segments: [{ kind: "TRUNK", joinsAtCode: null, stations: [ls("LRTJBDB-DKA", "C01")] }] },
+  "LRTJBDB/BK": { segments: [{ kind: "TRUNK", joinsAtCode: null, stations: [ls("LRTJBDB-DKA", "BK01"), ls("LRTJBDB-CWG", "BK08"), ls("LRTJBDB-JTM", "BK14")] }] },
+  "LRTJBDB/CB": { segments: [{ kind: "TRUNK", joinsAtCode: null, stations: [ls("LRTJBDB-DKA", "CB01"), ls("LRTJBDB-CWG", "CB08"), ls("LRTJBDB-HAR", "CB12")] }] },
 };
 
 const fs = (id: string) => ({ id, name: STATIONS.find((s) => s.id === id)?.name ?? id, latitude: -6.2, longitude: 106.8 });
@@ -153,12 +158,33 @@ describe("HttpCommuteSource (bentuk Commute Data API asli)", () => {
     expect(bnh.amenities.lift).toBe("unknown");
   });
 
+  it("LRT Jabodebek: urutan Lin Bekasi ke Jatimulya dan Lin Cibubur ke Harjamukti, pengaturan rute lini lama diabaikan", async () => {
+    const { app, store, services, login } = await setup({}, ["KCI", "MRTJ", "LRTJ", "LRTJBDB", "APCGK"]);
+    // Pengaturan rute admin untuk lini gabungan lama "lrt-jbd" (sebelum Lin Bekasi dan Lin Cibubur dipisah).
+    await store.content.saveDraft({ kind: "route_pattern", stationId: null, data: { lineId: "lrt-jbd", direction: 0, stops: [{ stationId: "dukuh-atas-lrt" }, { stationId: "lrtjbdb:har", minutes: 30 }], source: "commute" }, by: "uji" });
+    await store.content.publish("all", "uji");
+    const seqs = await services.planner.sequences(newContext({ preview: true }));
+    expect(seqs.find((x) => x.lineId === "lrtjbdb:bk")?.sequences).toEqual([["dukuh-atas-lrt", "lrtjbdb:cwg", "lrtjbdb:jtm"]]);
+    expect(seqs.find((x) => x.lineId === "lrtjbdb:cb")?.sequences).toEqual([["dukuh-atas-lrt", "lrtjbdb:cwg", "lrtjbdb:har"]]);
+    expect(seqs.some((x) => x.lineId === "lrt-jbd")).toBe(false);
+    const auth = { Authorization: `Bearer ${await login()}` };
+    const routes = (await request(app).get("/api/admin/routes").set(auth)).body.data as { lineId: string; base: string[][] }[];
+    expect(routes.find((r) => r.lineId === "lrtjbdb:bk")?.base).toEqual([["dukuh-atas-lrt", "lrtjbdb:cwg", "lrtjbdb:jtm"]]);
+    expect(routes.find((r) => r.lineId === "lrtjbdb:cb")?.base).toEqual([["dukuh-atas-lrt", "lrtjbdb:cwg", "lrtjbdb:har"]]);
+    const sync = (await request(app).get("/api/admin/routes/lrtjbdb:bk/defaults?source=commute").set(auth)).body.data as { patterns: { stops: { stationId: string }[] }[] };
+    expect(sync.patterns.map((p) => p.stops[p.stops.length - 1].stationId).sort()).toEqual(["dukuh-atas-lrt", "lrtjbdb:jtm"]);
+  });
+
   it("lini dari /operators + /lines, hub memakai slug", async () => {
     const { app, api } = await setup({}, ["KCI", "MRTJ", "LRTJ", "LRTJBDB", "APCGK"]);
     const net = (await request(app).get("/api/network")).body.data;
     const ckr = net.lines.find((l: { id: string }) => l.id === "krl-cikarang");
     expect(ckr).toMatchObject({ name: "Lin Cikarang", color: "#25B8EB", operator: "Commuter Line", stationIds: ["tanah-abang", "kci:kat", "bni-city", "sudirman", "manggarai"] });
-    expect(net.lines.find((l: { id: string }) => l.id === "lrt-jbd")).toMatchObject({ stationIds: ["dukuh-atas-lrt"] });
+    // Lin Bekasi dan Lin Cibubur LRT Jabodebek berbagi ruas Dukuh Atas–Cawang tetapi tetap dua lini dengan ujung masing-masing.
+    expect(net.lines.find((l: { id: string }) => l.id === "lrtjbdb:bk")).toMatchObject({ name: "Lin Bekasi", stationIds: ["dukuh-atas-lrt", "lrtjbdb:cwg", "lrtjbdb:jtm"] });
+    expect(net.lines.find((l: { id: string }) => l.id === "lrtjbdb:cb")).toMatchObject({ name: "Lin Cibubur", stationIds: ["dukuh-atas-lrt", "lrtjbdb:cwg", "lrtjbdb:har"] });
+    expect(net.lines.some((l: { id: string }) => l.id === "lrt-jbd")).toBe(false);
+    expect(net.stations.find((s: { id: string }) => s.id === "dukuh-atas-lrt")).toMatchObject({ lineIds: ["lrtjbdb:bk", "lrtjbdb:cb"] });
     expect(net.lines.some((l: { operator: string }) => l.operator === "TransJakarta")).toBe(false);
     expect(net.hubs).toEqual([expect.objectContaining({ id: "dukuh-atas", memberIds: ["sudirman", "bni-city", "dukuh-atas-mrt", "dukuh-atas-lrt"] })]);
     expect(net.stations.find((s: { id: string }) => s.id === "sudirman")).toMatchObject({ hubId: "dukuh-atas", lineIds: ["krl-cikarang"] });

@@ -6,6 +6,7 @@ import { z } from "zod";
 import type { RequestContext } from "../context";
 import type { ContentItem, ContentKind, ContentRepository } from "../store/types";
 import type { StationStatusContent } from "./stationStatus";
+import type { LineContent, StationContent } from "./datasetOverlay";
 import { CORE_AMENITIES, EXTRA_AMENITIES, SEGMENT_MEANS, type AmenityDetail, type AmenityType, type AnyAmenityType, type Concourse, type Entrance, type ExtraAmenityType, type Notice, type Platform, type StationInfo } from "./models";
 
 const isoDate = z.string().refine((v) => !Number.isNaN(Date.parse(v)), "harus tanggal ISO 8601");
@@ -250,8 +251,8 @@ export const hubSchema = z
       )
       .max(200)
       .default([]),
-    /** Asal data terakhir: diisi sendiri, atau hasil sinkron dari Commute Data API. */
-    source: z.enum(["manual", "commute"]).default("manual"),
+    /** Asal data terakhir: diisi sendiri, atau hasil sinkron dari Commute Data API / usulan GTFS Transjakarta. */
+    source: z.enum(["manual", "commute", "gtfs"]).default("manual"),
     syncedAt: isoDate.optional(),
     disabled: z.boolean().optional(),
     note: z.string().max(500).optional(),
@@ -263,6 +264,50 @@ export const hubSchema = z
   });
 
 export type HubContent = z.infer<typeof hubSchema> & { id: string };
+
+/** Id stasiun/lini: slug NTD (mis. "manggarai") atau id turunan `operator:kode` (mis. "lrtj:pka", "ntd:stasiun-baru"). */
+const datasetId = z
+  .string()
+  .min(2)
+  .max(80)
+  .regex(/^[a-z0-9]+(?::[a-z0-9-]+|(?:-[a-z0-9]+)*)$/, "huruf kecil, angka, tanda hubung; boleh berawalan operator:, mis. ntd:stasiun-baru");
+
+/**
+ * Stasiun dari admin (satu isian per stasiun, `stationId` isian): menambah stasiun yang belum ada di dataset
+ * (tambah manual, atau diimpor dari GTFS / lin Commute yang stasiunnya belum tercantum di /stations), atau
+ * mengoreksi nama, operator, nomor, lini, dan koordinat stasiun dataset dengan id yang sama.
+ */
+export const stationSchema = z.object({
+  name: z.string().trim().min(1).max(120),
+  operator: z.string().trim().min(1).max(80),
+  /** Nomor/kode stasiun pada peta, mis. "S08". */
+  codes: z.array(z.string().trim().min(1).max(20)).max(10).default([]),
+  /** Lini yang berhenti di stasiun ini (urutannya diatur di Rute & urutan halte). */
+  lineIds: z.array(z.string().min(1).max(80)).max(30).default([]),
+  lat: z.number().min(-90).max(90).optional(),
+  lng: z.number().min(-180).max(180).optional(),
+  /** Asal data terakhir: diisi sendiri, atau hasil sinkron dari Commute Data API / GTFS Transjakarta. */
+  source: z.enum(["manual", "commute", "gtfs"]).default("manual"),
+  syncedAt: isoDate.optional(),
+  note: z.string().max(500).optional(),
+}).refine((x) => (x.lat === undefined) === (x.lng === undefined), { message: "lat dan lng diisi bersama", path: ["lng"] });
+
+/**
+ * Lini/rute dari admin (satu isian per `lineId`): menambah rute yang belum ada di dataset (urutan pemberhentiannya
+ * diisi lewat pengaturan rute), atau mengoreksi nama, operator, moda, dan warna lini dataset dengan id yang sama.
+ */
+export const lineSchema = z.object({
+  lineId: datasetId,
+  name: z.string().trim().min(1).max(120),
+  operator: z.string().trim().min(1).max(80),
+  mode: z.enum(["RAIL", "SUBWAY", "TRAM", "BUS", "MONORAIL"]),
+  color: z.string().regex(/^#[0-9a-fA-F]{6}$/, "warna heksadesimal, mis. #F26324").default("#555555"),
+  source: z.enum(["manual", "commute", "gtfs"]).default("manual"),
+  syncedAt: isoDate.optional(),
+  note: z.string().max(500).optional(),
+});
+
+export const stationIdSchema = datasetId;
 export type MapTrack = z.infer<typeof mapTrackSchema> & { id: string };
 
 export const DEFAULT_DISCLAIMER =
@@ -327,6 +372,8 @@ export const SCHEMAS: Record<Exclude<ContentKind, "settings">, z.ZodType> = {
   route_pattern: routePatternSchema,
   hub: hubSchema,
   station_status: stationStatusSchema,
+  station: stationSchema,
+  line: lineSchema,
 };
 
 /** Konten yang terlihat: published untuk pengguna; draft (bila ada) untuk mode pratinjau admin. */
@@ -350,6 +397,8 @@ export class ContentSnapshot {
   private patterns = new Map<string, RoutePattern>();
   private hubs = new Map<string, HubContent>();
   private statuses = new Map<string, StationStatusContent>();
+  private stationRows = new Map<string, StationContent>();
+  private lineRows = new Map<string, LineContent>();
   readonly settings: Settings;
 
   constructor(items: ContentItem[], preview: boolean, now: Date) {
@@ -426,6 +475,17 @@ export class ContentSnapshot {
           this.hubs.set(h.hubId, { ...h, id: it.id });
           break;
         }
+        case "station": {
+          // Satu isian per stasiun; entri terbaru menang.
+          if (!it.stationId) break;
+          this.stationRows.set(it.stationId, { ...(v as z.infer<typeof stationSchema>), stationId: it.stationId });
+          break;
+        }
+        case "line": {
+          const l = v as z.infer<typeof lineSchema>;
+          this.lineRows.set(l.lineId, l);
+          break;
+        }
         case "map_track":
           this.tracks.push({ ...(v as z.infer<typeof mapTrackSchema>), id: it.id });
           break;
@@ -489,6 +549,11 @@ export class ContentSnapshot {
   /** Status operasional stasiun dari admin (nonaktif/aktif kembali). */
   stationStatuses(): StationStatusContent[] {
     return [...this.statuses.values()];
+  }
+
+  /** Stasiun dan lini yang ditambah/dikoreksi admin, di atas dataset. */
+  datasetOverlay(): { stations: StationContent[]; lines: LineContent[] } {
+    return { stations: [...this.stationRows.values()], lines: [...this.lineRows.values()] };
   }
 
   /** Hub transfer yang dibuat/diubah admin. */

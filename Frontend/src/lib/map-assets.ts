@@ -38,6 +38,13 @@ const LINE_GEOMETRY: Record<string, { geometry: (string | Pt)[]; stopAt?: Record
   "lrt-jbd": {
     geometry: ["dukuh-atas-lrt", [4235, 3872], [4313, 3950], "setiabudi-lrt", "rasuna-said", "kuningan"],
   },
+  // Lin Bekasi dan Lin Cibubur LRT Jabodebek (Commute Data API) berbagi ruas Dukuh Atas–Kuningan ini.
+  "lrtjbdb:bk": {
+    geometry: ["dukuh-atas-lrt", [4235, 3872], [4313, 3950], "setiabudi-lrt", "rasuna-said", "kuningan"],
+  },
+  "lrtjbdb:cb": {
+    geometry: ["dukuh-atas-lrt", [4235, 3872], [4313, 3950], "setiabudi-lrt", "rasuna-said", "kuningan"],
+  },
 };
 
 /**

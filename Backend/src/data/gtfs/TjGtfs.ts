@@ -103,6 +103,18 @@ export class TjGtfs {
     return [...base, ...through];
   }
 
+  /** Nama dan warna koridor `line` menurut GTFS (untuk menambah rute dari GTFS di admin). */
+  routeInfo(line: string): { code: string; name: string; color: string } | undefined {
+    const key = line.toUpperCase();
+    const r = this.data.routes[key];
+    return r ? { code: key, name: r.name, color: r.color } : undefined;
+  }
+
+  /** Semua halte induk koridor BRT di data GTFS NTD. */
+  allStops(): TjGtfsStop[] {
+    return Object.keys(this.data.stops).map((code) => this.stop(code)!);
+  }
+
   hasRoute(line: string): boolean {
     return !!this.data.routes[line.toUpperCase()];
   }
