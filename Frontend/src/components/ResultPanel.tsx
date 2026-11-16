@@ -3,7 +3,7 @@
 import { useState, type ReactNode } from "react";
 import { clock, duration, isWalk, km, legTimes, rideName, rupiah, spanMinutes, walking, wibDate } from "@/lib/journey";
 import { AMENITY_LABEL, useNetwork } from "@/lib/network";
-import type { Alternative, ExitRef, Frequency, GateChoice, JourneyPlan, Notice, RouteLeg, StationAssessment } from "@/lib/types";
+import type { Alternative, ExitRef, Frequency, GateChoice, HubGate, JourneyPlan, Notice, RouteLeg, StationAssessment } from "@/lib/types";
 import { AccessBadge } from "./AccessBadge";
 import { Chevron, EscalatorIcon, LevelIcon, LiftIcon, ModeIcon, RampIcon, StairsIcon, WalkIcon, WarnIcon } from "./Icons";
 import { accessText, PlatformDetails } from "./PlatformInfo";
@@ -466,10 +466,11 @@ function RideBody({ leg, name, assessmentOf }: { leg: RouteLeg; name: (id: strin
 
 function TransferBody({ leg, name }: { leg: RouteLeg; name: (id: string) => string }) {
   const [open, setOpen] = useState(false);
+  // Gate dari isian admin pada hub lebih rinci (fasilitas aksesibel) daripada pintu dari dataset.
   const hints = [
-    leg.fromExit && `Keluar lewat ${exitText(leg.fromExit)}.`,
+    leg.fromGate ? `Keluar lewat ${gateText(leg.fromGate)} di ${name(leg.stops[0])}.` : leg.fromExit && `Keluar lewat ${exitText(leg.fromExit)}.`,
     leg.notes && !leg.turnaround ? leg.notes : undefined,
-    leg.toExit && `Masuk lewat ${exitText(leg.toExit)}.`,
+    leg.toGate ? `Masuk lewat ${gateText(leg.toGate)} di ${name(leg.stops[leg.stops.length - 1])}.` : leg.toExit && `Masuk lewat ${exitText(leg.toExit)}.`,
   ].filter((x): x is string => !!x);
   const access = leg.access ?? [];
   const mins =
@@ -553,6 +554,29 @@ function RideChoices({ leg }: { leg: RouteLeg }) {
 }
 
 const exitText = (e: ExitRef) => `${e.name ?? e.ref}${e.signs?.length ? ` (ikuti tanda ${e.signs.join(", ")})` : ""}`;
+
+const GATE_FACILITY_LABEL: Record<HubGate["facilities"][number], string> = {
+  lift: "lift",
+  ramp: "ramp",
+  eskalator: "eskalator",
+  datar: "jalur datar",
+  tangga: "tangga",
+  guiding_block: "guiding block",
+  toilet: "toilet aksesibel",
+  kursi_roda: "kursi roda",
+  petugas_bantuan: "petugas bantuan",
+};
+
+/** Gate hub dari admin, mis. "Gate Utara (bisa dilalui kursi roda; lift, ramp; buka 05.00–22.00)". */
+const gateText = (g: HubGate) => {
+  const parts = [
+    g.accessible ? "bisa dilalui kursi roda" : "ada anak tangga",
+    g.facilities.length ? g.facilities.map((f) => GATE_FACILITY_LABEL[f] ?? f).join(", ") : "",
+    g.openHours ? `buka ${g.openHours}` : "",
+    g.note ?? "",
+  ].filter(Boolean);
+  return `${g.name} (${parts.join("; ")})`;
+};
 
 /** Rincian aksesibilitas perjalanan: jalan kaki, naik-turun lantai, lift/eskalator, celah peron, dan data yang kurang. */
 function AccessSummary({ plan, option, name }: { plan: JourneyPlan; option?: { accessScore: number; minScore: number; unmetNeeds: number }; name: (id: string) => string }) {

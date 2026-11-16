@@ -18,7 +18,7 @@ export interface ToolSpec {
 interface Tools {
   cari_stasiun: { in: { query: string }; out: Station[] };
   ambil_rute: { in: { fromId: string; toId: string; viaId?: string; at?: string; avoidModes?: Mode[]; needs?: TransferNeed[] }; out: Route | null };
-  lengkapi_rute: { in: { route: Route; at?: string }; out: Route };
+  lengkapi_rute: { in: { route: Route; at?: string; needs?: TransferNeed[] }; out: Route };
   variasi_rute: { in: { fromId: string; toId: string; avoidModes?: Mode[]; known: Route[]; at?: string; avoid?: string[] }; out: Route[] };
   cek_fasilitas: { in: { stationId: string }; out: Awaited<ReturnType<FacilityAnalysisService["assess"]>> };
   cari_alternatif: {
@@ -101,7 +101,7 @@ export class ToolRegistry {
       }
       case "lengkapi_rute": {
         const i = input as Tools["lengkapi_rute"]["in"];
-        return (await d.planner.annotate(i.route, ctx, i.at)) as Tools[N]["out"];
+        return (await d.planner.annotate(i.route, ctx, i.at, { needs: i.needs })) as Tools[N]["out"];
       }
       case "variasi_rute": {
         const i = input as Tools["variasi_rute"]["in"];

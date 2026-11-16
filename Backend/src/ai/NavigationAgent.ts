@@ -201,8 +201,8 @@ export class NavigationAgent {
 
     /** Lengkapi dan nilai satu rute: waktu (jadwal), peron, skor perjalanan, akses pindah, dan peringatannya. */
     const evaluate = async (raw: Route, alts: Alternative[]): Promise<Evaluated> => {
-      let r = await this.tools.call("lengkapi_rute", { route: raw, at: input.at }, ctx, snap);
-      const altsDone = await Promise.all(alts.map(async (a) => (a.route ? { ...a, route: await this.tools.call("lengkapi_rute", { route: a.route, at: input.at }, ctx, snap) } : a)));
+      let r = await this.tools.call("lengkapi_rute", { route: raw, at: input.at, needs }, ctx, snap);
+      const altsDone = await Promise.all(alts.map(async (a) => (a.route ? { ...a, route: await this.tools.call("lengkapi_rute", { route: a.route, at: input.at, needs }, ctx, snap) } : a)));
       const ids = routeStationIds(r);
       const altIds = altsDone.flatMap((a) => (a.route ? routeStationIds(a.route) : [a.viaStationId]));
       await assessIds([...ids, ...altIds]);
