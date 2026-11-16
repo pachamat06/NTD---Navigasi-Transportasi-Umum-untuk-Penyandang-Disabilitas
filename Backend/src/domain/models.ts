@@ -123,6 +123,8 @@ export type HubGateFacility = (typeof HUB_GATE_FACILITIES)[number];
 export interface HubGate {
   id: string;
   stationId: string;
+  /** Pintu/gate stasiun (id entri `entrances` detail stasiun) yang dirujuk gate ini, bila dipilih dari data stasiun. */
+  entranceId?: string;
   name: string;
   connectsTo: string[];
   facilities: HubGateFacility[];

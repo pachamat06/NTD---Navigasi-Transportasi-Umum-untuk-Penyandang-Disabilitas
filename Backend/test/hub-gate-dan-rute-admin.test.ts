@@ -201,12 +201,13 @@ describe("gate hub dan fasilitas aksesibel", () => {
       name: "Uji gate",
       memberIds: ["manggarai", "tanah-abang"],
       walks: [{ from: "manggarai", to: "tanah-abang", distanceM: 120 }],
-      gates: [{ id: "utara", stationId: "manggarai", name: "Gate Utara", connectsTo: ["tanah-abang"], facilities: ["lift", "guiding_block"], accessible: true, openHours: "05.00–22.00" }],
+      // Gate dipilih dari pintu yang sudah tercatat di stasiun (entranceId).
+      gates: [{ id: "utara", stationId: "manggarai", entranceId: "pintu-utara", name: "Gate Utara", connectsTo: ["tanah-abang"], facilities: ["lift", "guiding_block"], accessible: true, openHours: "05.00–22.00" }],
     };
     expect((await request(app).post("/api/admin/content").set(auth).send({ kind: "hub", data: { ...data, hubId: "salah", gates: [{ ...data.gates[0], stationId: "sudirman" }] } })).status).toBe(400);
     expect((await request(app).post("/api/admin/content").set(auth).send({ kind: "hub", data })).status).toBe(201);
     await request(app).post("/api/admin/publish").set(auth).send({});
     const hub = (await request(app).get("/api/hubs")).body.data.find((h: Hub) => h.id === "manggarai-tanah-abang");
-    expect(hub.gates).toEqual([expect.objectContaining({ id: "utara", stationId: "manggarai", connectsTo: ["tanah-abang"], facilities: ["lift", "guiding_block"], accessible: true })]);
+    expect(hub.gates).toEqual([expect.objectContaining({ id: "utara", stationId: "manggarai", entranceId: "pintu-utara", connectsTo: ["tanah-abang"], facilities: ["lift", "guiding_block"], accessible: true })]);
   });
 });

@@ -236,6 +236,8 @@ export const hubGateSchema = z.object({
     .max(60)
     .regex(/^[a-z0-9][a-z0-9-]*$/, "huruf kecil, angka, dan tanda hubung"),
   stationId: z.string().min(1).max(80),
+  /** Pintu/gate stasiun (entri `entrances` detail stasiun, dari dataset /exits atau isian tim) yang dipakai gate ini. */
+  entranceId: z.string().trim().min(1).max(200).optional(),
   name: z.string().trim().min(1).max(120),
   connectsTo: z.array(z.string().min(1).max(80)).max(20).default([]),
   facilities: z.array(z.enum(HUB_GATE_FACILITIES)).max(HUB_GATE_FACILITIES.length).default([]),
