@@ -4,9 +4,9 @@
 import type { RequestContext } from "../context";
 import type { AlternativeService } from "../domain/AlternativeService";
 import type { ContentSnapshot } from "../domain/content";
-import type { FacilityAnalysisService } from "../domain/FacilityAnalysisService";
-import type { Alternative, Hub, Mode, Route, Station, StationAssessment } from "../domain/models";
-import type { RoutePlannerService } from "../domain/RoutePlannerService";
+import { needMet, type FacilityAnalysisService } from "../domain/FacilityAnalysisService";
+import type { Alternative, Hub, Mode, Route, Station, StationAssessment, TransferNeed } from "../domain/models";
+import { WALK_WEIGHT, type RoutePlannerService } from "../domain/RoutePlannerService";
 import type { StationService } from "../domain/StationService";
 
 export interface ToolSpec {
@@ -17,10 +17,12 @@ export interface ToolSpec {
 
 interface Tools {
   cari_stasiun: { in: { query: string }; out: Station[] };
-  ambil_rute: { in: { fromId: string; toId: string; viaId?: string; at?: string; avoidModes?: Mode[] }; out: Route | null };
+  ambil_rute: { in: { fromId: string; toId: string; viaId?: string; at?: string; avoidModes?: Mode[]; needs?: TransferNeed[] }; out: Route | null };
+  lengkapi_rute: { in: { route: Route; at?: string }; out: Route };
+  variasi_rute: { in: { fromId: string; toId: string; avoidModes?: Mode[]; known: Route[]; at?: string; avoid?: string[] }; out: Route[] };
   cek_fasilitas: { in: { stationId: string }; out: Awaited<ReturnType<FacilityAnalysisService["assess"]>> };
   cari_alternatif: {
-    in: { originId: string; destinationId: string; route: Route; assessments: Map<string, StationAssessment>; hubs: Hub[]; avoid?: string[]; at?: string };
+    in: { originId: string; destinationId: string; route: Route; assessments: Map<string, StationAssessment>; hubs: Hub[]; avoid?: string[]; at?: string; needs?: TransferNeed[] };
     out: Alternative[];
   };
 }
@@ -51,6 +53,17 @@ export class ToolRegistry {
         ),
       },
       {
+        name: "lengkapi_rute",
+        description:
+          "Melengkapi rute: jarak dan petunjuk jalan kaki saat pindah, lin paralel yang bisa dinaiki pada ruas yang sama, dan frekuensi kendaraan bila jadwal tidak tersedia (bukan jadwal).",
+        input_schema: obj({ at: { type: "string" } }, []),
+      },
+      {
+        name: "variasi_rute",
+        description: "Mencari rute lain antara dua stasiun (paling sedikit pindah, tanpa titik pindah tertentu, jalan kaki minimal) untuk pilihan rute.",
+        input_schema: obj({ fromId: { type: "string" }, toId: { type: "string" } }, ["fromId", "toId"]),
+      },
+      {
         name: "cek_fasilitas",
         description: "Memeriksa fasilitas aksesibilitas sebuah stasiun dan menghitung skornya.",
         input_schema: obj({ stationId: { type: "string" } }, ["stationId"]),
@@ -73,9 +86,26 @@ export class ToolRegistry {
         const route = i.viaId
           ? d.planner.getRouteVia(i.fromId, i.viaId, i.toId, ctx, i.at)
           : i.avoidModes?.length
-            ? d.planner.getRouteAvoiding(i.fromId, i.toId, i.avoidModes, ctx, i.at)
+            ? d.planner.getRouteAvoiding(i.fromId, i.toId, i.avoidModes, ctx, i.at, i.needs?.length ? WALK_WEIGHT.SLOW : WALK_WEIGHT.AVERAGE)
             : d.planner.getRoute(i.fromId, i.toId, ctx, i.at);
-        return (await route) as Tools[N]["out"];
+        const found = await route;
+        if (!found || !i.needs?.length) return found as Tools[N]["out"];
+        // Halte BRT gabungan dua arah: fasilitas tiap arah diperiksa lewat id turunan per kode (mis. tj:h00267s).
+        const needs = i.needs;
+        const metAt = async (code: string) => {
+          const id = `tj:${code.toLowerCase()}`;
+          const det = await d.stations.detail(id, ctx, snap, { id, name: code, operator: "TransJakarta", lineIds: [], codes: [code] }, { dataset: false });
+          return !!det && needs.every((n) => needMet(n, det.amenities, det.assessment.layout));
+        };
+        return (await d.planner.backtrackForNeeds(found, ctx, metAt)) as Tools[N]["out"];
+      }
+      case "lengkapi_rute": {
+        const i = input as Tools["lengkapi_rute"]["in"];
+        return (await d.planner.annotate(i.route, ctx, i.at)) as Tools[N]["out"];
+      }
+      case "variasi_rute": {
+        const i = input as Tools["variasi_rute"]["in"];
+        return (await d.planner.routeVariants(i.fromId, i.toId, i.avoidModes ?? [], i.known, ctx, i.at, 3, i.avoid ?? [])) as Tools[N]["out"];
       }
       case "cek_fasilitas":
         return (await d.facilities.assess((input as Tools["cek_fasilitas"]["in"]).stationId, ctx, snap)) as Tools[N]["out"];

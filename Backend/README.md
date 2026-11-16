@@ -39,7 +39,7 @@ Semua variabel lingkungan terdokumentasi di [.env.example](.env.example).
 | Layanan domain | `src/domain/StationService.ts`, `RoutePlannerService.ts`, `FacilityAnalysisService.ts`, `AlternativeService.ts` |
 | Grounding Guard | `src/ai/GroundingGuard.ts`: cek nama stasiun, angka, dan klaim fasilitas; gagal berarti template statis. Disclaimer ditambahkan sistem |
 | Klien LLM | `src/ai/llm/` (`ClaudeClient`, `GptClient`, antarmuka `LlmClient`) |
-| CommuteApiClient + cache | `src/data/commute/CommuteApiClient.ts`: cache-first dengan TTL; tarif selalu segar dengan cadangan cache basi (UC-01 E2) |
+| CommuteApiClient + cache | `src/data/commute/CommuteApiClient.ts`: cache-first dengan TTL, satu permintaan per kunci (single-flight), salinan kedaluwarsa < 7 hari disajikan sambil diperbarui di latar belakang; tarif selalu segar dengan cadangan cache basi (UC-01 E2). HTTP 429 dari Commute menahan permintaan sampai `Retry-After` |
 | Basis data | `src/store/pg.ts` + `migrations/`; alternatif memori `src/store/memory.ts` |
 
 Sumber data Commute (`COMMUTE_SOURCE`):
@@ -49,6 +49,8 @@ Sumber data Commute (`COMMUTE_SOURCE`):
 
 Id stasiun GUI berbentuk slug (mis. `bni-city`) karena posisi di peta dikunci dengan slug. `station-index.ts` mencocokkan slug ke stasiun API lewat operator + nama tampilan atau nama resmi, jadi kode API tidak ditulis tetap. Stasiun di luar tabel memakai id turunan `operator:kode` (mis. `kci:kat`). Slug yang tidak cocok ditampilkan di Ringkasan halaman admin; tambahkan namanya di tabel bila muncul.
 
+Pelengkap GTFS Transjakarta (`src/data/gtfs/`): khusus koridor BRT 1–14 yang tercantum di NTD. Ruas naik TransJakarta tanpa jadwal di `/fares` diberi waktu tempuh dari jadwal GTFS (`minutesEstimated: true`, rute `timeEstimated: true`, disertai peringatan bahwa itu perkiraan); halte yang dilewati lin tetapi tidak ada di `/stations` ditambahkan dengan nama dan koordinat GTFS; koridor yang berhenti di halte menurut GTFS ditambahkan ke `lineIds`. Data dibuat ulang dari GTFS baru dengan `python3 scripts/build-tj-gtfs.py path/gtfs.zip`.
+
 Batasan data API: tidak ada jenis fasilitas ramp (status ramp selalu "data tidak tersedia" kecuali diisi tim lewat admin), `TOILET` biasa tidak dihitung sebagai toilet aksesibel, daftar fasilitas kosong berarti data belum ada, dan /hubs tidak memuat jarak jalan kaki antarstasiun.
 
 ### Data tambahan dari admin
@@ -56,14 +58,20 @@ Batasan data API: tidak ada jenis fasilitas ramp (status ramp selalu "data tidak
 Dataset tidak memuat semua informasi aksesibilitas, jadi tim melengkapinya lewat halaman admin (proyek terpisah, closed source). Jenis konten (`content_items.kind`):
 
 - `facility`: koreksi status lift, eskalator, toilet aksesibel, ramp, dll. (`available`, `absent`, `out_of_service` dengan `until`, `unknown`). Menimpa dataset untuk jenis yang sama.
-- `entrance`: pintu akses stasiun (nama, lokasi, fitur seperti lift/ramp/guiding block, jam buka).
+- `entrance`: pintu akses/gate stasiun (nama, lokasi, fitur seperti lift/ramp/guiding block, jam buka, jumlah dan arah eskalator, lift). Dengan `exitRef`, isian tim melengkapi pintu dataset yang sama (`/exits` Commute) dan mewarisi papan petunjuknya. `platformLinks` mencatat peron yang dicapai dari gate itu dan caranya (`langsung`, `crosswalk`, `sebidang`, `jpo`, `terowongan`). Gate yang tidak langsung ke peron memakai `concourseLinks`: concourse yang dicapai dan cara berpindah ke sana (`means`: `datar`, `ramp`, `lift`, `eskalator`, `tangga`, plus `lift` berisi jumlah/status dan `dedicated`). Satu gate boleh punya keduanya.
+- `concourse` (migrasi `006_concourses.sql`): area penghubung antara gate dan peron, satu entri per `code` per stasiun (`name`, `level`, `paid` untuk area setelah gerbang tiket). `platformLinks` berisi ruas concourse ke tiap peron dengan `means`, lift, eskalator, dan `dedicated` yang sama seperti ruas gate. Data pintu lama tanpa concourse tetap berlaku apa adanya.
+- `platform`: peron hasil survei (`code`, jenis `island`/`side`/`bay`, nomor jalur, lin dan arah yang dilayani, fasilitas per peron, eskalator `{count, direction: naik|turun|bergantian, connects}`, lift, dan celah peron dengan kendaraan `{level: sejajar|sedikit|tangga, steps, horizontalCm, verticalCm, boardingAid}`). Nomor peron dan arah diambil dari dataset (`/timetable/grouped`); isian tim menimpa dataset untuk nomor peron yang sama. Butuh migrasi `003_platforms.sql`.
 - `station_info`: info lain (kontak layanan, layanan pendampingan, dll.).
 - `notice`: pengumuman/notifikasi untuk stasiun, lini, hub, atau global, dengan periode aktif dan tingkat (`info`, `warning`, `critical`).
+- `map_stop`: posisi pemberhentian pada Aset Peta Transit (`{x, y}`, satuan pt peta FDTJ), menang atas posisi otomatis.
+- `map_track`: bentuk jalur satu lini antara dua pemberhentian bersebelahan (`{lineId, fromStationId, toStationId, points}`).
 - `settings`: bobot skor aksesibilitas, ambang memadai, disclaimer, LLM on/off, TTL cache, wajib lulus uji sebelum publikasi.
 
 Setiap konten punya versi **draft** dan **terbit**. Pengguna hanya melihat versi terbit. Admin bisa melihat hasil API dengan draft memakai header `X-NTD-Preview: 1` plus token admin. Publikasi menyalin draft ke terbit dan (opsional) menjalankan semua kasus uji API terlebih dahulu.
 
-Skor aksesibilitas = jumlah bobot fasilitas yang tersedia, dinormalisasi 0 sampai 100 (bawaan: lift 40, eskalator 20, toilet 25, ramp 15; ambang 70). Stasiun "memadai" bila datanya ada dan skornya mencapai ambang.
+Skor aksesibilitas = jumlah bobot fasilitas yang tersedia, dinormalisasi 0 sampai 100 (bawaan: lift 40, eskalator 20, toilet 25, ramp 15; ambang 70). Stasiun "memadai" bila datanya ada dan skornya mencapai ambang. Fasilitas tambahan (guiding block 10, petugas bantuan 10, kursi roda, gerbang lebar, area prioritas, informasi audio, informasi visual masing-masing 5) hanya dihitung bila statusnya sudah diisi tim, sehingga stasiun yang belum disurvei tidak dirugikan. Bila tim sudah mengisi jalur gate ke semua peron (`platformLinks`) dan semuanya tanpa anak tangga (langsung, crosswalk, pelintasan sebidang, atau JPO/terowongan bertanda `stepFree`), lift dan eskalator dianggap terpenuhi pada skor stasiun (`assessment.layout`). Jalur bertanda `dedicated` (khusus pengguna disabilitas) dipakai walau gate-nya tidak aksesibel untuk umum. Rincian bobot ada di `assessment.factors`. Peron dari dataset ikut diperiksa; bila ada peron yang belum dihubungkan ke gate, faktor jalur diabaikan dan skor memakai bobot fasilitas biasa. Celah peron dengan kendaraan memotong skor (bawaan: anak tangga 15, beda tinggi kecil 5; setengahnya bila ada pelat/ramp dari petugas; `assessment.penalties`): skor stasiun memakai celah terburuk, skor perjalanan hanya celah peron yang dipakai. Jalur gate → concourse → peron dinilai sama: tanpa anak tangga bila kedua ruas `datar`/`ramp` (`via: "concourse"`, `layout.concourse`); bila ada ruas yang pindah lantai, status lift dan eskalator di ruas itu (`pathLift`, `pathEscalator`, terburuk di antara ruas yang pindah lantai) menggantikan status stasiun/peron pada skor. Jalur ber-lift diutamakan atas jalur tangga saja. Pada kebutuhan pindah (`needs`), lift/eskalator ditandai `notNeeded` bila peron yang dipakai dicapai tanpa anak tangga, sehingga tidak diperingatkan; untuk jalur lewat concourse yang pindah lantai, status lift diambil dari ruas itu. Semua bobot dan potongan dapat diatur di halaman Pengaturan admin.
+
+Pada `POST /api/plan`, skor stasiun asal, tujuan, dan ujung perpindahan yang keluar stasiun disesuaikan dengan jalur gate ke peron yang dipakai (`assessment.journey`). Bila semua peron itu dapat dicapai tanpa pindah lantai (langsung, crosswalk, pelintasan sebidang), lift dan eskalator tidak dibutuhkan dan dianggap terpenuhi. Bila hanya lewat JPO/terowongan, lift dan eskalator menentukan skor, memakai fasilitas peron bila sudah diisi. Tanpa data `platformLinks`, skor stasiun dipakai apa adanya. Penyeberangan sebidang, crosswalk, dan JPO/terowongan tanpa lift diberi peringatan.
 
 ## API
 
@@ -76,13 +84,20 @@ Respons sukses `{"status":"ok","data":...}`; gagal `{"status":"error","code","me
 | GET | `/health` | Cek hidup |
 | GET | `/api/meta` | Disclaimer, atribusi, bobot skor, label fasilitas, sumber data |
 | GET | `/api/stations?q=&limit=` | Daftar stasiun, atau pencarian untuk autocomplete |
-| GET | `/api/stations/:id` | Detail stasiun: fasilitas tergabung, skor, pintu akses, info, pengumuman |
-| GET | `/api/network` | Data awal GUI: semua stasiun (fasilitas + skor), lini, dan hub |
+| GET | `/api/stations/:id` | Detail stasiun: fasilitas tergabung, skor, peron (`platforms`), pintu akses, info, pengumuman |
+| GET | `/api/network` | Data awal GUI: semua stasiun (fasilitas + skor, `commuteIds` untuk posisi peta), lini, hub, dan `map` (posisi stop dan bentuk jalur dari admin) |
+| GET | `/api/map` | Posisi stop dan bentuk jalur dari admin saja |
 | GET | `/api/lines`, `/api/hubs` | Lini dan hub antarmoda |
 | GET | `/api/notices?stationId=&lineId=&hubId=` | Pengumuman aktif |
-| POST | `/api/plan` | Rencana perjalanan (UC-01). Body `{originId, destinationId, viaStationId?, avoid?, avoidModes?, at?}`; `avoidModes` berisi moda yang dihindari (`RAIL`, `SUBWAY`, `TRAM`, `BUS`, `MONORAIL`) |
+| POST | `/api/plan` | Rencana perjalanan (UC-01). Body `{originId, destinationId, viaStationId?, avoid?, avoidModes?, needs?, at?}`; `avoidModes` berisi moda yang dihindari (`RAIL`, `SUBWAY`, `TRAM`, `BUS`, `MONORAIL`); `needs` berisi fasilitas yang wajib ada saat pindah (`lift`, `eskalator`, `ramp`) |
 
 Dengan `avoidModes`, bila rute dataset memakai moda yang dihindari, backend mencari rute sendiri di atas urutan stasiun lini yang diizinkan (`/lines`, termasuk cabang) dan perpindahan di hub, lalu meminta `/fares` untuk tiap ruas naik agar tarif dan jadwalnya tetap dari dataset. Ruas yang tarifnya tidak tersedia disusun dari urutan stasiun lini (tarif 0, waktu kosong) dan diberi peringatan. Bila tidak ada rute yang lolos, rute dataset tetap ditampilkan dengan peringatan.
+
+Dengan `needs`, tiap ruas pindah memuat `access` (status tiap fasilitas di kedua ujung), titik pindah yang tidak memenuhi dicarikan alternatif di hub yang sama, jalan kaki diberi bobot lebih berat, dan peringatan ditambahkan bila fasilitas tidak tercatat, rusak, atau belum ada datanya.
+
+Rute dilengkapi dari Commute: jarak, petunjuk, dan pintu keluar jalan kaki saat pindah (`/stations/{op}/{code}/transfers`); lin paralel yang berhenti di pemberhentian yang sama dengan tarif sama sebagai `options` (mis. TJ 4, 4D, 5, 5C dari Matraman ke Kesatrian; dari `serviceLines` /fares, atau urutan halte lin operator yang sama); dan `frequency` (headway gabungan, `/stations/{op}/{code}/headway`) karena /fares tidak memberi jam keberangkatan. `at` diteruskan ke /fares untuk tarif peak/off-peak.
+
+Ruas naik memuat `platform` (nomor peron dari /fares) dan `boardAt` (peron beserta fasilitas dan celahnya) bila peron dapat dipastikan. Pengecekan `needs` memakai fasilitas peron tempat naik/turun bila tim sudah mengisinya, dan peringatan ditambahkan bila naik kendaraan perlu menaiki anak tangga.
 
 `POST /api/plan` mengembalikan rute (bentuk sama dengan `Frontend/src/lib/types.ts`), penilaian fasilitas tiap stasiun transit, hingga 3 alternatif via stasiun lain di hub yang sama, pengumuman terkait, narasi notifikasi, peringatan (mis. data dari cache), disclaimer, dan atribusi.
 
@@ -101,7 +116,39 @@ Hanya origin di `ADMIN_ORIGINS` yang boleh memanggil lewat browser. Peran `admin
 | GET | `/pending` · POST `/publish` | Perubahan menunggu dan publikasi `{ids?, force?}` (admin) |
 | GET, POST | `/tests` · PUT, DELETE `/tests/:id` | Kasus uji API |
 | POST | `/tests/run`, `/tests/:id/run`, `/tests/adhoc` · GET `/tests/runs` | Jalankan uji pada data `published` atau `preview` |
+| GET | `/routes` · `/routes/:lineId/defaults?source=gtfs\|commute` | Urutan stasiun lini; rute bawaan dua arah untuk sinkron (urutan, waktu antarpemberhentian, frekuensi, jam layanan, `notes` ringkasan) |
+| POST | `/routes/sync` | `{lineIds (1–10), source: auto\|gtfs\|commute}`: sinkron banyak rute sekaligus dan simpan sebagai draft kedua arah; catatan admin dipertahankan |
+| GET | `/hubs` · `/hubs/defaults?hubId=&members=&source=commute\|gtfs` | Hub yang berlaku (pratinjau) dan hub bawaan; data Commute untuk satu hub (anggota dan jalan kaki dari `/transfers`), atau halte koridor BRT GTFS dalam `radius` (bawaan 300 m) dari anggotanya |
+| GET | `/lines` | Lini yang berlaku di pratinjau (dataset + rute tambahan/koreksi admin) |
+| GET | `/hubs/suggestions?source=gtfs&radius=` | Usulan hub dari GTFS: halte koridor BRT dalam 250 m dari stasiun rel yang belum satu hub dengannya |
+| POST | `/dataset/refresh` | `{parts?: stations\|lines\|hubs}` (admin): muat ulang dari Commute sekarang juga tanpa menunggu cache; balikan perubahan (`diff`), pengaturan rute yang tertinggal (`stalePatterns`) |
+| GET | `/stations/candidates?source=commute\|gtfs` | Usulan stasiun yang belum ada di NTD: stasiun di lin Commute yang belum di `/stations`, atau halte GTFS (plus halte yang nama/koordinatnya berbeda) |
+| GET | `/stations/defaults?stationId=&source=commute\|gtfs` | Isian form stasiun dari Commute atau GTFS |
+| GET | `/routes/candidates?source=gtfs` | Koridor BRT GTFS yang belum menjadi rute NTD (untuk tambah rute) |
 | GET | `/system` · POST `/cache/purge` · GET `/audit` | Status layanan, kosongkan cache, log aktivitas |
+| POST | `/stations/:id/floor-plan` | `{images: [{data, name?}]}` (1–4 gambar base64, maks. 5 MB/gambar) → usulan fasilitas, peron, gate, dan info dari AI. Tidak menyimpan apa pun; dibatasi 20 kali per 10 menit |
+| GET, PUT | `/ai/vision` | Penyedia AI pembaca denah (provider, model, endpoint, batas waktu, kunci API). Kunci tidak pernah dikembalikan; PUT hanya admin |
+
+#### Sinkron rute dan hub transfer
+
+- Sinkron rute dari GTFS Transjakarta mengisi waktu antarhalte, frekuensi rata-rata (ditimbang lama jendela frekuensi), dan jam layanan. Dari Commute, moda rel memakai jadwal hari kerja (`/stations/{op}/{code}/timetable`): waktu = median selisih jam berangkat pada nomor perjalanan yang sama di dua stasiun berurutan, frekuensi = rata-rata jarak keberangkatan dari stasiun awal, jam layanan = keberangkatan pertama–terakhir. TransJakarta lewat Commute memakai GTFS untuk waktu dan `/headway` (pukul 08.00) untuk frekuensi dan jam layanan. Pemberhentian yang belum dikenal NTD dibuang.
+- Hub transfer berlaku = `/hubs` Commute + hub bawaan NTD (`CURATED_HUBS`, mis. halte TransJakarta Cawang ↔ stasiun LRT Cawang, 170 m dari `/transfers`) + konten `hub` dari admin (id sama menggantikan, `disabled` menonaktifkan). Hub dipakai pencarian rute topologi, alternatif di hub, dan `hubId` stasiun. Hub tanpa data jalan kaki memakai jarak garis lurus antarkoordinat.
+
+#### Stasiun dan rute manual, sinkron dataset
+
+- Konten `station` (satu per stasiun, `stationId` = id stasiun) menambah stasiun yang belum ada di dataset (id baru, mis. `ntd:halte-baru`, atau id turunan `lrtj:kym` dari usulan) atau mengoreksi nama/operator/nomor/lini/koordinat stasiun dataset dengan id sama. Konten `line` (satu per `lineId`) menambah rute baru atau mengoreksi nama/operator/moda/warna. Urutan pemberhentian tetap lewat `route_pattern`.
+- Stasiun yang tidak dikenal Commute (`source` `admin` atau `ntd`) dirutekan di atas urutan lini (pengaturan rute admin + dataset); waktu dari pengaturan rute bila diisi.
+- Stasiun bawaan NTD (`BUILTIN_STATIONS`, `src/domain/datasetOverlay.ts`): LRT Jakarta Pramuka (S08, beroperasi 12 November 2026). Hanya dipakai bila lini `lrtj:s` ada di dataset tetapi stasiunnya belum (mis. cache lama); Commute Data API sudah memuatnya sejak 11 November.
+- `GET /routes` memberi `missing` untuk lini yang pengaturan rutenya tertinggal dari dataset (mis. urutan LRT Jakarta yang disinkron sebelum Pramuka dikenal). Sinkron ulang rute itu untuk memasukkannya.
+
+#### Isi fasilitas dari gambar denah
+
+Halaman stasiun di admin punya "Isi otomatis dari gambar denah": foto papan denah per lantai (dengan legenda), peta lokalitas, dan angkutan lanjutan dikirim ke backend, diteruskan ke penyedia AI, lalu jawabannya dipetakan ke skema konten NTD (`facility`, `platform`, `entrance`, `station_info`) dan divalidasi. Admin memeriksa, menyunting, dan memilih usulan; yang dipilih disimpan sebagai draft lewat `/content` dan baru terlihat pengguna setelah publikasi.
+
+- Penyedia bawaan Claude (`claude-sonnet-5-5`, structured output JSON, cadangan sisi server bila model menolak). Alternatif: `openai` = endpoint apa pun yang kompatibel dengan OpenAI Chat Completions.
+- Konfigurasi dari `AI_VISION_*` (lihat `.env.example`), dapat ditimpa admin di Pengaturan → AI pembaca denah. Disimpan di tabel `server_config` (migrasi 005), di luar alur draft/publikasi.
+- Kunci API hanya dipakai untuk penyedia dan endpoint tempat kunci itu diisi; mengganti penyedia/endpoint tidak mengirim kunci lama ke tujuan baru.
+- Body besar (hingga 24 MB) hanya diurai untuk token admin yang valid; endpoint lain tetap 100 kB.
 
 ## Deployment
 

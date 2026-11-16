@@ -70,13 +70,29 @@ export class GroundingGuard {
         add(l.fare);
         add(l.distanceM);
         add(l.minutes);
+        add(l.frequency?.headwayMinutes);
+        for (const o of l.options ?? []) {
+          add(o.frequency?.headwayMinutes);
+          // Nomor koridor/lin (mis. "13E", "4D") boleh disebut.
+          for (const n of `${o.lineId} ${o.lineName ?? ""}`.match(/\d+/g) ?? []) nums.add(n);
+        }
+        for (const n of `${l.lineId ?? ""} ${l.lineName ?? ""} ${l.notes ?? ""} ${l.platform ?? ""} ${l.boardAt?.code ?? ""}`.match(/\d+/g) ?? []) nums.add(n);
+        const g = l.boardAt?.gap;
+        for (const n of [g?.steps, g?.horizontalCm, g?.verticalCm, ...(l.boardAt?.escalators ?? []).map((e) => e.count), l.boardAt?.lift?.count]) add(n);
+        for (const a of l.access ?? []) for (const n of (a.platform ?? "").match(/\d+/g) ?? []) nums.add(n);
         add(Number((l.distanceM / 1000).toFixed(1)));
         nums.add((l.distanceM / 1000).toFixed(1).replace(".", ","));
       }
     };
     addRoute(f.route);
     for (const a of f.alternatives) if (a.route) addRoute(a.route);
-    for (const a of [...f.assessments, ...f.alternatives.map((x) => x.assessment)]) add(a.score);
+    for (const a of [...f.assessments, ...f.alternatives.map((x) => x.assessment)]) {
+      add(a.score);
+      if (a.journey) {
+        add(a.journey.stationScore);
+        for (const p of a.journey.platforms) nums.add(p.replace(/\D/g, ""));
+      }
+    }
     for (const s of f.stations.values()) for (const c of s.codes) nums.add(c.replace(/\D/g, ""));
     return nums;
   }
@@ -129,7 +145,10 @@ export class GroundingGuard {
       if (leg.type === "RIDE") {
         const line = leg.lineId ? lineName(leg.lineId) : undefined;
         const what = line ? `${line.operator} ${line.name}` : (leg.lineName ?? "kereta");
-        parts.push(`${i === 0 ? "Naik" : "lalu naik"} ${what} dari ${name(leg.stops[0])} ke ${name(leg.stops[leg.stops.length - 1])}`);
+        const choices = leg.options && leg.options.length > 1 ? leg.options.map((o) => lineName(o.lineId)?.name ?? o.lineName ?? o.lineId) : null;
+        const pick = choices ? ` (bisa juga ${choices.slice(1).join(", ")})` : "";
+        const freq = leg.frequency ? `, biasanya tiap sekitar ${leg.frequency.headwayMinutes} menit` : "";
+        parts.push(`${i === 0 ? "Naik" : "lalu naik"} ${what}${pick} dari ${name(leg.stops[0])} ke ${name(leg.stops[leg.stops.length - 1])}${freq}`);
       } else {
         parts.push(
           leg.stops[0] === leg.stops[1] ? `pindah lini di dalam Stasiun ${name(leg.stops[0])}` : `${i === 0 ? "Berjalan" : "pindah dengan berjalan kaki"} ke ${name(leg.stops[1])}`,
@@ -142,12 +161,26 @@ export class GroundingGuard {
       const st = f.stations.get(a.stationId);
       if (!st) continue;
       const liftNtd = st.amenityDetails.find((d) => d.type === "lift" && d.source === "ntd");
+      // Peron dicapai tanpa JPO/terowongan (tanpa pindah lantai): lift dan eskalator tidak dibutuhkan, jadi tidak disebut
+      // (aturan yang sama dengan skor).
+      const level = a.journey ? a.journey.level : !!a.layout?.level;
+      if (level) {
+        if (!a.dataAvailable) notes.push(`Data fasilitas ${st.name} belum tersedia.`);
+        continue;
+      }
       if (liftNtd?.status === "out_of_service") notes.push(`Lift di ${st.name} dilaporkan sedang tidak berfungsi.`);
       else if (!a.dataAvailable) notes.push(`Data fasilitas ${st.name} belum tersedia.`);
       else if (st.amenities.lift === "available") notes.push(`Lift tercatat tersedia di ${st.name}.`);
       else if (st.amenities.lift === "unknown") notes.push(`Data lift di ${st.name} tidak tersedia.`);
       else notes.push(`Lift tidak tercatat di ${st.name}.`);
     }
+    for (const leg of f.route.legs)
+      for (const a of leg.access ?? [])
+        if (a.status !== "available" && !a.notNeeded) {
+          const label = AMENITY_LABEL[a.need] ?? a.need;
+          const st = name(a.stationId);
+          notes.push(a.status === "out_of_service" ? `${label} di ${st} untuk pindah dilaporkan tidak berfungsi.` : a.status === "absent" ? `${label} untuk pindah tidak tercatat di ${st}.` : `Data ${label.toLowerCase()} untuk pindah di ${st} belum tersedia.`);
+        }
     if (f.alternatives.length) {
       const alt = f.alternatives[0];
       notes.push(`Alternatif transfer yang lebih aksesibel: melalui ${name(alt.viaStationId)}.`);
@@ -163,14 +196,32 @@ export function factsForPrompt(f: PlanFacts): unknown {
   const st = (id: string) => f.stations.get(id);
   return {
     rute: f.route.legs.map((l) => ({
-      jenis: l.type === "RIDE" ? "naik" : l.stops[0] === l.stops[1] ? "pindah lini di stasiun yang sama" : "jalan kaki pindah stasiun",
+      jenis: l.type === "RIDE" ? "naik" : l.turnaround ? "berbalik arah (pindah ke bus arah sebaliknya)" : l.stops[0] === l.stops[1] ? "pindah lini di stasiun yang sama" : "jalan kaki pindah stasiun",
       lini: l.lineName,
       operator: l.operator,
       dari: st(l.stops[0])?.name,
       ke: st(l.stops[l.stops.length - 1])?.name,
       jarakMeter: l.distanceM,
       menit: l.minutes,
+      ...(l.minutesEstimated ? { menitPerkiraan: true } : {}),
       tarif: l.fare,
+      ...(l.options && l.options.length > 1 ? { pilihanLin: l.options.map((o) => o.lineName ?? o.lineId) } : {}),
+      ...(l.frequency ? { frekuensiMenit: l.frequency.headwayMinutes } : {}),
+      ...(l.notes ? { petunjuk: l.notes } : {}),
+      ...(l.boardAt
+        ? {
+            peronNaik: {
+              nomor: l.boardAt.code,
+              jenis: l.boardAt.type,
+              celahDenganKendaraan: l.boardAt.gap,
+              eskalator: l.boardAt.escalators,
+              lift: l.boardAt.lift,
+            },
+          }
+        : l.platform
+          ? { peronNaik: { nomor: l.platform } }
+          : {}),
+      ...(l.access?.length ? { aksesPindah: l.access.map((a) => ({ stasiun: st(a.stationId)?.name ?? a.stationId, ...(a.platform ? { peron: a.platform } : {}), fasilitas: AMENITY_LABEL[a.need], status: a.status, ...(a.notNeeded ? { tidakDibutuhkan: "peron dicapai tanpa anak tangga" } : {}) })) } : {}),
     })),
     totalTarif: f.route.totalFare,
     totalMenit: f.route.timeComplete ? f.route.totalMinutes : null,
@@ -182,8 +233,25 @@ export function factsForPrompt(f: PlanFacts): unknown {
         skor: a.score,
         memadai: a.adequate,
         dataTersedia: a.dataAvailable,
-        fasilitas: Object.fromEntries(CORE_AMENITIES.map((t) => [AMENITY_LABEL[t], s?.amenities[t] ?? "unknown"])),
+        // Lift/eskalator yang tidak dibutuhkan (peron dicapai tanpa JPO/terowongan) tidak dikirim agar tidak disebut "tidak ada".
+        fasilitas: Object.fromEntries(
+          CORE_AMENITIES.filter((t) => !((a.journey ? a.journey.level : a.layout?.level) && (t === "lift" || t === "eskalator"))).map((t) => [AMENITY_LABEL[t], s?.amenities[t] ?? "unknown"]),
+        ),
         catatan: a.notes,
+        ...(a.journey ? {
+              jalurGatePeron: {
+                peron: a.journey.platforms,
+                lewat: a.journey.via,
+                ...(a.journey.concourse
+                  ? { concourse: a.journey.concourse.name ?? a.journey.concourse.code, gateKeConcourse: a.journey.concourse.toConcourse, concourseKePeron: a.journey.concourse.toPlatform, ...(a.journey.pathLift ? { liftDiJalur: a.journey.pathLift } : {}) }
+                  : {}),
+                tanpaPindahLantai: a.journey.level,
+                tidakDihitung: a.journey.excluded.map((t) => AMENITY_LABEL[t]),
+              },
+            } : {}),
+        ...(a.gateChoice
+          ? { pintuDipilih: { peran: a.gateChoice.role, pintu: a.gateChoice.chosen, ...(a.gateChoice.recommended ? { disarankan: a.gateChoice.recommended, alasan: a.gateChoice.reason } : {}) } }
+          : {}),
       };
     }),
     alternatif: f.alternatives.map((a) => ({ melalui: st(a.viaStationId)?.name, menggantikan: st(a.replacesStationId)?.name, skor: a.assessment.score })),

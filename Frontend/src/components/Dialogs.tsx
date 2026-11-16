@@ -5,6 +5,7 @@ import { fetchStationDetail } from "@/lib/api";
 import { AMENITY_LABEL, useNetwork } from "@/lib/network";
 import type { AmenityType, StationDetailData } from "@/lib/types";
 import { AccessBadge } from "./AccessBadge";
+import { PlatformList, segmentText, VIA_TEXT, verticalText } from "./PlatformInfo";
 import { NoticeBanner } from "./ResultPanel";
 
 /** Dialog modal berbasis <dialog> bawaan peramban (fokus terkunci, Esc menutup). */
@@ -92,6 +93,11 @@ export function StationDetail({
             {st.operator} · {st.lineIds.map((l) => lineById(l)?.name ?? l).join(", ")} · {st.codes.join("/")}
             {st.hubId && ` · Hub ${hubById(st.hubId)?.name ?? st.hubId}`}
           </p>
+          {(st.inactive || base?.inactive) && (
+            <p className="banner banner-warn" role="status">
+              <span aria-hidden>⚠</span> Stasiun ini sudah tidak beroperasi.{(st.inactiveNote ?? base?.inactiveNote) ? ` ${st.inactiveNote ?? base?.inactiveNote}` : ""}
+            </p>
+          )}
           {full?.data?.notices.map((n) => <NoticeBanner key={n.id} notice={n} />)}
           <div>
             <p className="text-sm font-semibold">Skor aksesibilitas</p>
@@ -104,6 +110,14 @@ export function StationDetail({
                 <div className="mt-2">
                   <AccessBadge a={a} compact />
                 </div>
+                {/* Penjelasan skor: jalur gate ke peron dan potongan celah peron. */}
+                {(a.notes ?? [])
+                  .filter((n) => n.startsWith("Jalur gate ke peron") || a.penalties?.some((p) => n.startsWith(p.reason)))
+                  .map((n) => (
+                    <p key={n} className="mt-1 text-sm text-[var(--muted)]">
+                      <span aria-hidden>ⓘ</span> {n}
+                    </p>
+                  ))}
               </>
             ) : (
               <p className="banner banner-muted mt-1">
@@ -112,7 +126,7 @@ export function StationDetail({
             )}
           </div>
           <div>
-            <p className="text-sm font-semibold">Fasilitas</p>
+            <p className="text-sm font-semibold">Fasilitas umum stasiun</p>
             <ul className="mt-1 divide-y divide-[var(--border)]">
               {(Object.keys(AMENITY_LABEL) as AmenityType[]).map((k) => {
                 const d = details.find((x) => x.type === k);
@@ -124,6 +138,13 @@ export function StationDetail({
               ))}
             </ul>
           </div>
+          {full?.data?.platforms && full.data.platforms.length > 0 && (
+            <div>
+              <p className="text-sm font-semibold">Peron ({full.data.platforms.length})</p>
+              <p className="text-xs text-[var(--muted)]">Per peron: hanya mobilitas (lift, eskalator, ramp, celah peron, akses ke pintu keluar).</p>
+              <PlatformList platforms={full.data.platforms} entrances={full.data.entrances} concourses={full.data.concourses} station={st.amenities} />
+            </div>
+          )}
           {full?.data && full.data.entrances.length > 0 && (
             <div>
               <p className="text-sm font-semibold">Pintu akses</p>
@@ -138,6 +159,22 @@ export function StationDetail({
                     </p>
                     {e.description && <p>{e.description}</p>}
                     {e.features.length > 0 && <p className="text-[var(--muted)]">Akses: {e.features.map((f) => ENTRANCE_FEATURE[f] ?? f).join(", ")}</p>}
+                    {verticalText(e.escalators, e.lift).length > 0 && <p className="text-[var(--muted)]">{verticalText(e.escalators, e.lift).join(" · ")}</p>}
+                    {e.platformLinks && e.platformLinks.length > 0 && (
+                      <p>Ke peron: {e.platformLinks.map((l) => `${l.platform} ${VIA_TEXT[l.via]}${l.stepFree ? " beramp tanpa anak tangga" : ""}${l.dedicated ? " khusus disabilitas" : ""}${l.note ? ` (${l.note})` : ""}`).join(" · ")}</p>
+                    )}
+                    {e.concourseLinks && e.concourseLinks.length > 0 && (
+                      <p>
+                        Ke concourse:{" "}
+                        {e.concourseLinks
+                          .map((l) => {
+                            const c = full.data?.concourses?.find((x) => x.code === l.concourse);
+                            return `${c?.name ?? l.concourse} (${segmentText(l)})`;
+                          })
+                          .join(" · ")}
+                      </p>
+                    )}
+                    {e.signs && e.signs.length > 0 && <p className="text-[var(--muted)]">Papan petunjuk: {e.signs.join(", ")}</p>}
                     {e.openHours && <p className="text-[var(--muted)]">Buka: {e.openHours}</p>}
                     {e.note && <p className="text-[var(--muted)]">{e.note}</p>}
                   </li>

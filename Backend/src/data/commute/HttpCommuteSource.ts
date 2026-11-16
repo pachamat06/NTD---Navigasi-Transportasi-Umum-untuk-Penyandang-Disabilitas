@@ -3,12 +3,13 @@
 //
 // Respons API dibungkus `{ status, data }` (gagal: `{ status, error: { code, message } }`) dan diterjemahkan
 // ke tipe internal di ./types. Endpoint yang dipakai:
-//   /stations, /stations/{operator}/{code}, /hubs, /operators, /lines/{operator}/{lineCode}, /fares/{from}/{to}
+//   /stations, /stations/{operator}/{code}, /stations/{operator}/{code}/transfers,
+//   /stations/{operator}/{code}/headway, /stations/{operator}/{code}/timetable, /hubs, /operators, /lines/{operator}/{lineCode}, /fares/{from}/{to}?at=
 // Id stasiun API berbentuk `{operator}-{code}` (mis. KCI-SUD); kunci lin `OPERATOR:KODE` (mis. KCI:C).
 
 import { UpstreamError } from "../../errors";
 import type { Mode } from "../../domain/models";
-import type { CommuteSource, UpFare, UpHub, UpLeg, UpLine, UpOperator, UpStation, UpStopRef } from "./types";
+import type { CommuteSource, UpDeparture, UpExit, UpExitRef, UpFare, UpHeadway, UpHub, UpHubTransfer, UpLeg, UpLine, UpOperator, UpPlatformService, UpStation, UpStopRef } from "./types";
 
 export interface HttpCommuteOptions {
   baseUrl: string;
@@ -23,6 +24,8 @@ export interface HttpCommuteOptions {
 
 export const DEFAULT_OPERATORS = ["KCI", "MRTJ", "LRTJ", "LRTJBDB", "APCGK", "TJ"];
 export const DEFAULT_REGIONS = ["CGK"];
+/** Jeda bila API membalas 429 tanpa Retry-After (API mengirim 60 detik). */
+const DEFAULT_RETRY_AFTER_S = 60;
 
 // --- Bentuk respons API (hanya field yang dipakai) ---------------------------------------------
 
@@ -55,7 +58,48 @@ interface ApiHub {
   id: string;
   slug: string;
   name: string;
+  kind?: "hub" | "integrated";
   members: ApiStationRef[];
+}
+
+interface ApiExitRef {
+  id?: string;
+  ref: string;
+  name?: string | null;
+  signs?: { text: string }[] | null;
+}
+
+type ApiTransfer =
+  | { dataType: "INTERNAL"; toStation: ApiStationRef; distanceM: number; notes?: string | null; fromExit?: ApiExitRef; toExit?: ApiExitRef }
+  | { dataType: "EXTERNAL"; toStation: { name: string; operatorName: string }; distanceM: number; notes?: string | null; fromExit?: ApiExitRef };
+
+/** /timetable/grouped?compact=1: per lin, kelompok arah dengan nomor peron (bila tercatat). */
+interface ApiGroupedTimetable {
+  line: string;
+  /** Label arah berupa daftar stasiun yang dilewati, mis. ["Manggarai", "Jatinegara", "Cikarang"]. */
+  timetable: { key: string; label?: string[] | string | null; platformCode?: string | null }[];
+}
+
+/** /timetable: satu keberangkatan. `estimatedArrival` adalah jam tiba di tujuan akhir, bukan di stasiun berikutnya. */
+interface ApiDeparture {
+  tripNumber: string;
+  estimatedDeparture: string;
+  /** Jam tiba di tujuan akhir (`boundFor`). Untuk sebagian operator sama dengan jam berangkat (tidak diketahui). */
+  estimatedArrival?: string | null;
+  boundFor?: string | null;
+  lineCode?: string | null;
+}
+
+interface ApiExit extends ApiExitRef {
+  source?: string;
+}
+
+interface ApiHeadway {
+  line: string;
+  headwayS: number | null;
+  source?: "STOP" | "LINE";
+  boundFor?: string;
+  serviceHours?: { start: string; end: string } | { allDay: true };
 }
 
 interface ApiOperator {
@@ -66,19 +110,12 @@ interface ApiOperator {
 }
 
 interface ApiLineDetail {
-  segments?: { kind?: string; joinsAtCode?: string | null; stations?: { id: string; code: string; stationNumber?: string }[] }[];
+  segments?: { kind?: string; joinsAtCode?: string | null; stations?: { id: string; code: string; name?: string; stationNumber?: string }[] }[];
 }
 
 interface ApiFareStation {
   id: string;
   name?: string;
-}
-
-interface ApiStopTime {
-  id?: string;
-  stationId?: string;
-  arrivalAt?: string | null;
-  departureAt?: string | null;
 }
 
 type ApiFareLeg =
@@ -90,9 +127,13 @@ type ApiFareLeg =
       to: ApiFareStation;
       stops?: ApiFareStation[];
       distanceM: number;
+      headsign?: string | null;
+      serviceLines?: { line: string; headsign?: string | null }[];
+      platformCode?: string | null;
       departureAt?: string | null;
       arrivalAt?: string | null;
-      stopTimes?: ApiStopTime[];
+      /** Jam di tiap pemberhentian, sejajar dengan `stops` (bukan objek). */
+      stopTimes?: (string | null)[];
     }
   | { type: "TRANSFER"; from: ApiFareStation; to: ApiFareStation; distanceM: number; fare?: number | null };
 
@@ -125,6 +166,8 @@ export class HttpCommuteSource implements CommuteSource {
   private fetchImpl: typeof fetch;
   private operators: Set<string>;
   private regions: Set<string>;
+  /** Setelah 429, permintaan berikutnya ditahan sampai waktu ini agar tidak memperpanjang pembatasan. */
+  private blockedUntil = 0;
 
   constructor(private opts: HttpCommuteOptions) {
     this.fetchImpl = opts.fetchImpl ?? fetch;
@@ -137,6 +180,9 @@ export class HttpCommuteSource implements CommuteSource {
     const url = new URL(path, this.opts.baseUrl.endsWith("/") ? this.opts.baseUrl : this.opts.baseUrl + "/");
     const headers: Record<string, string> = { accept: "application/json", "user-agent": "NTD-backend/1.0" };
     if (this.opts.apiKey) headers.authorization = `Bearer ${this.opts.apiKey}`;
+    if (Date.now() < this.blockedUntil) {
+      throw new UpstreamError(`Commute Data API sedang membatasi permintaan; coba lagi setelah ${new Date(this.blockedUntil).toISOString()}`, 429);
+    }
     let res: Response;
     try {
       res = await this.fetchImpl(url, { headers, signal: AbortSignal.timeout(this.opts.timeoutMs) });
@@ -144,6 +190,11 @@ export class HttpCommuteSource implements CommuteSource {
       throw new UpstreamError(`Commute Data API tidak dapat dihubungi: ${(e as Error).message}`);
     }
     if (res.status === 404) return null;
+    if (res.status === 429) {
+      const after = Number(res.headers.get("retry-after"));
+      this.blockedUntil = Date.now() + (Number.isFinite(after) && after > 0 ? after : DEFAULT_RETRY_AFTER_S) * 1000;
+      throw new UpstreamError(`Commute Data API membatasi permintaan (429) untuk ${url.pathname}`, 429);
+    }
     let body: unknown;
     try {
       body = await res.json();
@@ -176,25 +227,110 @@ export class HttpCommuteSource implements CommuteSource {
     return s ? mapStation(s, null) : null;
   }
 
-  async getFare(from: UpStopRef, to: UpStopRef): Promise<UpFare | null> {
-    // Nama parameter waktu keberangkatan belum terdokumentasi pada sampel OpenAPI, jadi tarif dan jadwal
-    // memakai waktu sekarang menurut API.
-    const f = await this.get<ApiFare>(`fares/${stopParam(from)}/${stopParam(to)}`);
+  async getFare(from: UpStopRef, to: UpStopRef, at?: string): Promise<UpFare | null> {
+    // `at` (ISO 8601) menentukan tarif peak/off-peak. /fares tidak mengembalikan jam keberangkatan.
+    const query = at ? `?at=${encodeURIComponent(new Date(at).toISOString())}` : "";
+    const f = await this.get<ApiFare>(`fares/${stopParam(from)}/${stopParam(to)}${query}`);
     return f ? mapFare(f) : null;
   }
 
+  async getTransfers(operator: string, code: string): Promise<UpHubTransfer[] | null> {
+    const list = await this.get<ApiTransfer[]>(`stations/${encodeURIComponent(operator)}/${encodeURIComponent(code)}/transfers`);
+    if (!list) return null;
+    // EXTERNAL = layanan di luar API (tanpa id), tidak bisa dipakai sebagai perpindahan dalam rute.
+    return list.flatMap((t) =>
+      t.dataType === "INTERNAL"
+        ? [
+            {
+              from: { operator, code },
+              to: { operator: t.toStation.operator, code: t.toStation.code },
+              distanceM: t.distanceM,
+              notes: t.notes ?? null,
+              ...(t.fromExit ? { fromExit: mapExit(t.fromExit) } : {}),
+              ...(t.toExit ? { toExit: mapExit(t.toExit) } : {}),
+            },
+          ]
+        : [],
+    );
+  }
+
+  async getHeadways(operator: string, code: string, at?: string): Promise<UpHeadway[] | null> {
+    const { day, hour } = jakartaDayHour(at ? new Date(at) : new Date());
+    const rows = await this.get<ApiHeadway[]>(`stations/${encodeURIComponent(operator)}/${encodeURIComponent(code)}/headway?day=${day}&hour=${hour}`);
+    if (!rows) return null;
+    return rows.map((r) => {
+      const [op, line] = r.line.includes(":") ? r.line.split(":", 2) : [operator, r.line];
+      return {
+        operator: op,
+        line,
+        headwayS: r.headwayS,
+        ...(r.boundFor ? { boundFor: r.boundFor } : {}),
+        ...(r.source ? { source: r.source } : {}),
+        ...(r.serviceHours ? { serviceHours: r.serviceHours } : {}),
+      };
+    });
+  }
+
+  async getTimetable(operator: string, code: string, day: "WD" | "SAT" | "SUN"): Promise<UpDeparture[] | null> {
+    // from = to berarti sehari penuh.
+    const rows = await this.get<ApiDeparture[]>(`stations/${encodeURIComponent(operator)}/${encodeURIComponent(code)}/timetable?day=${day}&from=00:00&to=00:00`);
+    if (!rows) return null;
+    return rows.flatMap((r) => {
+      const minutes = clockMinutes(r.estimatedDeparture);
+      if (!r.tripNumber || minutes === undefined) return [];
+      const arrive = clockMinutes(r.estimatedArrival);
+      return [
+        {
+          tripNumber: String(r.tripNumber),
+          minutes,
+          ...(r.boundFor ? { boundFor: r.boundFor } : {}),
+          ...(arrive !== undefined && arrive !== minutes ? { arriveFinal: arrive } : {}),
+          ...(r.lineCode ? { line: r.lineCode } : {}),
+        },
+      ];
+    });
+  }
+
+  async getPlatforms(operator: string, code: string): Promise<UpPlatformService[] | null> {
+    // Jendela jam sempit agar respons kecil; pengelompokan arah tetap dihitung dari jadwal sehari penuh.
+    const path = `stations/${encodeURIComponent(operator)}/${encodeURIComponent(code)}/timetable/grouped?compact=1&from=04:00&to=05:00`;
+    const rows = await this.get<ApiGroupedTimetable[]>(path);
+    if (!rows) return null;
+    return rows.flatMap((r) => {
+      const [op, line] = r.line.includes(":") ? r.line.split(":", 2) : [operator, r.line];
+      return r.timetable.flatMap((g) => (g.platformCode ? [{ operator: op, line, platformCode: g.platformCode, ...(directionLabel(g.label) ? { direction: directionLabel(g.label) } : {}) }] : []));
+    });
+  }
+
+  async getExits(operator: string, code: string): Promise<UpExit[] | null> {
+    const rows = await this.get<ApiExit[]>(`stations/${encodeURIComponent(operator)}/${encodeURIComponent(code)}/exits`);
+    return rows ? rows.map((e) => ({ ...mapExit(e), ...(e.source ? { source: e.source } : {}) })) : null;
+  }
+
   async getHubs(): Promise<UpHub[]> {
-    const hubs = (await this.get<ApiHub[]>("hubs")) ?? [];
-    return hubs
+    const hubs = ((await this.get<ApiHub[]>("hubs")) ?? [])
       .map((h) => ({
         // slug dipakai sebagai id karena GUI (indeks posisi peta) mengenal hub dengan slug, mis. "dukuh-atas".
         id: h.slug,
         name: h.name,
+        ...(h.kind ? { kind: h.kind } : {}),
         stations: (h.members ?? []).filter((m) => this.allowed(m.operator)).map((m) => ({ operator: m.operator, code: m.code })),
-        // Jarak jalan kaki antarstasiun tidak tersedia pada /hubs.
-        transfers: [],
       }))
       .filter((h) => h.stations.length > 1);
+    // /hubs tidak memuat jarak jalan kaki; jaraknya dari /stations/{op}/{code}/transfers tiap anggota.
+    const members = hubs.flatMap((h) => h.stations.map((s) => ({ h, s })));
+    // Jarak hanya pelengkap: galat satu anggota tidak menggagalkan daftar hub, kecuali 429 (cache lama dipakai).
+    const lists = await mapLimit(members, 4, ({ s }) =>
+      this.getTransfers(s.operator, s.code).catch((e) => {
+        if (e instanceof UpstreamError && e.status === 429) throw e;
+        return null;
+      }),
+    );
+    return hubs.map((h) => {
+      const inHub = new Set(h.stations.map((s) => `${s.operator}:${s.code}`));
+      const transfers = members.flatMap(({ h: owner }, i) => (owner === h ? (lists[i] ?? []) : [])).filter((t) => inHub.has(`${t.to.operator}:${t.to.code}`));
+      return { ...h, transfers };
+    });
   }
 
   private async apiOperators(): Promise<ApiOperator[]> {
@@ -253,10 +389,11 @@ function mapStation(s: ApiStation, hub: string | null): UpStation {
 }
 
 /** Stasiun sebuah lin, urut dari stasiun awal; cabang (loop, ramp) ditambahkan setelah batang utama. */
-function lineStations(operator: string, detail: ApiLineDetail | null): Pick<UpLine, "stations" | "stationNumbers" | "segments"> {
+function lineStations(operator: string, detail: ApiLineDetail | null): Pick<UpLine, "stations" | "stationNumbers" | "stationNames" | "segments"> {
   const seen = new Set<string>();
   const stations: UpStopRef[] = [];
   const stationNumbers: (string | null)[] = [];
+  const stationNames: (string | null)[] = [];
   const segments: NonNullable<UpLine["segments"]> = [];
   for (const seg of detail?.segments ?? []) {
     const refs: UpStopRef[] = [];
@@ -268,11 +405,13 @@ function lineStations(operator: string, detail: ApiLineDetail | null): Pick<UpLi
         seen.add(key);
         stations.push(ref);
         stationNumbers.push(st.stationNumber || null);
+        stationNames.push(st.name || null);
       }
     }
-    if (refs.length) segments.push({ stations: refs, ...(seg.joinsAtCode ? { joinsAt: { operator, code: seg.joinsAtCode } } : {}) });
+    if (refs.length)
+      segments.push({ stations: refs, ...(seg.joinsAtCode ? { joinsAt: { operator, code: seg.joinsAtCode } } : {}), ...(seg.kind === "LOOP" ? { loop: true } : {}) });
   }
-  return { stations, stationNumbers, segments };
+  return { stations, stationNumbers, stationNames, segments };
 }
 
 function mapFare(f: ApiFare): UpFare {
@@ -286,10 +425,17 @@ function mapFare(f: ApiFare): UpFare {
     // Tarif ditagih per segmen operator; segmen dibebankan ke leg pertama yang berangkat dari titik awalnya.
     const si = segments.findIndex((s) => s.operator === l.operator && s.from.id === l.from.id);
     const fare = si >= 0 ? (segments.splice(si, 1)[0].fare ?? 0) : 0;
+    const serviceLines = (l.serviceLines ?? []).map((x) => {
+      const [op, code] = x.line.includes(":") ? x.line.split(":", 2) : [l.operator, x.line];
+      return { operator: op, line: code, headsign: x.headsign ?? null };
+    });
     return {
       type: "RIDE",
       operator: lineOp,
       line: lineCode,
+      headsign: l.headsign ?? null,
+      ...(l.platformCode ? { platformCode: l.platformCode } : {}),
+      ...(serviceLines.length > 1 ? { serviceLines } : {}),
       stops: stops.map((s) => refOfId(s.id)),
       stopNames: stops.map((s) => s.name ?? s.id),
       distanceM: l.distanceM,
@@ -312,6 +458,31 @@ function mapFare(f: ApiFare): UpFare {
     totalDistanceM: f.totalDistanceM,
     legs,
   };
+}
+
+function mapExit(e: ApiExitRef): UpExitRef {
+  return { ref: e.ref, ...(e.name ? { name: e.name } : {}), ...(e.signs?.length ? { signs: e.signs.map((x) => x.text) } : {}) };
+}
+
+/** "HH:MM[:SS]" menjadi menit sejak tengah malam (0–1439); undefined bila bukan jam. */
+function clockMinutes(v: string | null | undefined): number | undefined {
+  const m = /^(\d{1,2}):(\d{2})/.exec(v ?? "");
+  return m ? (Number(m[1]) * 60 + Number(m[2])) % 1440 : undefined;
+}
+
+/** Label arah dari /timetable/grouped (daftar stasiun yang dilewati) menjadi teks, mis. "Arah Manggarai – Jatinegara – Cikarang". */
+export function directionLabel(label: unknown): string | undefined {
+  const parts = (Array.isArray(label) ? label : [label]).filter((x): x is string => typeof x === "string" && x.trim() !== "").map((x) => x.trim());
+  if (!parts.length) return undefined;
+  const text = /^arah\b/i.test(parts[0]) ? parts.join(" – ") : `Arah ${parts.join(" – ")}`;
+  return text.length > 120 ? `${text.slice(0, 119)}…` : text;
+}
+
+/** Hari layanan (WD/SAT/SUN) dan jam menurut waktu Jakarta (UTC+7, tanpa DST). */
+export function jakartaDayHour(d: Date): { day: "WD" | "SAT" | "SUN"; hour: number } {
+  const local = new Date(d.getTime() + 7 * 3600_000);
+  const dow = local.getUTCDay();
+  return { day: dow === 0 ? "SUN" : dow === 6 ? "SAT" : "WD", hour: local.getUTCHours() };
 }
 
 async function mapLimit<T, R>(items: T[], limit: number, fn: (x: T) => Promise<R>): Promise<R[]> {

@@ -1,11 +1,13 @@
 // Konten yang tidak disediakan dataset dan dikelola tim lewat halaman admin:
 // koreksi/tambahan fasilitas, pintu akses stasiun, pengumuman (sumber notifikasi), info lain,
-// serta pengaturan skor dan disclaimer. Validasi skema di sini dipakai bersama oleh endpoint admin.
+// posisi pemberhentian dan bentuk jalur pada peta, serta pengaturan skor dan disclaimer. Validasi skema di sini dipakai bersama oleh endpoint admin.
 
 import { z } from "zod";
 import type { RequestContext } from "../context";
 import type { ContentItem, ContentKind, ContentRepository } from "../store/types";
-import { CORE_AMENITIES, EXTRA_AMENITIES, type AmenityDetail, type AmenityType, type Entrance, type Notice, type StationInfo } from "./models";
+import type { StationStatusContent } from "./stationStatus";
+import type { LineContent, StationContent } from "./datasetOverlay";
+import { CORE_AMENITIES, EXTRA_AMENITIES, SEGMENT_MEANS, type AmenityDetail, type AmenityType, type AnyAmenityType, type Concourse, type Entrance, type ExtraAmenityType, type Notice, type Platform, type StationInfo } from "./models";
 
 const isoDate = z.string().refine((v) => !Number.isNaN(Date.parse(v)), "harus tanggal ISO 8601");
 
@@ -18,6 +20,89 @@ export const facilitySchema = z.object({
   until: isoDate.optional(),
 });
 
+const detailStatus = z.enum(["available", "absent", "unknown", "out_of_service"]);
+
+/** Sekelompok eskalator di satu tempat: jumlah dan arah (naik/turun dilihat dari lantai bawah). */
+export const escalatorSchema = z.object({
+  count: z.number().int().min(1).max(20),
+  direction: z.enum(["naik", "turun", "bergantian"]),
+  connects: z.string().max(120).optional(),
+  status: detailStatus.optional(),
+});
+
+export const liftSchema = z.object({
+  count: z.number().int().min(0).max(20),
+  connects: z.string().max(120).optional(),
+  status: detailStatus.optional(),
+});
+
+/** Peron satu stasiun/halte hasil survei. Peron dengan `code` sama dengan dataset melengkapi/menimpa data itu. */
+export const platformSchema = z.object({
+  code: z.string().min(1).max(20),
+  name: z.string().max(120).optional(),
+  type: z.enum(["island", "side", "bay"]).optional(),
+  tracks: z.array(z.string().min(1).max(10)).max(6).optional(),
+  serves: z.array(z.object({ lineId: z.string().min(1).max(80), direction: z.string().max(120).optional() })).max(20).optional(),
+  /**
+   * Fasilitas mobilitas di peron ini. `toilet` hanya diterima dari data lama: toilet adalah informasi umum stasiun
+   * sehingga dipindahkan ke fasilitas stasiun (lihat ContentSnapshot.platformStationFacilities).
+   */
+  amenities: z.object({ lift: detailStatus, eskalator: detailStatus, ramp: detailStatus, guiding_block: detailStatus, toilet: detailStatus }).partial().default({}),
+  /** Akses dari peron ini ke pintu keluar tertentu. */
+  exitAccess: z
+    .array(
+      z.object({
+        gate: z.string().min(1).max(120),
+        via: z.enum(["langsung", "crosswalk", "sebidang", "jpo", "terowongan"]),
+        stepFree: z.boolean().optional(),
+        dedicated: z.boolean().optional(),
+        note: z.string().max(200).optional(),
+      }),
+    )
+    .max(20)
+    .optional(),
+  escalators: z.array(escalatorSchema).max(10).optional(),
+  lift: liftSchema.optional(),
+  gap: z
+    .object({
+      level: z.enum(["sejajar", "sedikit", "tangga"]),
+      steps: z.number().int().min(1).max(10).optional(),
+      horizontalCm: z.number().min(0).max(200).optional(),
+      verticalCm: z.number().min(0).max(200).optional(),
+      boardingAid: z.boolean().optional(),
+      note: z.string().max(300).optional(),
+    })
+    .refine((g) => g.level !== "tangga" || !!g.steps, { message: "jumlah anak tangga wajib bila level 'tangga'", path: ["steps"] })
+    .optional(),
+  note: z.string().max(500).optional(),
+});
+
+/**
+ * Satu ruas jalur di dalam stasiun (gate → concourse atau concourse → peron): cara berpindah yang tersedia
+ * (datar/ramp tanpa anak tangga; lift/eskalator/tangga pindah lantai), lift dan eskalator di ruas itu.
+ */
+const segmentFields = {
+  means: z.array(z.enum(SEGMENT_MEANS)).min(1, "isi minimal satu cara berpindah").max(SEGMENT_MEANS.length),
+  lift: liftSchema.optional(),
+  escalators: z.array(escalatorSchema).max(10).optional(),
+  /** Ruas khusus pengguna disabilitas. */
+  dedicated: z.boolean().optional(),
+  note: z.string().max(200).optional(),
+};
+
+/** Concourse (area penghubung gate dan peron). Satu entri per kode per stasiun; gate merujuknya lewat `concourseLinks`. */
+export const concourseSchema = z.object({
+  code: z.string().min(1).max(40),
+  name: z.string().max(120).optional(),
+  level: z.string().max(60).optional(),
+  paid: z.boolean().optional(),
+  platformLinks: z
+    .array(z.object({ platform: z.string().min(1).max(20), ...segmentFields }))
+    .max(20)
+    .default([]),
+  note: z.string().max(500).optional(),
+});
+
 export const entranceSchema = z.object({
   name: z.string().min(1).max(120),
   description: z.string().max(1000).optional(),
@@ -26,6 +111,30 @@ export const entranceSchema = z.object({
   openHours: z.string().max(120).optional(),
   note: z.string().max(500).optional(),
   mapPosition: z.object({ x: z.number(), y: z.number() }).optional(),
+  escalators: z.array(escalatorSchema).max(10).optional(),
+  lift: liftSchema.optional(),
+  /** Nama pintu pada dataset (/exits, mis. "B") yang dilengkapi entri ini. */
+  exitRef: z.string().max(40).optional(),
+  /** Peron yang dicapai dari gate ini: langsung, menyeberang setinggi tanah/rel, atau lewat JPO/terowongan. */
+  platformLinks: z
+    .array(
+      z.object({
+        platform: z.string().min(1).max(20),
+        via: z.enum(["langsung", "crosswalk", "sebidang", "jpo", "terowongan"]),
+        /** Jalur/penyeberangan khusus pengguna disabilitas. */
+        dedicated: z.boolean().optional(),
+        /** JPO/terowongan tanpa anak tangga (ramp landai). */
+        stepFree: z.boolean().optional(),
+        note: z.string().max(200).optional(),
+      }),
+    )
+    .max(20)
+    .optional(),
+  /** Concourse yang dicapai dari gate ini (gate yang tidak langsung ke peron), dengan cara berpindah ke sana. */
+  concourseLinks: z
+    .array(z.object({ concourse: z.string().min(1).max(40), ...segmentFields }))
+    .max(10)
+    .optional(),
 });
 
 export const noticeSchema = z
@@ -47,13 +156,173 @@ export const stationInfoSchema = z.object({
   body: z.string().min(1).max(2000),
 });
 
+/** Status operasional stasiun (satu isian per stasiun): nonaktif = sudah tidak beroperasi, aktif = membatalkan status bawaan. */
+export const stationStatusSchema = z.object({
+  inactive: z.boolean(),
+  note: z.string().trim().max(300).optional(),
+});
+
+/** Titik pada Aset Peta Transit (satuan pt peta FDTJ 2026-08c, 9513.57 x 6726.88). */
+const mapPoint = z.tuple([z.number().min(-500).max(10_500), z.number().min(-500).max(7_500)]);
+
+/**
+ * Posisi titik pemberhentian yang ditetapkan admin; menang atas posisi otomatis. Dengan `lineId`: titik anak
+ * stasiun, yaitu posisi stasiun itu khusus untuk satu lini, agar garis beberapa lini yang berhenti di stasiun
+ * yang sama (mis. Bundaran Senayan, Pulo Gadung) tidak bertumpuk di satu titik.
+ */
+export const mapStopSchema = z.object({
+  x: z.number().min(-500).max(10_500),
+  y: z.number().min(-500).max(7_500),
+  lineId: z.string().min(1).max(80).optional(),
+  note: z.string().max(500).optional(),
+});
+
+/** Bentuk jalur satu lini antara dua pemberhentian bersebelahan (titik belok di antaranya, urut dari `fromStationId`). */
+export const mapTrackSchema = z
+  .object({
+    lineId: z.string().min(1).max(80),
+    fromStationId: z.string().min(1).max(80),
+    toStationId: z.string().min(1).max(80),
+    points: z.array(mapPoint).max(300),
+    note: z.string().max(500).optional(),
+  })
+  .refine((t) => t.fromStationId !== t.toStationId, { message: "fromStationId dan toStationId harus berbeda", path: ["toStationId"] });
+
+export type MapStop = z.infer<typeof mapStopSchema> & { stationId: string };
+
+/** Satu pemberhentian pada urutan rute: waktu tempuh dari pemberhentian sebelumnya (menit; null = belum diketahui). */
+export const routeStopSchema = z.object({
+  stationId: z.string().min(1).max(80),
+  minutes: z.number().min(0).max(240).nullable().optional(),
+  note: z.string().max(200).optional(),
+});
+
+/**
+ * Pengaturan rute satu lini untuk satu arah (0 atau 1): urutan pemberhentian, waktu tempuh antarpemberhentian,
+ * dan tujuan akhir. Menggantikan urutan bawaan (Commute Data API / GTFS) untuk peta, pencarian rute topologi,
+ * lin paralel, dan waktu tempuh yang tidak tersedia di dataset.
+ */
+export const routePatternSchema = z
+  .object({
+    lineId: z.string().min(1).max(80),
+    direction: z.union([z.literal(0), z.literal(1)]),
+    headsign: z.string().max(120).optional(),
+    stops: z.array(routeStopSchema).min(2).max(200),
+    /** Asal data terakhir: diisi sendiri, atau hasil sinkron dari GTFS / Commute Data API. */
+    source: z.enum(["manual", "gtfs", "commute"]).default("manual"),
+    syncedAt: isoDate.optional(),
+    /** Frekuensi rata-rata (menit) bila dataset tidak punya. */
+    headwayMinutes: z.number().min(1).max(240).optional(),
+    serviceHours: z.string().max(60).optional(),
+    /** Ruas cabang/ramp tambahan untuk arah ini (urutan stasiun searah arah ini), mis. cabang dari dataset. */
+    branches: z.array(z.array(z.string().min(1).max(80)).min(2).max(200)).max(20).optional(),
+    note: z.string().max(500).optional(),
+  })
+  .refine((p) => p.stops.every((s, i) => i === 0 || s.stationId !== p.stops[i - 1].stationId), {
+    message: "dua pemberhentian berurutan tidak boleh sama",
+    path: ["stops"],
+  });
+
+export type RoutePattern = z.infer<typeof routePatternSchema> & { id: string };
+
+/**
+ * Hub transfer dari admin: membuat hub baru atau menggantikan hub dataset dengan `hubId` yang sama (anggota, jalan
+ * kaki antaranggota, nama). `disabled` menghapus hub dataset yang keliru dari perencanaan rute.
+ */
+export const hubSchema = z
+  .object({
+    hubId: z
+      .string()
+      .min(2)
+      .max(60)
+      .regex(/^[a-z0-9][a-z0-9-]*$/, "huruf kecil, angka, dan tanda hubung"),
+    name: z.string().min(1).max(120),
+    kind: z.enum(["hub", "integrated"]).default("hub"),
+    memberIds: z.array(z.string().min(1).max(80)).max(20).default([]),
+    walks: z
+      .array(
+        z.object({
+          from: z.string().min(1).max(80),
+          to: z.string().min(1).max(80),
+          distanceM: z.number().min(0).max(5000),
+          minutes: z.number().min(0).max(120).nullable().optional(),
+          notes: z.string().max(300).optional(),
+        }),
+      )
+      .max(200)
+      .default([]),
+    /** Asal data terakhir: diisi sendiri, atau hasil sinkron dari Commute Data API / usulan GTFS Transjakarta. */
+    source: z.enum(["manual", "commute", "gtfs"]).default("manual"),
+    syncedAt: isoDate.optional(),
+    disabled: z.boolean().optional(),
+    note: z.string().max(500).optional(),
+  })
+  .refine((h) => h.disabled || new Set(h.memberIds).size >= 2, { message: "hub minimal punya dua anggota", path: ["memberIds"] })
+  .refine((h) => h.walks.every((w) => w.from !== w.to && h.memberIds.includes(w.from) && h.memberIds.includes(w.to)), {
+    message: "jalan kaki hanya antaranggota hub yang berbeda",
+    path: ["walks"],
+  });
+
+export type HubContent = z.infer<typeof hubSchema> & { id: string };
+
+/** Id stasiun/lini: slug NTD (mis. "manggarai") atau id turunan `operator:kode` (mis. "lrtj:pka", "ntd:stasiun-baru"). */
+const datasetId = z
+  .string()
+  .min(2)
+  .max(80)
+  .regex(/^[a-z0-9]+(?::[a-z0-9-]+|(?:-[a-z0-9]+)*)$/, "huruf kecil, angka, tanda hubung; boleh berawalan operator:, mis. ntd:stasiun-baru");
+
+/**
+ * Stasiun dari admin (satu isian per stasiun, `stationId` isian): menambah stasiun yang belum ada di dataset
+ * (tambah manual, atau diimpor dari GTFS / lin Commute yang stasiunnya belum tercantum di /stations), atau
+ * mengoreksi nama, operator, nomor, lini, dan koordinat stasiun dataset dengan id yang sama.
+ */
+export const stationSchema = z.object({
+  name: z.string().trim().min(1).max(120),
+  operator: z.string().trim().min(1).max(80),
+  /** Nomor/kode stasiun pada peta, mis. "S08". */
+  codes: z.array(z.string().trim().min(1).max(20)).max(10).default([]),
+  /** Lini yang berhenti di stasiun ini (urutannya diatur di Rute & urutan halte). */
+  lineIds: z.array(z.string().min(1).max(80)).max(30).default([]),
+  lat: z.number().min(-90).max(90).optional(),
+  lng: z.number().min(-180).max(180).optional(),
+  /** Asal data terakhir: diisi sendiri, atau hasil sinkron dari Commute Data API / GTFS Transjakarta. */
+  source: z.enum(["manual", "commute", "gtfs"]).default("manual"),
+  syncedAt: isoDate.optional(),
+  note: z.string().max(500).optional(),
+}).refine((x) => (x.lat === undefined) === (x.lng === undefined), { message: "lat dan lng diisi bersama", path: ["lng"] });
+
+/**
+ * Lini/rute dari admin (satu isian per `lineId`): menambah rute yang belum ada di dataset (urutan pemberhentiannya
+ * diisi lewat pengaturan rute), atau mengoreksi nama, operator, moda, dan warna lini dataset dengan id yang sama.
+ */
+export const lineSchema = z.object({
+  lineId: datasetId,
+  name: z.string().trim().min(1).max(120),
+  operator: z.string().trim().min(1).max(80),
+  mode: z.enum(["RAIL", "SUBWAY", "TRAM", "BUS", "MONORAIL"]),
+  color: z.string().regex(/^#[0-9a-fA-F]{6}$/, "warna heksadesimal, mis. #F26324").default("#555555"),
+  source: z.enum(["manual", "commute", "gtfs"]).default("manual"),
+  syncedAt: isoDate.optional(),
+  note: z.string().max(500).optional(),
+});
+
+export const stationIdSchema = datasetId;
+export type MapTrack = z.infer<typeof mapTrackSchema> & { id: string };
+
 export const DEFAULT_DISCLAIMER =
   "Informasi fasilitas berasal dari data statis dan bisa berbeda dengan kondisi di lapangan. Bukan status real-time.";
 
+const weight = z.number().min(0).max(100);
+
 export const settingsSchema = z.object({
   scoring: z.object({
-    weights: z.object({ lift: z.number().min(0).max(100), eskalator: z.number().min(0).max(100), toilet: z.number().min(0).max(100), ramp: z.number().min(0).max(100) }),
-    threshold: z.number().min(0).max(100),
+    weights: z.object({ lift: weight, eskalator: weight, toilet: weight, ramp: weight }),
+    /** Bobot fasilitas tambahan; hanya dihitung bila tim sudah mengisi statusnya (belum diisi tidak mengurangi skor). */
+    extraWeights: z.object(Object.fromEntries(EXTRA_AMENITIES.map((t) => [t, weight])) as Record<ExtraAmenityType, typeof weight>).optional(),
+    /** Potongan skor perjalanan karena celah peron dengan kendaraan; dipotong setengah bila petugas menyediakan pelat/ramp. */
+    gapPenalty: z.object({ tangga: weight, sedikit: weight }).optional(),
+    threshold: weight,
   }),
   disclaimer: z.string().min(10).max(500),
   llmEnabled: z.boolean(),
@@ -65,8 +334,24 @@ export type FacilityOverride = z.infer<typeof facilitySchema>;
 export type Settings = z.infer<typeof settingsSchema>;
 
 /** Bobot awal mengikuti GUI basic; divalidasi dengan data riil pada Sprint 2 (Risiko #4). */
+export const DEFAULT_EXTRA_WEIGHTS: Record<ExtraAmenityType, number> = {
+  guiding_block: 10,
+  petugas_bantuan: 10,
+  kursi_roda: 5,
+  pintu_lebar: 5,
+  area_prioritas: 5,
+  informasi_audio: 5,
+  informasi_visual: 5,
+};
+export const DEFAULT_GAP_PENALTY = { tangga: 15, sedikit: 5 };
+
 export const DEFAULT_SETTINGS: Settings = {
-  scoring: { weights: { lift: 40, eskalator: 20, toilet: 25, ramp: 15 }, threshold: 70 },
+  scoring: {
+    weights: { lift: 40, eskalator: 20, toilet: 25, ramp: 15 },
+    extraWeights: DEFAULT_EXTRA_WEIGHTS,
+    gapPenalty: DEFAULT_GAP_PENALTY,
+    threshold: 70,
+  },
   disclaimer: DEFAULT_DISCLAIMER,
   llmEnabled: true,
   cacheTtlSeconds: 24 * 3600,
@@ -80,6 +365,15 @@ export const SCHEMAS: Record<Exclude<ContentKind, "settings">, z.ZodType> = {
   entrance: entranceSchema,
   notice: noticeSchema,
   station_info: stationInfoSchema,
+  platform: platformSchema,
+  concourse: concourseSchema,
+  map_stop: mapStopSchema,
+  map_track: mapTrackSchema,
+  route_pattern: routePatternSchema,
+  hub: hubSchema,
+  station_status: stationStatusSchema,
+  station: stationSchema,
+  line: lineSchema,
 };
 
 /** Konten yang terlihat: published untuk pengguna; draft (bila ada) untuk mode pratinjau admin. */
@@ -92,8 +386,19 @@ export function effective<T>(item: ContentItem, preview: boolean): T | null {
 export class ContentSnapshot {
   private facilities = new Map<string, AmenityDetail[]>();
   private entrances = new Map<string, Entrance[]>();
+  private platforms = new Map<string, Platform[]>();
+  private concourses = new Map<string, Concourse[]>();
+  /** Status toilet yang dulu diisi per peron (data lama), per stasiun. */
+  private legacyToilet = new Map<string, { code: string; status: AmenityDetail["status"] }[]>();
   private info = new Map<string, StationInfo[]>();
   private noticeList: Notice[] = [];
+  private stops = new Map<string, MapStop>();
+  private tracks: MapTrack[] = [];
+  private patterns = new Map<string, RoutePattern>();
+  private hubs = new Map<string, HubContent>();
+  private statuses = new Map<string, StationStatusContent>();
+  private stationRows = new Map<string, StationContent>();
+  private lineRows = new Map<string, LineContent>();
   readonly settings: Settings;
 
   constructor(items: ContentItem[], preview: boolean, now: Date) {
@@ -115,8 +420,27 @@ export class ContentSnapshot {
           break;
         }
         case "entrance":
-          this.entrances.set(sid, [...(this.entrances.get(sid) ?? []), { ...(v as Omit<Entrance, "id" | "stationId">), id: it.id, stationId: sid }]);
+          this.entrances.set(sid, [...(this.entrances.get(sid) ?? []), { ...(v as Omit<Entrance, "id" | "stationId">), id: it.id, stationId: sid, source: "ntd" }]);
           break;
+        case "platform": {
+          // Satu entri per nomor peron; entri terbaru menang.
+          const p = v as z.infer<typeof platformSchema>;
+          const list = (this.platforms.get(sid) ?? []).filter((x) => x.code !== p.code);
+          // Toilet (data lama) bukan fasilitas peron: dipindahkan ke fasilitas umum stasiun.
+          const { toilet, ...mobility } = p.amenities ?? {};
+          if (toilet) this.legacyToilet.set(sid, [...(this.legacyToilet.get(sid) ?? []).filter((x) => x.code !== p.code), { code: p.code, status: toilet }]);
+          list.push({ ...p, serves: p.serves ?? [], amenities: mobility, source: "ntd" });
+          this.platforms.set(sid, list);
+          break;
+        }
+        case "concourse": {
+          // Satu entri per kode concourse; entri terbaru menang.
+          const c = v as z.infer<typeof concourseSchema>;
+          const list = (this.concourses.get(sid) ?? []).filter((x) => x.code !== c.code);
+          list.push({ ...c, platformLinks: c.platformLinks ?? [], id: it.id, stationId: sid, source: "ntd" });
+          this.concourses.set(sid, list);
+          break;
+        }
         case "station_info":
           this.info.set(sid, [...(this.info.get(sid) ?? []), { ...(v as Omit<StationInfo, "id" | "stationId">), id: it.id, stationId: sid }]);
           break;
@@ -127,6 +451,44 @@ export class ContentSnapshot {
           this.noticeList.push({ ...n, id: it.id });
           break;
         }
+        case "map_stop": {
+          // Satu posisi per pemberhentian (dan per lini untuk titik anak); entri terbaru menang.
+          const m = v as z.infer<typeof mapStopSchema>;
+          this.stops.set(`${sid}|${m.lineId ?? ""}`, { ...m, stationId: sid });
+          break;
+        }
+        case "route_pattern": {
+          // Satu pengaturan per lini dan arah; entri terbaru menang.
+          const p = v as z.infer<typeof routePatternSchema>;
+          this.patterns.set(`${p.lineId}|${p.direction}`, { ...p, id: it.id });
+          break;
+        }
+        case "station_status": {
+          if (!it.stationId) break;
+          const v2 = v as z.infer<typeof stationStatusSchema>;
+          this.statuses.set(it.stationId, { stationId: it.stationId, inactive: v2.inactive, ...(v2.note ? { note: v2.note } : {}) });
+          break;
+        }
+        case "hub": {
+          // Satu isian per id hub; entri terbaru menang.
+          const h = v as z.infer<typeof hubSchema>;
+          this.hubs.set(h.hubId, { ...h, id: it.id });
+          break;
+        }
+        case "station": {
+          // Satu isian per stasiun; entri terbaru menang.
+          if (!it.stationId) break;
+          this.stationRows.set(it.stationId, { ...(v as z.infer<typeof stationSchema>), stationId: it.stationId });
+          break;
+        }
+        case "line": {
+          const l = v as z.infer<typeof lineSchema>;
+          this.lineRows.set(l.lineId, l);
+          break;
+        }
+        case "map_track":
+          this.tracks.push({ ...(v as z.infer<typeof mapTrackSchema>), id: it.id });
+          break;
         case "settings":
           settings = { ...DEFAULT_SETTINGS, ...(v as Partial<Settings>) };
           break;
@@ -139,8 +501,21 @@ export class ContentSnapshot {
     return this.facilities.get(stationId) ?? [];
   }
 
+  platformsOf(stationId: string): Platform[] {
+    return this.platforms.get(stationId) ?? [];
+  }
+
+  /** Toilet yang dulu diisi per peron (data lama); kini informasi umum stasiun. */
+  legacyPlatformToilet(stationId: string): { code: string; status: AmenityDetail["status"] }[] {
+    return this.legacyToilet.get(stationId) ?? [];
+  }
+
   entrancesOf(stationId: string): Entrance[] {
     return this.entrances.get(stationId) ?? [];
+  }
+
+  concoursesOf(stationId: string): Concourse[] {
+    return this.concourses.get(stationId) ?? [];
   }
 
   infoOf(stationId: string): StationInfo[] {
@@ -161,12 +536,43 @@ export class ContentSnapshot {
       .sort((a, b) => rank[a.severity] - rank[b.severity]);
   }
 
+  /** Posisi dan bentuk jalur yang ditetapkan admin pada peta. */
+  mapOverrides(): { stops: MapStop[]; tracks: MapTrack[] } {
+    return { stops: [...this.stops.values()], tracks: [...this.tracks] };
+  }
+
+  /** Pengaturan rute per lini dan arah dari admin. */
+  routePatterns(): RoutePattern[] {
+    return [...this.patterns.values()];
+  }
+
+  /** Status operasional stasiun dari admin (nonaktif/aktif kembali). */
+  stationStatuses(): StationStatusContent[] {
+    return [...this.statuses.values()];
+  }
+
+  /** Stasiun dan lini yang ditambah/dikoreksi admin, di atas dataset. */
+  datasetOverlay(): { stations: StationContent[]; lines: LineContent[] } {
+    return { stations: [...this.stationRows.values()], lines: [...this.lineRows.values()] };
+  }
+
+  /** Hub transfer yang dibuat/diubah admin. */
+  hubOverrides(): HubContent[] {
+    return [...this.hubs.values()];
+  }
+
   allNotices(): Notice[] {
     return [...this.noticeList];
   }
 
-  weight(type: AmenityType): number {
-    return this.settings.scoring.weights[type];
+  /** Bobot fasilitas inti atau tambahan. Pengaturan lama tanpa bobot tambahan memakai bobot bawaan. */
+  weight(type: AnyAmenityType): number {
+    const { weights, extraWeights } = this.settings.scoring;
+    return type in weights ? weights[type as AmenityType] : (extraWeights?.[type as ExtraAmenityType] ?? DEFAULT_EXTRA_WEIGHTS[type as ExtraAmenityType] ?? 0);
+  }
+
+  gapPenalty(): { tangga: number; sedikit: number } {
+    return this.settings.scoring.gapPenalty ?? DEFAULT_GAP_PENALTY;
   }
 }
 
@@ -176,14 +582,18 @@ export class ContentService {
 
   constructor(private repo: ContentRepository) {}
 
-  async snapshot(ctx: RequestContext): Promise<ContentSnapshot> {
-    if (ctx.preview) return new ContentSnapshot(await this.repo.list(), true, ctx.now);
+  /**
+   * `at`: waktu yang dipakai menilai isian berjadwal (pengumuman startsAt/endsAt, fasilitas rusak sampai `until`), mis.
+   * waktu berangkat pilihan pengguna. Bawaan: waktu permintaan.
+   */
+  async snapshot(ctx: RequestContext, at: Date = ctx.now): Promise<ContentSnapshot> {
+    if (ctx.preview) return new ContentSnapshot(await this.repo.list(), true, at);
     const version = await this.repo.version();
     // Batas waktu 60 dtk agar pengumuman berjadwal (startsAt/endsAt) tetap ter-evaluasi meski tidak ada publikasi.
     if (!this.cached || this.cached.version !== version || Date.now() - this.cached.at > 60_000) {
       this.cached = { version, at: Date.now(), items: await this.repo.list() };
     }
-    return new ContentSnapshot(this.cached.items, false, ctx.now);
+    return new ContentSnapshot(this.cached.items, false, at);
   }
 
   invalidate(): void {

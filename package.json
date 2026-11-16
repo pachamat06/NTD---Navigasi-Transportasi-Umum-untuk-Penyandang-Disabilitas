@@ -3,9 +3,9 @@
   "version": "1.0.0",
   "description": "",
   "main": "index.js",
-  "workspaces": ["backend", "frontend"],
+  "workspaces": ["Backend", "Frontend"],
   "scripts": {
-    "dev": "concurrently -n api,web -c blue,green \"npm run dev -w apps/api\" \"npm run dev -w apps/web\"",
+    "dev": "concurrently -n api,web -c blue,green \"npm run dev -w Backend\" \"npm run dev -w Frontend\"",
     "build": "npm run build --workspaces --if-present"
   },
   "repository": {

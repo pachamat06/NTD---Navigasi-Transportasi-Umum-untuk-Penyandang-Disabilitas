@@ -1,22 +1,49 @@
 // CommuteApiClient (Tabel 3.8): satu-satunya titik akses ke Commute Data API.
 // - cache-first ber-TTL untuk data yang jarang berubah (stasiun, fasilitas, hub, lini, operator);
+// - satu permintaan per kunci cache pada satu waktu (single-flight), dan data kedaluwarsa disajikan sambil
+//   diperbarui di latar belakang (stale-while-revalidate) agar cache kosong tidak memicu ratusan permintaan;
 // - rute/tarif selalu diminta langsung (tarif bergantung pada waktu `at`), tetapi salinan terakhir
 //   disimpan sebagai cadangan bila API tidak dapat dihubungi (UC-01 E2);
 // - memetakan respons upstream ke model internal (id NTD dari station-index).
 
 import { markStale, type RequestContext } from "../../context";
-import type { Amenity, AnyAmenityType, Hub, Line, Mode, Operator, Station } from "../../domain/models";
+import type { Amenity, AnyAmenityType, Entrance, ExitRef, Hub, HubWalk, Line, Mode, Operator, Platform, Station } from "../../domain/models";
 import { UpstreamError } from "../../errors";
 import type { CacheRepository } from "../../store/types";
-import { buildStationIndex, lineIdOf, type StationIndex } from "./station-index";
-import type { CommuteSource, UpAmenity, UpLeg, UpStation } from "./types";
+import { directionLabel, jakartaDayHour } from "./HttpCommuteSource";
+import { buildStationIndex, lineIdOf, liveIdsOf, type StationIndex } from "./station-index";
+import type { CommuteSource, UpAmenity, UpDeparture, UpExitRef, UpFare, UpHubTransfer, UpLeg, UpLine, UpStation } from "./types";
+import type { TjGtfs } from "../gtfs/TjGtfs";
+import { applyLines, applyStations, BUILTIN_STATIONS, type DatasetOverlay, type OverlayProvider } from "../../domain/datasetOverlay";
 
 export const DEFAULT_TTL_SECONDS = 24 * 3600;
+
+/** Bagian dataset yang bisa dimuat ulang dari admin. */
+export type DatasetPart = "stations" | "lines" | "hubs";
+/** Data kedaluwarsa masih disajikan (sambil diperbarui) sampai umur ini; lebih tua dari itu ditunggu. */
+export const MAX_STALE_SECONDS = 7 * 24 * 3600;
+/** Jadwal keberangkatan sehari penuh jarang berubah; cukup diperbarui beberapa kali sehari. */
+const TIMETABLE_TTL_SECONDS = 6 * 3600;
+/** Frekuensi bergantung jam, jadi di-cache singkat (sama dengan Commute Data API: 10 menit). */
+const HEADWAY_TTL_SECONDS = 600;
+
+export interface LineHeadway {
+  lineId: string;
+  headwayMinutes: number | null;
+  boundFor?: string;
+  source: "STOP" | "LINE";
+  serviceHours?: string;
+}
 
 export interface FareLeg {
   type: "RIDE" | "TRANSFER";
   lineId?: string;
   operator?: string;
+  headsign?: string;
+  /** Nomor peron naik dari dataset. */
+  platform?: string;
+  /** Lin paralel pada ruas yang sama (termasuk lin utama, paling depan). */
+  serviceLines?: { lineId: string; headsign?: string }[];
   stops: string[];
   distanceM: number;
   fare: number;
@@ -76,6 +103,8 @@ export class CommuteApiClient {
   constructor(
     private source: CommuteSource,
     private cache: CacheRepository,
+    /** Pelengkap halte TransJakarta (koridor BRT NTD) yang tidak ada di daftar stasiun sumber data. */
+    private gtfs?: TjGtfs,
   ) {
     this.prefix = `commute:v3:${source.name}:`;
   }
@@ -90,6 +119,25 @@ export class CommuteApiClient {
   }
 
   private memo?: { raw: UpStation[]; index: StationIndex };
+
+  /** Stasiun dan lini dari admin serta stasiun bawaan NTD, di atas dataset (lihat datasetOverlay.ts). */
+  private overlayProvider?: OverlayProvider;
+
+  setOverlay(provider: OverlayProvider): void {
+    this.overlayProvider = provider;
+  }
+
+  /** Isian admin dibaca sekali per permintaan. */
+  private overlay(ctx: RequestContext): Promise<DatasetOverlay> {
+    if (!this.overlayProvider) return Promise.resolve({ stations: [], lines: [] });
+    const memo = (ctx.memo ??= new Map());
+    const known = memo.get("overlay") as Promise<DatasetOverlay> | undefined;
+    if (known) return known;
+    const p = this.overlayProvider(ctx);
+    memo.set("overlay", p);
+    p.catch(() => memo.delete("overlay"));
+    return p;
+  }
 
   /** Indeks slug NTD <-> kode upstream, dibangun dari daftar stasiun (cache) sumber data. */
   async index(ctx: RequestContext): Promise<StationIndex> {
@@ -106,15 +154,54 @@ export class CommuteApiClient {
     return this.cached("stations", ctx, this.ttl(ctx), () => this.source.getStations());
   }
 
-  /** Ambil dari cache bila masih segar; bila tidak, panggil API; bila API gagal, pakai cache kedaluwarsa. */
-  private async cached<T>(key: string, ctx: RequestContext, ttlSeconds: number, load: () => Promise<T>): Promise<T> {
+  /** Permintaan ke sumber data yang sedang berjalan, per kunci cache (single-flight). */
+  private inflight = new Map<string, Promise<unknown>>();
+
+  /** Panggil `load` sekali untuk semua pemanggil kunci yang sama, lalu simpan hasilnya. */
+  private refresh<T>(key: string, ttlSeconds: number, load: () => Promise<T>): Promise<T> {
+    const running = this.inflight.get(key) as Promise<T> | undefined;
+    if (running) return running;
+    const p = (async () => {
+      try {
+        const value = await load();
+        // null (404) tidak di-cache lama agar data baru segera terlihat.
+        await this.cache.put(this.prefix + key, value, value === null ? 300 : ttlSeconds);
+        return value;
+      } finally {
+        this.inflight.delete(key);
+      }
+    })();
+    this.inflight.set(key, p);
+    return p;
+  }
+
+  /**
+   * Ambil dari cache bila masih segar. Bila kedaluwarsa tetapi belum terlalu tua, sajikan salinan itu dan
+   * perbarui di latar belakang. Bila tidak ada salinan, tunggu API; bila API gagal, pakai cache kedaluwarsa.
+   */
+  private cached<T>(key: string, ctx: RequestContext, ttlSeconds: number, load: () => Promise<T>): Promise<T> {
+    // Satu kali baca store per kunci per permintaan; hasilnya (objek yang sama) dipakai ulang sehingga memo indeks
+    // stasiun juga kena. Galat tidak disimpan agar pemanggil berikutnya bisa mencoba lagi.
+    const memo = (ctx.memo ??= new Map());
+    const k = this.prefix + key;
+    const known = memo.get(k) as Promise<T> | undefined;
+    if (known) return known;
+    const p = this.readThrough(key, ctx, ttlSeconds, load);
+    memo.set(k, p);
+    p.catch(() => memo.delete(k));
+    return p;
+  }
+
+  private async readThrough<T>(key: string, ctx: RequestContext, ttlSeconds: number, load: () => Promise<T>): Promise<T> {
     const hit = await this.cache.get<T>(this.prefix + key);
     if (hit && hit.expiresAt > ctx.now) return hit.value;
+    if (hit && ctx.now.getTime() - hit.expiresAt.getTime() < MAX_STALE_SECONDS * 1000) {
+      // Galat pembaruan latar belakang diabaikan: salinan lama tetap dipakai sampai pembaruan berhasil.
+      this.refresh(key, ttlSeconds, load).catch(() => {});
+      return hit.value;
+    }
     try {
-      const value = await load();
-      // null (404) tidak di-cache lama agar data baru segera terlihat.
-      await this.cache.put(this.prefix + key, value, value === null ? 300 : ttlSeconds);
-      return value;
+      return await this.refresh(key, ttlSeconds, load);
     } catch (e) {
       if (e instanceof UpstreamError && hit) {
         markStale(ctx, new Date(hit.storedAt));
@@ -134,12 +221,14 @@ export class CommuteApiClient {
   }
 
   async getLines(ctx: RequestContext): Promise<Line[]> {
-    const [lines, ops, idx] = await Promise.all([
+    const [lines, ops, idx, overlay] = await Promise.all([
       this.rawLines(ctx),
       this.getOperators(ctx),
       this.index(ctx),
+      this.overlay(ctx),
     ]);
-    // Beberapa lin upstream bisa dipetakan ke satu lini NTD (mis. LRT Jabodebek); stasiunnya digabung.
+    // Beberapa lin upstream bisa dipetakan ke satu lini NTD (mis. lini gabungan LRT Jabodebek pada sumber offline);
+    // stasiunnya digabung.
     const out = new Map<string, Line>();
     for (const l of lines) {
       const id = lineIdOf(l.operator, l.code);
@@ -157,14 +246,50 @@ export class CommuteApiClient {
         mode: (l.mode ?? op?.mode ?? "RAIL") as Mode,
         color: l.color ?? "#555555",
         stationIds: dedupe(stationIds),
+        source: "commute",
       });
     }
+    return applyLines([...out.values()], overlay.lines);
+  }
+
+  /**
+   * Muat ulang daftar dari sumber data sekarang juga, tanpa menunggu cache kedaluwarsa (sinkron dari admin), mis.
+   * agar stasiun yang baru beroperasi segera dikenal. Bila sumber gagal, cache lama tetap dipakai.
+   */
+  async refreshDataset(parts: readonly DatasetPart[], ctx: RequestContext): Promise<void> {
+    const ttl = this.ttl(ctx);
+    const jobs: Promise<unknown>[] = [];
+    if (parts.includes("stations") || parts.includes("lines")) jobs.push(this.refresh("operators", ttl, () => this.source.getOperators()));
+    if (parts.includes("stations")) jobs.push(this.refresh("stations", ttl, () => this.source.getStations()));
+    if (parts.includes("lines") || parts.includes("stations")) jobs.push(this.refresh("lines", ttl, () => this.source.getLines()));
+    if (parts.includes("hubs")) jobs.push(this.refresh("hubs", ttl, () => this.source.getHubs()));
+    await Promise.all(jobs);
+  }
+
+  /**
+   * Stasiun yang tercantum di lin (/lines) tetapi belum ada di daftar stasiun NTD, mis. stasiun perpanjangan yang
+   * belum dimuat /stations. Admin bisa menambahkannya bila sudah beroperasi.
+   */
+  async lineOnlyStations(ctx: RequestContext): Promise<{ id: string; name: string; operator: string; code: string; number?: string; lineIds: string[] }[]> {
+    const [lines, idx, stations] = await Promise.all([this.rawLines(ctx), this.index(ctx), this.getStations(ctx)]);
+    const known = new Set(stations.map((s) => s.id));
+    const out = new Map<string, { id: string; name: string; operator: string; code: string; number?: string; lineIds: string[] }>();
+    for (const l of lines)
+      l.stations.forEach((r, i) => {
+        const id = idx.idOf(r);
+        if (known.has(id)) return;
+        const lineId = lineIdOf(l.operator, l.code);
+        const prev = out.get(id);
+        if (prev) prev.lineIds = dedupe([...prev.lineIds, lineId]);
+        else out.set(id, { id, name: l.stationNames?.[i] ?? r.code, operator: r.operator, code: r.code, ...(l.stationNumbers?.[i] ? { number: l.stationNumbers[i]! } : {}), lineIds: [lineId] });
+      });
     return [...out.values()];
   }
 
   /**
    * Urutan stasiun tiap lini per ruas (batang utama dan cabang, id NTD), untuk mencari rute di atas topologi
-   * lini (filter moda). Cabang disambungkan ke stasiun percabangannya pada ujung ruas yang lebih dekat.
+   * lini (filter moda). Cabang disambungkan ke stasiun percabangannya pada ujung ruas yang lebih dekat; ruas
+   * putaran (LOOP) di kedua ujungnya, mis. lingkar Lin Cikarang: Jatinegara > Pondok Jati ... Matraman > Jatinegara.
    */
   async getLineSequences(ctx: RequestContext): Promise<{ lineId: string; sequences: string[][] }[]> {
     const [lines, idx, raw] = await Promise.all([this.rawLines(ctx), this.index(ctx), this.rawStations(ctx)]);
@@ -174,20 +299,37 @@ export class CommuteApiClient {
       const q = coord.get(b);
       return p && q ? (p.lat - q.lat) ** 2 + (p.lng - q.lng) ** 2 : Number.POSITIVE_INFINITY;
     };
-    return lines.map((l) => {
+    // Lin upstream yang dipetakan ke lini NTD yang sama digabung menjadi satu entri (ruas pertama = batang utama), agar
+    // pemakai yang mencari urutan per lini tidak hanya mendapat salah satu lin.
+    const out = new Map<string, { lineId: string; sequences: string[][] }>();
+    for (const l of lines) {
       const segments = l.segments?.length ? l.segments : [{ stations: l.stations }];
       const sequences = segments.map((seg) => {
         const ids = seg.stations.map((r) => idx.idOf(r));
         if (!seg.joinsAt || !ids.length) return ids;
         const j = idx.idOf(seg.joinsAt);
         if (ids.includes(j)) return ids;
+        if (seg.loop) return [j, ...ids, j];
         return far(j, ids[ids.length - 1]) < far(j, ids[0]) ? [...ids, j] : [j, ...ids];
       });
-      return { lineId: lineIdOf(l.operator, l.code), sequences: sequences.filter((x) => x.length > 1) };
-    });
+      const lineId = lineIdOf(l.operator, l.code);
+      const prev = out.get(lineId);
+      const own = sequences.filter((x) => x.length > 1);
+      if (prev) prev.sequences.push(...own);
+      else out.set(lineId, { lineId, sequences: own });
+    }
+    return [...out.values()];
   }
 
   async getStations(ctx: RequestContext): Promise<Station[]> {
+    const [base, overlay, upLines] = await Promise.all([this.datasetStations(ctx), this.overlay(ctx), this.rawLines(ctx)]);
+    // Stasiun bawaan NTD hanya untuk lini yang ada di sumber data (sumber offline tidak memuat LRT Jakarta).
+    const lineIds = new Set(upLines.map((l) => lineIdOf(l.operator, l.code)));
+    return applyStations(base, overlay.stations, BUILTIN_STATIONS.filter((b) => b.lineIds.some((id) => lineIds.has(id))));
+  }
+
+  /** Stasiun dataset saja (Commute + halte GTFS), tanpa stasiun bawaan NTD dan isian admin. */
+  async datasetStations(ctx: RequestContext): Promise<Station[]> {
     const [raw, ops, idx, upLines] = await Promise.all([this.rawStations(ctx), this.getOperators(ctx), this.index(ctx), this.rawLines(ctx)]);
     // Nomor stasiun dari /lines (mis. C12, 1-13) dipakai GUI untuk menemukan posisi di peta.
     const numbers = new Map<string, string[]>();
@@ -212,12 +354,14 @@ export class CommuteApiClient {
         const codes = curated[0] ? curated : (numbers.get(id) ?? [s.code]);
         merged.set(id, {
           id,
-          name: s.name,
+          name: idx.nameOf?.(id) ?? s.name,
           operator: opName,
           lineIds: dedupe(lineIds),
           hubId: s.hub ?? undefined,
           codes,
+          commuteIds: commuteIdsOf(id, idx),
           ...(typeof s.lat === "number" && typeof s.lng === "number" ? { lat: s.lat, lng: s.lng } : {}),
+          source: "commute",
         });
       } else {
         if (!prev.operator.split(" · ").includes(opName)) prev.operator += ` · ${opName}`;
@@ -225,7 +369,54 @@ export class CommuteApiClient {
         prev.hubId ??= s.hub ?? undefined;
       }
     }
+    if (this.gtfs) this.addGtfsStops(merged, upLines, idx, numbers);
     return [...merged.values()];
+  }
+
+  /**
+   * Halte TransJakarta yang dilewati lin (/lines) tetapi tidak ada di /stations (mis. halte sementara
+   * Manggarai pada koridor 4) diambil nama dan koordinatnya dari GTFS Transjakarta; halte tanpa koordinat
+   * dilengkapi koordinat GTFS; koridor BRT yang berhenti di halte menurut GTFS ditambahkan ke `lineIds`
+   * (mis. Juanda dan Pecenongan untuk koridor 3). Hanya halte koridor BRT yang ada di data GTFS NTD.
+   */
+  private addGtfsStops(merged: Map<string, Station>, upLines: UpLine[], idx: StationIndex, numbers: Map<string, string[]>) {
+    const gtfs = this.gtfs!;
+    for (const s of merged.values()) {
+      for (const code of idx.refsOf(s.id).flatMap((r) => (r.operator.toUpperCase() === "TJ" ? [r.code] : []))) {
+        const corridors = gtfs.routesAt(code).map((c) => lineIdOf("TJ", c));
+        if (corridors.length) s.lineIds = dedupe([...s.lineIds, ...corridors]);
+        const g = s.lat === undefined ? gtfs.stop(code) : undefined;
+        if (g) Object.assign(s, { lat: g.lat, lng: g.lng });
+      }
+    }
+    const added = new Set<string>();
+    for (const l of upLines) {
+      if (l.operator !== "TJ") continue;
+      for (const r of l.stations) {
+        const id = idx.idOf(r);
+        if (merged.has(id)) continue;
+        const g = gtfs.stop(r.code);
+        if (!g) continue;
+        added.add(id);
+        merged.set(id, {
+          id,
+          name: g.name,
+          operator: "TransJakarta",
+          lineIds: [],
+          codes: numbers.get(id) ?? [r.code],
+          commuteIds: commuteIdsOf(id, idx),
+          lat: g.lat,
+          lng: g.lng,
+          source: "gtfs",
+        });
+      }
+    }
+    // Semua lin yang melewati halte tambahan.
+    for (const l of upLines)
+      for (const r of l.stations) {
+        const id = idx.idOf(r);
+        if (added.has(id)) merged.get(id)!.lineIds = dedupe([...merged.get(id)!.lineIds, lineIdOf(l.operator, l.code)]);
+      }
   }
 
   /**
@@ -263,34 +454,151 @@ export class CommuteApiClient {
     return hubs.map((h) => ({
       id: h.id,
       name: h.name,
+      ...(h.kind ? { kind: h.kind } : {}),
       memberIds: dedupe(h.stations.map((r) => idx.idOf(r))),
-      walks: (h.transfers ?? []).map((t) => ({
-        from: idx.idOf(t.from),
-        to: idx.idOf(t.to),
-        distanceM: t.distanceM,
-        minutes: t.durationS === null || t.durationS === undefined ? null : Math.round(t.durationS / 60),
-      })),
+      // Satu stasiun NTD bisa memuat beberapa kode operator; jalan "ke dirinya sendiri" tidak dipakai.
+      walks: (h.transfers ?? []).map((t) => mapWalk(t, idx)).filter((w) => w.from !== w.to),
     }));
+  }
+
+  /**
+   * Jalan kaki dari stasiun `fromId` ke `toId` menurut dataset (jarak, petunjuk, pintu keluar), dari
+   * /stations/{op}/{code}/transfers. undefined = dataset tidak mencatat perpindahan itu.
+   */
+  async getWalk(fromId: string, toId: string, ctx: RequestContext): Promise<HubWalk | undefined> {
+    const getTransfers = this.source.getTransfers?.bind(this.source);
+    if (!getTransfers || fromId === toId) return undefined;
+    const idx = await this.index(ctx);
+    for (const r of idx.refsOf(fromId)) {
+      const list = await this.cached(`transfers:${r.operator}:${r.code}`, ctx, this.ttl(ctx), () => getTransfers(r.operator, r.code));
+      const hit = (list ?? []).map((t) => mapWalk(t, idx)).find((w) => w.to === toId);
+      if (hit) return hit;
+    }
+    return undefined;
+  }
+
+  /** Frekuensi tiap lin di pemberhentian `stationId` pada waktu `at`. [] = dataset tidak menyediakan. */
+  async getHeadways(stationId: string, ctx: RequestContext, at?: string): Promise<LineHeadway[]> {
+    const getHeadways = this.source.getHeadways?.bind(this.source);
+    if (!getHeadways) return [];
+    const idx = await this.index(ctx);
+    const when = at ?? ctx.now.toISOString();
+    const { day, hour } = jakartaDayHour(new Date(when));
+    const out: LineHeadway[] = [];
+    for (const r of idx.refsOf(stationId)) {
+      const rows = await this.cached(`headway:${r.operator}:${r.code}:${day}:${hour}`, ctx, HEADWAY_TTL_SECONDS, () => getHeadways(r.operator, r.code, when)).catch((e) => {
+        // Frekuensi hanya pelengkap; rute tetap ditampilkan tanpa frekuensi bila API gagal.
+        if (e instanceof UpstreamError) return null;
+        throw e;
+      });
+      for (const h of rows ?? [])
+        out.push({
+          lineId: lineIdOf(h.operator, h.line),
+          headwayMinutes: h.headwayS === null ? null : Math.max(1, Math.round(h.headwayS / 60)),
+          ...(h.boundFor ? { boundFor: h.boundFor } : {}),
+          source: h.source ?? "LINE",
+          ...(h.serviceHours ? { serviceHours: "allDay" in h.serviceHours ? "24 jam" : `${h.serviceHours.start}–${h.serviceHours.end}` } : {}),
+        });
+    }
+    return out;
+  }
+
+  /**
+   * Jadwal keberangkatan sehari penuh di stasiun `stationId` untuk tiap kode operator stasiun itu (selain TransJakarta,
+   * yang memakai GTFS). [] = dataset tidak menyediakan. Galat dianggap data belum ada agar rute tetap tampil.
+   */
+  async getTimetables(stationId: string, day: "WD" | "SAT" | "SUN", ctx: RequestContext): Promise<{ operator: string; code: string; departures: UpDeparture[] }[]> {
+    const getTimetable = this.source.getTimetable?.bind(this.source);
+    if (!getTimetable) return [];
+    const idx = await this.index(ctx);
+    const out: { operator: string; code: string; departures: UpDeparture[] }[] = [];
+    for (const r of idx.refsOf(stationId)) {
+      if (r.operator.toUpperCase() === "TJ") continue;
+      const rows = await this.cached(`timetable:${r.operator}:${r.code}:${day}`, ctx, TIMETABLE_TTL_SECONDS, () => getTimetable(r.operator, r.code, day)).catch(supplementary);
+      if (rows?.length) out.push({ operator: r.operator, code: r.code, departures: rows });
+    }
+    return out;
+  }
+
+  /**
+   * Peron menurut dataset: nomor peron dan lin/arah yang dilayaninya. Dataset belum memuat jenis peron,
+   * fasilitas per peron, atau celah peron; itu diisi tim lewat admin. [] = dataset tidak mencatat.
+   */
+  async getPlatforms(stationId: string, ctx: RequestContext): Promise<Platform[]> {
+    const getPlatforms = this.source.getPlatforms?.bind(this.source);
+    if (!getPlatforms) return [];
+    const idx = await this.index(ctx);
+    const byCode = new Map<string, Platform>();
+    for (const r of idx.refsOf(stationId)) {
+      const rows = await this.cached(`platforms:${r.operator}:${r.code}`, ctx, this.ttl(ctx), () => getPlatforms(r.operator, r.code)).catch(supplementary);
+      for (const p of rows ?? []) {
+        const pl = byCode.get(p.platformCode) ?? { code: p.platformCode, serves: [], amenities: {}, source: "dataset" as const };
+        pl.serves.push({ lineId: lineIdOf(p.operator, p.line), ...(directionLabel(p.direction) ? { direction: directionLabel(p.direction) } : {}) });
+        byCode.set(p.platformCode, pl);
+      }
+    }
+    return [...byCode.values()].sort((a, b) => a.code.localeCompare(b.code, "id", { numeric: true }));
+  }
+
+  /** Pintu keluar/gate menurut dataset (/exits). [] = belum dicatat, bukan berarti tidak ada pintu. */
+  async getExits(stationId: string, ctx: RequestContext): Promise<Entrance[]> {
+    const getExits = this.source.getExits?.bind(this.source);
+    if (!getExits) return [];
+    const idx = await this.index(ctx);
+    const out: Entrance[] = [];
+    for (const r of idx.refsOf(stationId)) {
+      const rows = await this.cached(`exits:${r.operator}:${r.code}`, ctx, this.ttl(ctx), () => getExits(r.operator, r.code)).catch(supplementary);
+      for (const e of rows ?? [])
+        out.push({
+          id: `${r.operator}-${r.code}:${e.ref}`,
+          stationId,
+          name: e.name ? `Pintu ${e.ref} (${e.name})` : `Pintu ${e.ref}`,
+          // Dataset tidak menyatakan aksesibilitas pintu; tim melengkapinya lewat admin.
+          accessible: false,
+          features: [],
+          ...(e.signs?.length ? { signs: e.signs } : {}),
+          source: "dataset",
+        });
+    }
+    return out;
   }
 
   /** Rute dari dataset. null = rute tidak ditemukan. */
   async getFare(fromId: string, toId: string, ctx: RequestContext, at?: string): Promise<FareResult | null> {
     const idx = await this.index(ctx);
-    const [from] = idx.refsOf(fromId);
-    const [to] = idx.refsOf(toId);
-    if (!from || !to) return null;
-    const key = `${this.prefix}fare:${fromId}:${toId}`;
-    let up;
-    try {
-      up = await this.source.getFare(from, to, at);
-      if (up) await this.cache.put(key, up, 7 * 24 * 3600);
-    } catch (e) {
-      const hit = e instanceof UpstreamError ? await this.cache.get<typeof up>(key) : null;
-      if (!hit) throw e;
-      markStale(ctx, new Date(hit.storedAt));
-      up = hit.value;
-    }
-    if (!up || !up.legs?.length) return null;
+    // Halte TransJakarta gabungan dua arah punya dua kode: rute dicari dari/ke tiap arah, lalu dipilih yang
+    // dilayani bus sesuai arah (GTFS), paling sedikit pindah, dan paling pendek.
+    const tjMulti = (id: string) => {
+      const refs = idx.refsOf(id);
+      return refs.length > 1 && refs.every((r) => r.operator.toUpperCase() === "TJ") ? refs : refs.slice(0, 1);
+    };
+    const pairs = tjMulti(fromId).flatMap((from) => tjMulti(toId).map((to) => ({ from, to })));
+    if (!pairs.length) return null;
+    const results = await Promise.all(
+      pairs.map(async ({ from, to }, i) => {
+        const key = `${this.prefix}fare:${fromId}:${toId}${i ? `:${i}` : ""}`;
+        try {
+          const up = await this.source.getFare(from, to, at);
+          if (up) await this.cache.put(key, up, 7 * 24 * 3600);
+          return up;
+        } catch (e) {
+          const hit = e instanceof UpstreamError ? await this.cache.get<UpFare | null>(key) : null;
+          if (!hit) {
+            if (pairs.length > 1 && i > 0) return null;
+            throw e;
+          }
+          markStale(ctx, new Date(hit.storedAt));
+          return hit.value;
+        }
+      }),
+    );
+    const usable = results.filter((u): u is UpFare => !!u?.legs?.length);
+    const rank = (u: UpFare) => [this.wrongDirectionLegs(u), u.legs.filter((l) => l.type === "TRANSFER").length, u.totalDistanceM];
+    const up = usable.sort((a, b) => {
+      const [x, y] = [rank(a), rank(b)];
+      return x[0] - y[0] || x[1] - y[1] || x[2] - y[2];
+    })[0];
+    if (!up) return null;
     return {
       fromId,
       toId,
@@ -299,6 +607,18 @@ export class CommuteApiClient {
       legs: up.legs.map((l) => mapLeg(l, idx)),
       stopNames: Object.fromEntries(up.legs.flatMap((l) => (l.stopNames ?? []).map((n, i) => [idx.idOf(l.stops[i]), n]))),
     };
+  }
+
+  /** Jumlah ruas naik TransJakarta yang urutan haltenya tidak dilayani satu bus menurut GTFS (mis. salah arah). */
+  private wrongDirectionLegs(up: UpFare): number {
+    const gtfs = this.gtfs;
+    if (!gtfs) return 0;
+    return up.legs.filter((l) => {
+      if (l.type !== "RIDE" || l.operator?.toUpperCase() !== "TJ" || !l.line) return false;
+      const lines = [l.line, ...(l.serviceLines ?? []).map((x) => x.line)].filter((x) => gtfs.hasRoute(x));
+      if (!lines.length || l.stops.some((s) => s.operator.toUpperCase() !== "TJ")) return false;
+      return !gtfs.match(lines, l.stops.map((s) => s.code));
+    }).length;
   }
 
   /** Cek kesehatan Commute Data API tanpa cache (dipakai halaman admin). */
@@ -320,12 +640,45 @@ function mapLeg(l: UpLeg, idx: StationIndex): FareLeg {
     type: l.type,
     lineId: l.line && l.operator ? lineIdOf(l.operator, l.line) : undefined,
     operator: l.operator,
+    ...(l.headsign ? { headsign: l.headsign } : {}),
+    ...(l.platformCode ? { platform: l.platformCode } : {}),
+    ...(l.serviceLines?.length ? { serviceLines: l.serviceLines.map((x) => ({ lineId: lineIdOf(x.operator, x.line), ...(x.headsign ? { headsign: x.headsign } : {}) })) } : {}),
     stops: l.stops.map((r) => idx.idOf(r)),
     distanceM: l.distanceM,
     fare: l.fare ?? 0,
     departureAt: l.departureAt ?? firstTime?.departureAt ?? firstTime?.arrivalAt ?? undefined,
     arrivalAt: l.arrivalAt ?? lastTime?.arrivalAt ?? lastTime?.departureAt ?? undefined,
   };
+}
+
+/**
+ * Data pelengkap (peron, pintu): galat apa pun, termasuk bentuk respons yang tidak terduga, tidak boleh
+ * menggagalkan pencarian rute; data dianggap belum ada.
+ */
+function supplementary(): null {
+  return null;
+}
+
+function mapExit(e: UpExitRef): ExitRef {
+  return { ref: e.ref, ...(e.name ? { name: e.name } : {}), ...(e.signs?.length ? { signs: e.signs } : {}) };
+}
+
+function mapWalk(t: UpHubTransfer, idx: StationIndex): HubWalk {
+  return {
+    from: idx.idOf(t.from),
+    to: idx.idOf(t.to),
+    distanceM: t.distanceM,
+    minutes: t.durationS === null || t.durationS === undefined ? null : Math.round(t.durationS / 60),
+    ...(t.notes ? { notes: t.notes } : {}),
+    ...(t.fromExit ? { fromExit: mapExit(t.fromExit) } : {}),
+    ...(t.toExit ? { toExit: mapExit(t.toExit) } : {}),
+  };
+}
+
+/** Id Commute Data API sebuah stasiun NTD: kode dari sumber data, ditambah id yang dikurasi di station-index. */
+function commuteIdsOf(stationId: string, idx: StationIndex): string[] {
+  const live = liveIdsOf(stationId);
+  return live.length ? live : dedupe(idx.refsOf(stationId).map((r) => `${r.operator}-${r.code}`));
 }
 
 function dedupe<T>(xs: T[]): T[] {

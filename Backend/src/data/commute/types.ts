@@ -48,10 +48,25 @@ export interface UpLine {
   /** Nomor stasiun pada lin ini (sejajar dengan `stations`), mis. "C12" atau "1-13"; dipakai untuk posisi di peta. */
   stationNumbers?: (string | null)[];
   /**
-   * Ruas lin berurutan (batang utama dan cabang). `joinsAt` = stasiun tempat cabang berpisah dari batang utama.
-   * Tidak diisi = `stations` adalah satu ruas lurus.
+   * Nama stasiun pada lin ini (sejajar dengan `stations`). Lin bisa memuat stasiun yang belum ada di /stations
+   * (mis. stasiun perpanjangan yang belum beroperasi); namanya dipakai admin untuk menambahkannya.
    */
-  segments?: { stations: UpStopRef[]; joinsAt?: UpStopRef }[];
+  stationNames?: (string | null)[];
+  /**
+   * Ruas lin berurutan (batang utama dan cabang). `joinsAt` = stasiun tempat cabang berpisah dari batang utama.
+   * `loop` = ruas putaran (mis. lingkar Lin Cikarang Pondok Jati ... Matraman) yang tersambung ke `joinsAt` di
+   * KEDUA ujungnya. Tidak diisi = `stations` adalah satu ruas lurus.
+   */
+  segments?: { stations: UpStopRef[]; joinsAt?: UpStopRef; loop?: boolean }[];
+}
+
+/** Pintu keluar stasiun (/stations/{op}/{code}/exits, rujukan pada transfer). */
+export interface UpExitRef {
+  /** Nama pintu persis seperti papan petunjuk, mis. "B". */
+  ref: string;
+  name?: string | null;
+  /** Isi papan petunjuk pintu itu, urut seperti tercetak. */
+  signs?: string[];
 }
 
 export interface UpHubTransfer {
@@ -59,13 +74,60 @@ export interface UpHubTransfer {
   to: UpStopRef;
   distanceM: number;
   durationS?: number | null;
+  /** Petunjuk jalan dari sumber data, mis. "Keluar lewat pintu B, lalu ...". */
+  notes?: string | null;
+  fromExit?: UpExitRef;
+  toExit?: UpExitRef;
 }
 
 export interface UpHub {
   id: string;
   name: string;
+  /** "integrated" = bagi penumpang satu tempat; "hub" = beberapa stasiun dalam satu kompleks. */
+  kind?: "hub" | "integrated";
   stations: UpStopRef[];
   transfers?: UpHubTransfer[];
+}
+
+/** Nomor peron untuk satu lin dan arah di satu stasiun (/stations/{op}/{code}/timetable/grouped). */
+export interface UpPlatformService {
+  operator: string;
+  line: string;
+  platformCode: string;
+  /** Label arah seperti di papan keberangkatan, mis. "Arah Manggarai". */
+  direction?: string;
+}
+
+/** Pintu keluar/gate stasiun (/stations/{op}/{code}/exits). */
+export interface UpExit extends UpExitRef {
+  /** FIELD = dicek di lokasi, OPERATOR = peta resmi operator, OSM = OpenStreetMap. */
+  source?: string;
+}
+
+/** Frekuensi kendaraan satu lin di satu pemberhentian (/stations/{op}/{code}/headway). BUKAN jadwal. */
+export interface UpHeadway {
+  operator: string;
+  line: string;
+  /** Rata-rata jarak antarkendaraan (detik); null = lin tidak jalan pada hari itu. */
+  headwayS: number | null;
+  /** Tujuan akhir arah ini, bila dua arah berbeda frekuensinya. */
+  boundFor?: string;
+  /** "STOP" = diukur di pemberhentian ini, "LINE" = rata-rata se-lin. */
+  source?: "STOP" | "LINE";
+  serviceHours?: { start: string; end: string } | { allDay: true };
+}
+
+/** Satu keberangkatan di satu stasiun (/stations/{op}/{code}/timetable). Nomor perjalanan sama di semua stasiun yang dilewati. */
+export interface UpDeparture {
+  tripNumber: string;
+  /** Menit sejak tengah malam, waktu Jakarta (0–1439). */
+  minutes: number;
+  /** Tujuan akhir perjalanan. */
+  boundFor?: string;
+  /** Jam tiba di tujuan akhir (menit sejak tengah malam), bila dataset memuatnya berbeda dari jam berangkat. */
+  arriveFinal?: number;
+  /** Kode lin operator, mis. "B" (KRL Bogor) atau "BK" (LRT Jabodebek Bekasi). */
+  line?: string;
 }
 
 export interface UpStopTime {
@@ -74,10 +136,23 @@ export interface UpStopTime {
   departureAt?: string | null;
 }
 
+/** Lin yang melayani ruas yang sama (jalur dipakai bersama), mis. TJ 4, 4D, 5, 5C dari Matraman ke Kesatrian. */
+export interface UpServiceLine {
+  operator: string;
+  line: string;
+  headsign?: string | null;
+}
+
 export interface UpLeg {
   type: "RIDE" | "TRANSFER";
   operator?: string;
   line?: string;
+  /** Tujuan akhir kendaraan pada ruas naik. */
+  headsign?: string | null;
+  /** Nomor peron naik, bila diketahui dataset. */
+  platformCode?: string | null;
+  /** Lin lain yang berhenti di pemberhentian yang sama sepanjang ruas ini (termasuk lin utama, paling depan). */
+  serviceLines?: UpServiceLine[];
   stops: UpStopRef[];
   /** Nama tampilan tiap pemberhentian (sejajar dengan `stops`), bila sumber menyediakannya. */
   stopNames?: string[];
@@ -106,6 +181,19 @@ export interface CommuteSource {
   /** null bila rute tidak ditemukan. */
   getFare(from: UpStopRef, to: UpStopRef, at?: string): Promise<UpFare | null>;
   getHubs(): Promise<UpHub[]>;
+  /** Transfer jalan kaki dari satu stasiun (jarak, petunjuk, pintu). Tidak diisi = sumber tidak menyediakan. */
+  getTransfers?(operator: string, code: string): Promise<UpHubTransfer[] | null>;
+  /** Frekuensi lin di satu pemberhentian pada waktu `at` (default sekarang). Tidak diisi = sumber tidak menyediakan. */
+  getHeadways?(operator: string, code: string, at?: string): Promise<UpHeadway[] | null>;
+  /**
+   * Jadwal keberangkatan satu stasiun sehari penuh (hari layanan WD/SAT/SUN). Dipakai untuk waktu tempuh dan frekuensi
+   * moda rel: waktu tempuh = selisih jam berangkat pada nomor perjalanan yang sama. Tidak diisi = sumber tidak menyediakan.
+   */
+  getTimetable?(operator: string, code: string, day: "WD" | "SAT" | "SUN"): Promise<UpDeparture[] | null>;
+  /** Nomor peron tiap lin dan arah di satu stasiun. Tidak diisi = sumber tidak menyediakan. */
+  getPlatforms?(operator: string, code: string): Promise<UpPlatformService[] | null>;
+  /** Pintu keluar/gate satu stasiun. Tidak diisi = sumber tidak menyediakan. */
+  getExits?(operator: string, code: string): Promise<UpExit[] | null>;
   getOperators(): Promise<UpOperator[]>;
   getLines(): Promise<UpLine[]>;
   getLine(operator: string, lineCode: string): Promise<UpLine | null>;
