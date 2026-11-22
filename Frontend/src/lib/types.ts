@@ -106,6 +106,36 @@ export interface Meta {
   scoring: { weights: Record<AmenityType, number>; threshold: number };
   amenityLabels: Record<string, string>;
   dataSource: string;
+  /** Pilihan pipeline untuk pengguna: "llm" hanya ada bila admin menyalakan mode LLM dan klien LLM tersedia. */
+  llm?: { available: boolean; pipelines: Pipeline[]; defaultPipeline: Pipeline; reason?: string };
+}
+
+/** "default" = algoritma NTD tanpa LLM; "llm" = agent navigasi LLM memilih rute dan LLM menyusun narasi. */
+export type Pipeline = "default" | "llm";
+
+/** Informasi layanan operator (gangguan, keterlambatan, penutupan). "approved" sudah diperiksa admin dan memengaruhi rute. */
+export interface ServiceInfoItem {
+  id: string;
+  status: "approved" | "pending";
+  verified: boolean;
+  category: string;
+  impact?: "info" | "delay" | "disruption" | "closure";
+  summary: string;
+  operator: string | null;
+  stationIds: string[];
+  lineIds: string[];
+  source: { type: "x" | "manual"; account: string; url: string | null; postedAt: string };
+  expiresAt: string;
+}
+
+export interface PipelineInfo {
+  requested: Pipeline;
+  used: Pipeline;
+  navigation: Pipeline;
+  narration: "template" | "llm";
+  reason?: string;
+  notes: string[];
+  model?: string;
 }
 
 export interface StationAssessment {
@@ -405,9 +435,14 @@ export interface RouteOption {
     transfers: number;
     unmetNeeds: number;
     usesAvoidedModes: boolean;
+    /** Dampak informasi layanan yang disetujui admin pada rute ini. */
+    advisoryImpact?: "delay" | "disruption" | "closure";
   };
   notification: Notification;
   alternatives: Alternative[];
+  /** "llm" = dipilih agent navigasi LLM; `llmReason` alasannya. */
+  pickedBy?: "llm";
+  llmReason?: string;
 }
 
 export interface JourneyPlan {
@@ -428,6 +463,10 @@ export interface JourneyPlan {
   departMode?: "now" | "at";
   /** Pilihan rute: paling aksesibel (sama dengan `route`), moderat, tercepat, lalu rute lain. */
   options?: RouteOption[];
+  /** Pipeline yang diminta dan yang dipakai Backend. */
+  pipeline?: PipelineInfo;
+  /** Informasi layanan operator yang relevan dengan rute. */
+  serviceInfo?: ServiceInfoItem[];
 }
 
 export type ErrorCode = "NOT_FOUND" | "INVALID" | "API_DOWN" | "RATE_LIMITED" | "INTERNAL" | "NETWORK";
