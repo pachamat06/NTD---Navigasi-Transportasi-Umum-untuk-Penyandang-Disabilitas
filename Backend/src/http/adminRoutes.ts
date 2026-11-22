@@ -18,6 +18,8 @@ import type { DefaultPattern } from "../domain/routePatterns";
 import type { SyncSource } from "../domain/routeSync";
 import { buildSuggestions, FLOOR_PLAN_JSON_SCHEMA, FLOOR_PLAN_SYSTEM, floorPlanPrompt, MAX_IMAGES, parseFloorPlan, sniffImage, type FloorPlanResult } from "../ai/vision/floorPlan";
 import { llmAvailability } from "../ai/pipeline";
+import { llmSettingsInput } from "../ai/llm/LlmService";
+import { xTokenInput } from "../ai/reader/PostSourceService";
 import { readerConfigInput, X_PRICE_USD } from "../ai/reader/ReaderConfig";
 import { advisoryEditSchema, advisoryIngestSchema } from "../domain/serviceAdvisory";
 import { VisionError } from "../ai/vision/VisionClient";
@@ -306,10 +308,12 @@ export function adminRoutes(s: Services): Router {
   // pada /api/plan; agent pembaca membaca akun operator dan mengisi antrean `service-info` (status pending). Hanya yang
   // disetujui di sini yang mengubah navigasi.
   const readerView = async () => {
-    const [config, state, problem] = await Promise.all([s.readerConfig.get(), s.readerConfig.state(), s.reader.problem()]);
+    const [config, state, problem, src] = await Promise.all([s.readerConfig.get(), s.readerConfig.state(), s.reader.problem(), s.postSource.view()]);
     return {
       config,
-      source: { kind: s.postSource?.kind ?? "none", configured: !!s.postSource },
+      source: { kind: src.kind, configured: src.configured },
+      /** Token X (tidak pernah dikembalikan; hanya petunjuk empat karakter terakhir). */
+      xToken: { ...src.token, canStore: src.canStoreToken, updatedAt: src.updatedAt, updatedBy: src.updatedBy },
       problem,
       usage: { month: state.usage.month, posts: state.usage.posts, users: state.usage.users, budget: config.monthlyPostBudget, approxCostUsd: Math.round((state.usage.posts * X_PRICE_USD.post + state.usage.users * X_PRICE_USD.user) * 1000) / 1000 },
       prices: X_PRICE_USD,
@@ -320,13 +324,14 @@ export function adminRoutes(s: Services): Router {
   r.get("/ai/status", async (_req, res) => {
     const published = (await s.content.snapshot(newContext())).settings.llmEnabled;
     const draft = ((await s.store.content.get(SETTINGS_ID))?.draft as Partial<Settings> | null | undefined)?.llmEnabled ?? null;
+    const client = await s.llm.client().then((c) => (c ? { provider: c.name, model: c.model, toolCalling: typeof c.runTools === "function" } : null));
     ok(res, {
       llm: {
         enabled: published,
         /** Nilai pada draft pengaturan yang belum dipublikasikan (null = tidak ada perubahan). */
         draftEnabled: draft,
-        client: s.llm ? { provider: s.llm.name, model: s.llm.model, toolCalling: typeof s.llm.runTools === "function" } : null,
-        availability: llmAvailability(published, s.llm),
+        client,
+        availability: llmAvailability(published, await s.llm.client()),
       },
       reader: await readerView(),
       pendingAdvisories: (await s.advisories.list({ status: "pending", limit: 500 })).length,
@@ -336,10 +341,33 @@ export function adminRoutes(s: Services): Router {
   r.get("/ai/reader", async (_req, res) => ok(res, await readerView()));
 
   r.put("/ai/reader", requireAdmin("admin"), async (req, res) => {
-    const body = parse(readerConfigInput, req.body ?? {});
-    await s.readerConfig.update(body, actor(req));
-    await audit(req, "ai.reader.update", null, body);
+    const body = parse(readerConfigInput.extend(xTokenInput.shape), req.body ?? {});
+    const { xBearerToken, clearXToken, ...config } = body;
+    await s.readerConfig.update(config, actor(req));
+    // Token X dienkripsi di server; tidak pernah dikembalikan dan tidak masuk log aktivitas.
+    await s.postSource.update({ xBearerToken, clearXToken }, actor(req));
+    await audit(req, "ai.reader.update", null, { ...config, xToken: xBearerToken ? "(diganti)" : clearXToken ? "(dihapus)" : undefined });
     ok(res, await readerView());
+  });
+
+  // Kunci dan model LLM diatur admin di sini (berlaku langsung, tanpa restart). Kunci dienkripsi di server dan tidak pernah
+  // dikembalikan; kosongkan field kunci untuk mempertahankan yang lama. Nilai kosong memakai environment (LLM_*).
+  r.get("/ai/llm", async (_req, res) => ok(res, await s.llm.view()));
+
+  r.put("/ai/llm", requireAdmin("admin"), async (req, res) => {
+    const body = parse(llmSettingsInput, req.body ?? {});
+    const view = await s.llm.update(body, actor(req));
+    const { apiKey, ...rest } = body;
+    await audit(req, "ai.llm.update", null, { ...rest, apiKey: apiKey ? "(diganti)" : undefined });
+    ok(res, view);
+  });
+
+  // Uji koneksi LLM: satu panggilan singkat dengan konfigurasi yang berlaku. Dibatasi laju karena memakai kuota API.
+  const llmTestLimiter = rateLimit({ windowMs: 5 * 60_000, max: 10 });
+  r.post("/ai/llm/test", requireAdmin("admin"), llmTestLimiter, async (req, res) => {
+    const result = await s.llm.probe();
+    await audit(req, "ai.llm.test", null, { ok: result.ok, provider: result.provider, model: result.model, error: result.error });
+    ok(res, result);
   });
 
   /** Stasiun dan lini pada isian informasi layanan harus dikenal sistem. */
@@ -763,7 +791,7 @@ export function adminRoutes(s: Services): Router {
       startedAt: s.startedAt,
       store: { kind: s.store.kind, ok: dbOk },
       commute: { source: s.commute.sourceName, baseUrl: s.config.commute.source === "http" ? s.config.commute.baseUrl : null, ...upstream, mapping },
-      llm: s.llm ? { provider: s.llm.name, model: s.llm.model } : { provider: "none" },
+      llm: await s.llm.client().then((c) => (c ? { provider: c.name, model: c.model } : { provider: "none" })),
       vision: await s.vision.view().then((v) => ({ provider: v.provider, model: v.model, ready: v.ready })),
       cache,
       pendingChanges: pending.length,

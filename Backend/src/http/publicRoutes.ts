@@ -59,7 +59,7 @@ export function publicRoutes(s: Services): Router {
       dataSource: s.commute.sourceName,
       preview: req.ctx.preview,
       // Pilihan pipeline untuk pengguna: "llm" hanya ada bila admin menyalakan mode LLM dan klien LLM tersedia.
-      llm: llmAvailability(snap.settings.llmEnabled, s.llm),
+      llm: llmAvailability(snap.settings.llmEnabled, await s.llm.client()),
     });
   });
 

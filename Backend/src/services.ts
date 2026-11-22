@@ -3,11 +3,12 @@
 import { AuthService } from "./admin/auth";
 import { TestRunner } from "./admin/TestRunner";
 import { GroundingGuard } from "./ai/GroundingGuard";
-import { ClaudeClient } from "./ai/llm/ClaudeClient";
-import { GptClient } from "./ai/llm/GptClient";
 import type { LlmClient } from "./ai/llm/LlmClient";
+import { LlmService, type LlmClientFactory } from "./ai/llm/LlmService";
 import { NavigationAgent } from "./ai/NavigationAgent";
 import { FixturePostSource, XApiPostSource, type PostSource } from "./ai/reader/PostSource";
+import { PostSourceService } from "./ai/reader/PostSourceService";
+import { SecretBox } from "./ai/secrets";
 import { ReaderConfigService } from "./ai/reader/ReaderConfig";
 import { ServiceInfoReaderAgent } from "./ai/reader/ServiceInfoReaderAgent";
 import { VisionService, type VisionClientFactory } from "./ai/vision/VisionService";
@@ -45,12 +46,13 @@ export interface Services {
   alternatives: AlternativeService;
   tools: ToolRegistry;
   guard: GroundingGuard;
-  llm: LlmClient | null;
+  /** Konfigurasi LLM (admin atau environment); `client()` memberi klien terkini. */
+  llm: LlmService;
   agent: NavigationAgent;
   /** Informasi layanan operator dan antrean persetujuan admin. */
   advisories: ServiceAdvisoryService;
-  /** Sumber postingan akun operator (X API atau fixture); null = tanpa pembacaan otomatis. */
-  postSource: PostSource | null;
+  /** Sumber postingan akun operator (X API dengan token dari admin/environment, atau fixture). */
+  postSource: PostSourceService;
   readerConfig: ReaderConfigService;
   /** Agent pembaca informasi layanan dari akun X operator. */
   reader: ServiceInfoReaderAgent;
@@ -59,14 +61,6 @@ export interface Services {
   auth: AuthService;
   tests: TestRunner;
   startedAt: Date;
-}
-
-export function createLlm(config: Config): LlmClient | null {
-  const { provider, apiKey, model, timeoutMs } = config.llm;
-  if (provider === "none" || !apiKey) return null;
-  if (provider === "claude") return new ClaudeClient(apiKey, model, timeoutMs);
-  if (!model) throw new Error("LLM_MODEL wajib diisi untuk LLM_PROVIDER=gpt.");
-  return new GptClient(apiKey, model, timeoutMs);
 }
 
 export function createSource(config: Config): CommuteSource {
@@ -86,7 +80,7 @@ export function createPostSource(config: Config): PostSource | null {
   return new XApiPostSource({ bearerToken: c.xBearerToken, baseUrl: c.xBaseUrl, timeoutMs: c.timeoutMs });
 }
 
-export function createServices(opts: { config: Config; store: Store; log: Logger; source?: CommuteSource; llm?: LlmClient | null; visionFactory?: VisionClientFactory; postSource?: PostSource | null }): Services {
+export function createServices(opts: { config: Config; store: Store; log: Logger; source?: CommuteSource; llm?: LlmClient | null; visionFactory?: VisionClientFactory; postSource?: PostSource | null; llmFactory?: LlmClientFactory; xFactory?: (token: string) => PostSource }): Services {
   const { config, store, log } = opts;
   const source = opts.source ?? createSource(config);
   // GTFS Transjakarta (koridor BRT 1–14 dan lin BRT turunannya) melengkapi data TransJakarta yang tidak ada di Commute.
@@ -107,12 +101,14 @@ export function createServices(opts: { config: Config; store: Store; log: Logger
   const alternatives = new AlternativeService(planner, facilities);
   const tools = new ToolRegistry({ stations, planner, facilities, alternatives });
   const guard = new GroundingGuard();
-  const llm = opts.llm === undefined ? createLlm(config) : opts.llm;
+  // Rahasia (kunci LLM, token X) yang diisi admin disimpan terenkripsi dengan kunci turunan ADMIN_TOKEN_SECRET.
+  const box = new SecretBox(config.admin.tokenSecret);
+  const llm = new LlmService(config.llm, store.serverConfig, box, { factory: opts.llmFactory, fixed: opts.llm });
   const advisories = new ServiceAdvisoryService(store.advisories);
   const agent = new NavigationAgent(tools, stations, content, guard, llm, log, advisories);
-  const postSource = opts.postSource === undefined ? createPostSource(config) : opts.postSource;
+  const postSource = new PostSourceService(config.serviceInfo, store.serverConfig, box, { xFactory: opts.xFactory, fixed: opts.postSource });
   const readerConfig = new ReaderConfigService(store.serverConfig);
-  const reader = new ServiceInfoReaderAgent({ source: postSource, config: readerConfig, advisories, llm, stations, content, log });
+  const reader = new ServiceInfoReaderAgent({ sources: postSource, config: readerConfig, advisories, llm, stations, content, log });
   const vision = new VisionService(config.vision, store.serverConfig, opts.visionFactory);
   const auth = new AuthService(store.admins, config.admin.tokenSecret, config.admin.tokenTtlMinutes);
   const tests = new TestRunner(agent, store.tests);

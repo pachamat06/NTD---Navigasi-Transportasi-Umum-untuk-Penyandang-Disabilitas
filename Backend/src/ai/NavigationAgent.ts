@@ -33,6 +33,7 @@ import { AppError } from "../errors";
 import { ATTRIBUTION, factsForPrompt, type GroundingGuard, type PlanFacts } from "./GroundingGuard";
 import { LlmNavigator, type GuardView, type NavHost } from "./LlmNavigator";
 import type { LlmClient } from "./llm/LlmClient";
+import type { LlmSource } from "./llm/LlmService";
 import { resolvePipeline, type PipelineChoice } from "./pipeline";
 import type { ToolRegistry } from "./ToolRegistry";
 import { inactiveMessage } from "../domain/stationStatus";
@@ -104,7 +105,8 @@ export class NavigationAgent {
     private stations: StationService,
     private content: ContentService,
     private guard: GroundingGuard,
-    private llm: LlmClient | null,
+    /** Sumber klien LLM (konfigurasi admin/environment, dibaca saat dipakai); null = tanpa LLM. */
+    private llmSource: LlmSource | null,
     private log: AgentLogger = { warn: () => {} },
     /** Informasi layanan operator (agent pembaca + persetujuan admin). Tanpa ini, rute tidak terpengaruh informasi layanan. */
     private advisories: ServiceAdvisoryService | null = null,
@@ -120,7 +122,8 @@ export class NavigationAgent {
     // mengubah navigasi di kedua pipeline; yang belum diperiksa hanya tampil sebagai info (dan konteks agent LLM), dan
     // hanya selama mode LLM menyala.
     const requested: PipelineChoice = input.pipeline ?? "default";
-    const pipe = resolvePipeline({ requested, llmEnabled: snap.settings.llmEnabled, llm: this.llm, skipLlm: ctx.skipLlm === true });
+    const llm = this.llmSource ? await this.llmSource.client() : null;
+    const pipe = resolvePipeline({ requested, llmEnabled: snap.settings.llmEnabled, llm, skipLlm: ctx.skipLlm === true });
     const pipeline: PipelineInfo = { requested, used: "default", navigation: "default", narration: "template", notes: [], ...(pipe.reason ? { reason: pipe.reason } : {}) };
     const activeInfo = this.advisories ? await this.advisories.active(when, { includePending: snap.settings.llmEnabled }) : [];
     const effective = activeInfo.filter((a) => a.status === "approved");
@@ -395,7 +398,7 @@ export class NavigationAgent {
         },
         guardViews: (): GuardView[] => evaluated.map((e) => ({ unmetNeeds: e.summary.unmetNeeds, usesAvoidedModes: e.summary.usesAvoidedModes, advisoryImpact: e.summary.advisoryImpact ?? "none" })),
       };
-      const out = await new LlmNavigator(this.llm!).decide(host);
+      const out = await new LlmNavigator(llm!).decide(host);
       if (out.ok) {
         llmPick = { e: evaluated[out.index], ...(out.reason ? { reason: out.reason } : {}) };
         pipeline.navigation = "llm";
@@ -452,10 +455,10 @@ export class NavigationAgent {
 
     // 5. Notifikasi: LLM hanya pada pipeline "llm" (pilihan utama saja), divalidasi Grounding Guard; cadangan template statis.
     const factsOf = (e: Evaluated): PlanFacts => factsFor(e, notices);
-    const notification = await this.susunNotifikasi(factsOf(primary), advisoryNotices, lines, pipe.use === "llm");
+    const notification = await this.susunNotifikasi(factsOf(primary), advisoryNotices, lines, pipe.use === "llm" ? llm : null);
     pipeline.narration = notification.source === "LLM" ? "llm" : "template";
     pipeline.used = pipeline.navigation === "llm" || pipeline.narration === "llm" ? "llm" : "default";
-    if (pipeline.used === "llm" && this.llm) pipeline.model = this.llm.model;
+    if (pipeline.used === "llm" && llm) pipeline.model = llm.model;
     if (requested === "llm" && pipeline.used === "default" && !pipeline.reason) pipeline.reason = "LLM tidak dapat dipakai untuk permintaan ini; memakai pipeline default.";
     const options: RouteOption[] = picked.map((p, i) => ({
       kinds: p.kinds,
@@ -492,19 +495,19 @@ export class NavigationAgent {
   }
 
   /**
-   * Notifikasi ringkasan rute. `useLlm` hanya true pada pipeline "llm" (mode LLM menyala dan klien ada); pipeline default
+   * Notifikasi ringkasan rute. `llm` hanya terisi pada pipeline "llm" (mode LLM menyala dan klien ada); pipeline default
    * selalu memakai template. `extraNotices` (informasi layanan) hanya dikirim ke LLM, divalidasi bersama fakta lainnya.
    */
-  private async susunNotifikasi(facts: PlanFacts, extraNotices: Notice[], lines: Line[], useLlm: boolean): Promise<Notification> {
+  private async susunNotifikasi(facts: PlanFacts, extraNotices: Notice[], lines: Line[], llm: LlmClient | null): Promise<Notification> {
     const lineName = (id: string) => {
       const l = lines.find((x) => x.id === id);
       return l ? { name: l.name, operator: l.operator } : undefined;
     };
     const template = () => this.guard.fallback(facts, lineName);
-    if (!this.llm || !useLlm) return template();
+    if (!llm) return template();
     const llmFacts: PlanFacts = { ...facts, notices: [...facts.notices, ...extraNotices] };
     try {
-      const text = await this.llm.complete({
+      const text = await llm.complete({
         system: SYSTEM_PROMPT,
         prompt: `Data hasil tool (JSON):\n${JSON.stringify(factsForPrompt(llmFacts))}\n\nSusun notifikasi ringkasan rute.`,
         maxTokens: 2000,

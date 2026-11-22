@@ -26,23 +26,24 @@ async function main() {
     await services.auth.bootstrap(config.admin.bootstrapEmail, config.admin.bootstrapPassword, (m) => log.info(m));
   }
 
-  // Pembacaan berkala informasi layanan operator (hanya bila sumber postingan dikonfigurasi; pembacaan baru berjalan bila
-  // admin mengaktifkannya dan mode LLM menyala).
-  const reader = services.postSource ? new ReaderScheduler(services.reader, services.readerConfig, log) : null;
-  reader?.start();
+  // Pembacaan berkala informasi layanan operator. Selalu dijadwalkan; pembacaan baru berjalan bila admin mengaktifkannya,
+  // mode LLM menyala, kunci LLM dan token X (admin atau .env) tersedia.
+  const reader = new ReaderScheduler(services.reader, services.readerConfig, log);
+  reader.start();
 
   const app = createApp(services);
+  const llmInfo = await services.llm.client().then((c) => (c ? `${c.name}/${c.model}` : "belum dikonfigurasi (template)"));
   const server = app.listen(config.port, () => {
     log.info(`API running on http://localhost:${config.port}`, {
       commute: config.commute.source,
       store: store.kind,
-      llm: services.llm ? `${services.llm.name}/${services.llm.model}` : "none (template)",
+      llm: llmInfo,
       serviceInfo: config.serviceInfo.source,
     });
   });
 
   const shutdown = () => {
-    reader?.stop();
+    reader.stop();
     server.close(() => void store.close().finally(() => process.exit(0)));
   };
   process.on("SIGTERM", shutdown);

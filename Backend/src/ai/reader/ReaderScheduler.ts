@@ -7,6 +7,7 @@ import type { ServiceInfoReaderAgent } from "./ServiceInfoReaderAgent";
 export class ReaderScheduler {
   private timer?: NodeJS.Timeout;
   private stopped = true;
+  private lastSkip?: string;
 
   constructor(
     private agent: ServiceInfoReaderAgent,
@@ -36,8 +37,14 @@ export class ReaderScheduler {
     if (this.stopped) return;
     try {
       const r = await this.agent.poll("jadwal");
-      if (r.skipped) this.log.info("pembaca dilewati", { alasan: r.skipped });
-      else this.log.info("pembaca selesai", { ambil: r.fetched, dibuat: r.created, galat: r.errors.length, biayaPerkiraanUsd: r.approxCostUsd });
+      // Alasan dilewati hanya dicatat saat berubah agar log tidak penuh pengulangan.
+      if (r.skipped) {
+        if (r.skipped !== this.lastSkip) this.log.info("pembaca dilewati", { alasan: r.skipped });
+        this.lastSkip = r.skipped;
+      } else {
+        this.lastSkip = undefined;
+        this.log.info("pembaca selesai", { ambil: r.fetched, dibuat: r.created, galat: r.errors.length, biayaPerkiraanUsd: r.approxCostUsd });
+      }
     } catch (e) {
       this.log.warn("pembaca gagal", { error: (e as Error).message });
     }

@@ -30,7 +30,10 @@ export class GptClient implements LlmClient {
     } catch (e) {
       throw new LlmError(`LLM: ${(e as Error).message}`);
     }
-    if (!res.ok) throw new LlmError(`LLM: galat API ${res.status}`);
+    if (!res.ok) {
+      const detail = ((await res.json().catch(() => null)) as { error?: { message?: string } } | null)?.error?.message;
+      throw new LlmError(`LLM: galat API ${res.status}${detail ? ` (${detail.slice(0, 160)})` : ""}`);
+    }
     const json = (await res.json()) as { choices?: { message?: ChatMessage }[] };
     const message = json.choices?.[0]?.message;
     if (!message) throw new LlmError("LLM: jawaban kosong");

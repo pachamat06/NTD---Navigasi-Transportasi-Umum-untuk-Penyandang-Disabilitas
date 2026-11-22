@@ -115,6 +115,7 @@ Dampak: `info` (tidak mengubah navigasi), `delay`, `disruption`, `closure`. Meny
 
 - `test/dua-agent-llm.test.ts`: pipeline (toggle admin, jatuh ke default, default tanpa LLM), agent navigasi dengan LLM tiruan (memilih, ditolak pagar, alasan karangan dibuang, `cari_rute_baru`, gagal, tanpa tool-calling), informasi layanan yang belum disetujui tidak mengubah navigasi lalu mengubahnya setelah disetujui dan berhenti setelah kedaluwarsa, mode LLM mati, dan antrean admin (peran, validasi, siklus status, input manual).
 - `test/pembaca-x.test.ts`: agent pembaca dengan sumber fixture (saring, ekstraksi, pencocokan deterministik, duplikat dan `since_id`, anggaran, galat sumber, injeksi prompt, syarat pembacaan), klien X dengan respons tiruan, klien Claude dan GPT tool-calling dengan respons tiruan, konfigurasi, dan penjadwal.
+- `test/kunci-admin.test.ts`: enkripsi kunci, kunci/token admin (tersimpan terenkripsi, tidak bocor di respons dan log, berlaku tanpa restart, cadangan `.env`, secret berubah, tanpa secret), uji koneksi, dan pesan galat penyedia.
 - `test/store.test.ts`: repositori informasi layanan (memori; PostgreSQL bila `TEST_DATABASE_URL` diisi). Jangan arahkan `TEST_DATABASE_URL` ke basis data kerja: tes itu menghapus skema `public`.
 - Repositori PostgreSQL juga diverifikasi pada PostgreSQL 18.2 lokal di dalam transaksi yang di-rollback (tanpa menyimpan apa pun).
 
@@ -131,6 +132,18 @@ Admin (`/api/admin`):
 - `GET /service-info?status=`, `GET /service-info/:id`, `PATCH /service-info/:id` (ubah isian, saat `pending`).
 - `POST /service-info/:id/approve` | `reject` | `expire` (peran admin).
 - `POST /service-info/ingest` (tempel postingan manual) dan `POST /service-info/poll` (baca sekarang), peran admin, dibatasi laju.
+
+### 7.1 Kunci API di admin (22 November 2026)
+
+Kunci LLM dan token X dapat diisi dari admin (kartu LLM dan kartu Agent pembaca di Pengaturan), tidak hanya dari `.env`:
+
+- Tersimpan **terenkripsi** (AES-256-GCM, kunci diturunkan dari `ADMIN_TOKEN_SECRET` lewat HKDF) di `server_config` (`ai.llm`, `ai.x`). Dump basis data atau cadangan saja tidak membuka kunci; `.env` saja tidak berisi kunci. Syaratnya `ADMIN_TOKEN_SECRET` (minimal 16 karakter) terisi dan dijaga terpisah dari cadangan.
+- Tidak pernah dikembalikan ke browser (hanya empat karakter terakhir), tidak masuk respons maupun log aktivitas.
+- Berlaku tanpa restart: `LlmService` dan `PostSourceService` membaca konfigurasi terkini dan membuat ulang klien saat berubah.
+- Kunci admin menang atas `.env`; `.env` menjadi cadangan. Kunci hanya berlaku untuk penyedia tempat ia diisi (tidak dikirim ke penyedia lain).
+- Bila `ADMIN_TOKEN_SECRET` berubah, kunci tersimpan tidak terbaca dan admin diminta mengisi ulang.
+- Tombol **Uji koneksi** (`POST /api/admin/ai/llm/test`) menampilkan galat penyedia apa adanya, mis. `galat API 404 (model: nama-salah)`.
+- Kunci disimpan di basis data yang sama dengan data lain; siapa pun yang memegang basis data **dan** `ADMIN_TOKEN_SECRET` dapat membukanya. Kunci AI pembaca denah yang sudah ada belum dienkripsi (tindak lanjut).
 
 ## 8. Batasan yang perlu diketahui
 

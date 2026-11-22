@@ -1,6 +1,7 @@
 import request from "supertest";
 import { hashPassword } from "../src/admin/auth";
 import type { LlmClient } from "../src/ai/llm/LlmClient";
+import type { LlmClientFactory } from "../src/ai/llm/LlmService";
 import type { PostSource } from "../src/ai/reader/PostSource";
 import type { VisionClientFactory } from "../src/ai/vision/VisionService";
 import { createApp } from "../src/app";
@@ -27,11 +28,11 @@ export class FakeLlm implements LlmClient {
   }
 }
 
-export async function makeTestApp(opts: { store?: Store; llm?: LlmClient | null; env?: Record<string, string>; source?: CommuteSource; visionFactory?: VisionClientFactory; postSource?: PostSource | null } = {}) {
+export async function makeTestApp(opts: { store?: Store; llm?: LlmClient | null; env?: Record<string, string>; source?: CommuteSource; visionFactory?: VisionClientFactory; postSource?: PostSource | null; llmFactory?: LlmClientFactory; xFactory?: (token: string) => PostSource } = {}) {
   const store = opts.store ?? createMemoryStore();
   const config = loadConfig({ RATE_LIMIT_MAX: "10000", ADMIN_TOKEN_SECRET: "x".repeat(40), ...opts.env } as NodeJS.ProcessEnv);
   const source = opts.source ?? new FixtureCommuteSource();
-  const services = createServices({ config, store, log: silentLogger, source, llm: opts.llm ?? null, visionFactory: opts.visionFactory, postSource: opts.postSource ?? null });
+  const services = createServices({ config, store, log: silentLogger, source, llm: opts.llm === undefined ? undefined : opts.llm, visionFactory: opts.visionFactory, postSource: opts.postSource, llmFactory: opts.llmFactory, xFactory: opts.xFactory });
   if ((await store.admins.count()) === 0) {
     await store.admins.create({ email: ADMIN.email, name: "Admin", role: "admin", passwordHash: await hashPassword(ADMIN.password), active: true });
     await store.admins.create({ email: EDITOR.email, name: "Editor", role: "editor", passwordHash: await hashPassword(EDITOR.password), active: true });

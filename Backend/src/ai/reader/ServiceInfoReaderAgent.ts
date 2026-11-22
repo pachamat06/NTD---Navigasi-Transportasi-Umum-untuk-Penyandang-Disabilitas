@@ -10,8 +10,10 @@ import type { StationService } from "../../domain/StationService";
 import { ServiceAdvisoryService, type AdvisoryIngest } from "../../domain/serviceAdvisory";
 import type { NewServiceAdvisory, ServiceAdvisory } from "../../store/types";
 import type { LlmClient } from "../llm/LlmClient";
+import type { LlmSource } from "../llm/LlmService";
 import { excerpt, EXTRACTION_SYSTEM, extractionPrompt, groundSummary, looksLikeServiceInfo, mentionedIds, nameResolves, parseExtraction, resolveExpiry, type ExtractedItem } from "./extraction";
-import type { PostSource, SourcePost } from "./PostSource";
+import type { SourcePost } from "./PostSource";
+import type { PostSourceProvider } from "./PostSourceService";
 import { ReaderConfigService, X_PRICE_USD, type PollReport } from "./ReaderConfig";
 
 export interface ReaderLogger {
@@ -19,10 +21,12 @@ export interface ReaderLogger {
 }
 
 export interface ReaderDeps {
-  source: PostSource | null;
+  /** Sumber postingan (X API atau fixture), dibaca saat dipakai. */
+  sources: PostSourceProvider;
   config: ReaderConfigService;
   advisories: ServiceAdvisoryService;
-  llm: LlmClient | null;
+  /** Sumber klien LLM, dibaca saat dipakai. */
+  llm: LlmSource;
   stations: StationService;
   content: ContentService;
   log?: ReaderLogger;
@@ -57,7 +61,7 @@ export class ServiceInfoReaderAgent {
   async llmReady(): Promise<{ ok: boolean; problem?: string }> {
     const snap = await this.d.content.snapshot(newContext({ now: this.now() }));
     if (!snap.settings.llmEnabled) return { ok: false, problem: "Mode LLM dimatikan oleh admin (Pengaturan)." };
-    if (!this.d.llm) return { ok: false, problem: "Klien LLM belum dikonfigurasi (LLM_PROVIDER dan LLM_API_KEY)." };
+    if (!(await this.d.llm.client())) return { ok: false, problem: "Klien LLM belum dikonfigurasi (isi kunci API di Pengaturan admin atau LLM_API_KEY di .env)." };
     return { ok: true };
   }
 
@@ -65,7 +69,7 @@ export class ServiceInfoReaderAgent {
   async problem(): Promise<string | null> {
     const llm = await this.llmReady();
     if (!llm.ok) return llm.problem!;
-    if (!this.d.source) return "Sumber postingan belum dikonfigurasi (SERVICE_INFO_SOURCE=x atau fixture).";
+    if (!(await this.d.sources.source())) return "Sumber postingan belum dikonfigurasi (isi token X di Pengaturan admin, atau SERVICE_INFO_SOURCE di .env).";
     const cfg = await this.d.config.get();
     if (!cfg.enabled) return "Pembacaan otomatis dimatikan di pengaturan pembaca.";
     if (!cfg.accounts.some((a) => a.enabled)) return "Belum ada akun yang diaktifkan untuk dibaca.";
@@ -92,6 +96,8 @@ export class ServiceInfoReaderAgent {
       } else {
         const cfg = await this.d.config.get();
         const ents = await this.entities();
+        const source = (await this.d.sources.source())!;
+        const llm = (await this.d.llm.client())!;
         for (const account of cfg.accounts.filter((a) => a.enabled)) {
           const key = account.handle.toLowerCase();
           const remaining = cfg.monthlyPostBudget - state.usage.posts;
@@ -101,7 +107,7 @@ export class ServiceInfoReaderAgent {
           }
           let posts: SourcePost[];
           try {
-            const r = await this.d.source!.fetchNew({ handle: account.handle, sinceId: state.cursors[key], userId: state.userIds[key], maxResults: Math.min(cfg.maxPostsPerAccount, remaining) });
+            const r = await source.fetchNew({ handle: account.handle, sinceId: state.cursors[key], userId: state.userIds[key], maxResults: Math.min(cfg.maxPostsPerAccount, remaining) });
             posts = r.posts;
             state.usage.posts += r.reads.posts;
             state.usage.users += r.reads.users;
@@ -121,7 +127,7 @@ export class ServiceInfoReaderAgent {
             else if (cfg.keywordFilter && !looksLikeServiceInfo(p.text)) report.irrelevant++;
             else fresh.push(p);
           }
-          if (fresh.length) await this.extractBatch(account.handle, account.operator, fresh, ents, report);
+          if (fresh.length) await this.extractBatch(llm, account.handle, account.operator, fresh, ents, report);
         }
         report.approxCostUsd = Math.round(report.approxCostUsd * 1000) / 1000;
       }
@@ -133,11 +139,11 @@ export class ServiceInfoReaderAgent {
     }
   }
 
-  private async extractBatch(account: string, operator: string, posts: SourcePost[], ents: Entities, report: PollReport): Promise<void> {
+  private async extractBatch(llm: LlmClient, account: string, operator: string, posts: SourcePost[], ents: Entities, report: PollReport): Promise<void> {
     const now = this.now();
     let items: ExtractedItem[] = [];
     try {
-      const raw = await this.d.llm!.complete({
+      const raw = await llm.complete({
         system: EXTRACTION_SYSTEM,
         prompt: extractionPrompt(posts.map((p, i) => ({ ref: i + 1, waktu: p.createdAt, teks: p.text.slice(0, 1000) })), account, operator, now),
         maxTokens: 1200 + 300 * posts.length,
@@ -154,7 +160,7 @@ export class ServiceInfoReaderAgent {
         report.notService++;
         continue;
       }
-      const adv = this.build({ type: "x", account, postId: p.id, url: p.url, text: p.text, postedAt: new Date(p.createdAt).toISOString() }, operator, item, ents, "llm");
+      const adv = this.build({ type: "x", account, postId: p.id, url: p.url, text: p.text, postedAt: new Date(p.createdAt).toISOString() }, operator, item, ents, "llm", llm.model);
       if (Date.parse(adv.expiresAt) <= now.getTime()) {
         report.tooOld++;
         continue;
@@ -170,7 +176,7 @@ export class ServiceInfoReaderAgent {
   }
 
   /** Menyusun isian informasi. Stasiun dan lini selalu dari pencocokan deterministik pada teks postingan. */
-  private build(c: Candidate, operator: string | null, item: ExtractedItem | null, ents: Entities, by: "llm" | "manual"): Omit<NewServiceAdvisory, "status" | "reviewedBy" | "reviewedAt" | "reviewNote"> {
+  private build(c: Candidate, operator: string | null, item: ExtractedItem | null, ents: Entities, by: "llm" | "manual", model?: string): Omit<NewServiceAdvisory, "status" | "reviewedBy" | "reviewedAt" | "reviewNote"> {
     const stationIds = mentionedIds(c.text, ents.stations);
     const lineIds = mentionedIds(c.text, ents.lines);
     const category = item?.kategori ?? "lainnya";
@@ -190,7 +196,7 @@ export class ServiceInfoReaderAgent {
       expiresAt: resolveExpiry(item?.berlakuSampai ?? null, c.postedAt, impact),
       extraction: {
         by: item && grounded ? "llm" : item || by === "llm" ? "fallback" : "manual",
-        ...(item && this.d.llm ? { model: this.d.llm.model } : {}),
+        ...(item && model ? { model } : {}),
         ...(item ? { confidence: item.keyakinan, proposedImpact: item.dampak } : {}),
         ...(unmatched.length ? { unmatched } : {}),
       },
@@ -208,16 +214,17 @@ export class ServiceInfoReaderAgent {
     if (input.postId && (await this.d.advisories.findBySource("manual", account, input.postId))) throw new AppError("CONFLICT", "Postingan ini sudah ada di antrean.");
     const ents = await this.entities();
     let item: ExtractedItem | null = null;
-    if ((await this.llmReady()).ok) {
+    const llm = (await this.llmReady()).ok ? await this.d.llm.client() : null;
+    if (llm) {
       try {
-        const raw = await this.d.llm!.complete({ system: EXTRACTION_SYSTEM, prompt: extractionPrompt([{ ref: 1, waktu: postedAt, teks: input.text.slice(0, 1000) }], account, input.operator ?? "-", now), maxTokens: 1500 });
+        const raw = await llm.complete({ system: EXTRACTION_SYSTEM, prompt: extractionPrompt([{ ref: 1, waktu: postedAt, teks: input.text.slice(0, 1000) }], account, input.operator ?? "-", now), maxTokens: 1500 });
         item = parseExtraction(raw).find((x) => x.ref === 1) ?? null;
       } catch (e) {
         this.log.warn("pembaca: ekstraksi manual gagal", { error: (e as Error).message });
       }
     }
     // Admin sengaja menempelkan teks ini: tetap masuk antrean walau LLM menilainya bukan informasi layanan.
-    const adv = this.build({ type: "manual", account, postId: input.postId ?? null, url: input.url ?? null, text: input.text, postedAt }, input.operator ?? null, item?.relevan ? item : null, ents, "manual");
+    const adv = this.build({ type: "manual", account, postId: input.postId ?? null, url: input.url ?? null, text: input.text, postedAt }, input.operator ?? null, item?.relevan ? item : null, ents, "manual", llm?.model);
     if (Date.parse(adv.expiresAt) <= now.getTime()) throw new AppError("INVALID", "Masa berlaku bawaan postingan ini sudah lewat; isi postedAt dengan waktu yang lebih baru.");
     return this.d.advisories.create(adv);
   }

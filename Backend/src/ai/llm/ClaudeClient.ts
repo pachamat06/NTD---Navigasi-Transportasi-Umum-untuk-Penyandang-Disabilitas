@@ -35,7 +35,11 @@ export class ClaudeClient implements LlmClient {
     } catch (e) {
       if (e instanceof Anthropic.RateLimitError) throw new LlmError("LLM: batas laju terlampaui");
       if (e instanceof Anthropic.AuthenticationError) throw new LlmError("LLM: kunci API tidak valid");
-      if (e instanceof Anthropic.APIError) throw new LlmError(`LLM: galat API ${e.status ?? ""}`.trim());
+      if (e instanceof Anthropic.APIError) {
+        // Pesan penyedia (mis. "model: nama-salah") membantu admin memperbaiki konfigurasi; tidak memuat kunci API.
+        const detail = (e.error as { error?: { message?: string } } | undefined)?.error?.message;
+        throw new LlmError(`LLM: galat API ${e.status ?? ""}${detail ? ` (${detail.slice(0, 160)})` : ""}`.trim());
+      }
       throw new LlmError(`LLM: ${(e as Error).message}`);
     }
     if (res.stop_reason === "refusal") throw new LlmError("LLM: permintaan ditolak");
