@@ -34,6 +34,18 @@ export interface Config {
     baseUrl?: string;
     timeoutMs: number;
   };
+  /**
+   * Sumber postingan akun operator untuk agent pembaca informasi layanan. "none" = tidak ada pembacaan otomatis (input
+   * manual admin tetap bisa), "x" = X API resmi (berbayar per postingan, butuh bearer token), "fixture" = berkas JSON.
+   * Token hanya dari environment; tidak pernah dikirim ke browser.
+   */
+  serviceInfo: {
+    source: ServiceInfoSource;
+    xBearerToken?: string;
+    xBaseUrl?: string;
+    fixtureFile?: string;
+    timeoutMs: number;
+  };
   admin: {
     enabled: boolean;
     tokenSecret?: string;
@@ -43,6 +55,9 @@ export interface Config {
   };
   rateLimit: { windowMs: number; max: number };
 }
+
+export const SERVICE_INFO_SOURCES = ["none", "x", "fixture"] as const;
+export type ServiceInfoSource = (typeof SERVICE_INFO_SOURCES)[number];
 
 export const VISION_PROVIDERS = ["claude", "openai", "none"] as const;
 export type VisionProvider = (typeof VISION_PROVIDERS)[number];
@@ -64,6 +79,10 @@ export function loadConfig(env: NodeJS.ProcessEnv = process.env): Config {
     (visionProvider === "claude" && provider === "claude" ? env.LLM_API_KEY : undefined) ||
     (visionProvider === "claude" ? env.ANTHROPIC_API_KEY : undefined) ||
     undefined;
+
+  // Tanpa pilihan eksplisit, sumber "x" hanya menyala bila token tersedia; bawaan tidak membaca apa pun (tanpa biaya X API).
+  const infoSource = (env.SERVICE_INFO_SOURCE || (env.X_API_BEARER_TOKEN ? "x" : "none")) as ServiceInfoSource;
+  if (!SERVICE_INFO_SOURCES.includes(infoSource)) throw new Error(`SERVICE_INFO_SOURCE tidak dikenal: ${infoSource}`);
 
   const tokenSecret = env.ADMIN_TOKEN_SECRET;
   const adminEnabled = env.ADMIN_ENABLED !== "false";
@@ -97,6 +116,13 @@ export function loadConfig(env: NodeJS.ProcessEnv = process.env): Config {
       model: env.AI_VISION_MODEL || undefined,
       baseUrl: env.AI_VISION_BASE_URL || undefined,
       timeoutMs: Number(env.AI_VISION_TIMEOUT_MS) || 120_000,
+    },
+    serviceInfo: {
+      source: infoSource,
+      xBearerToken: env.X_API_BEARER_TOKEN || undefined,
+      xBaseUrl: env.X_API_BASE_URL || undefined,
+      fixtureFile: env.SERVICE_INFO_FIXTURE_FILE || undefined,
+      timeoutMs: Number(env.X_API_TIMEOUT_MS) || 10_000,
     },
     admin: {
       enabled: adminEnabled,

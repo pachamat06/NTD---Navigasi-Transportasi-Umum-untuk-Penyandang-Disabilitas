@@ -2,6 +2,8 @@
 // Bentuknya sengaja sama dengan Frontend/src/lib/types.ts agar GUI cukup mengganti mock-planner
 // dengan panggilan ke backend. Field tambahan bersifat opsional sehingga tidak merusak GUI.
 
+import type { AdvisoryView } from "./serviceAdvisory";
+
 export type Mode = "RAIL" | "SUBWAY" | "TRAM" | "BUS" | "MONORAIL";
 
 /** Status yang dipakai GUI. "absent" = tidak tercatat pada data, bukan pasti tidak ada. */
@@ -597,6 +599,12 @@ export interface RouteOptionSummary {
   unmetNeeds: number;
   /** Rute memakai moda yang ingin dihindari (tidak ada rute lain). */
   usesAvoidedModes: boolean;
+  /**
+   * Dampak informasi layanan operator yang SUDAH DISETUJUI admin pada rute ini (mengurangi `rankScore`). Tidak ada bila
+   * tidak terdampak; informasi yang belum disetujui tidak pernah memengaruhi nilai ini.
+   */
+  advisoryImpact?: "delay" | "disruption" | "closure";
+  advisoryIds?: string[];
 }
 
 /** Satu pilihan rute (gaya TfL): rute, penilaian stasiun untuk rute itu, peringatan, dan ringkasan. */
@@ -610,6 +618,24 @@ export interface RouteOption {
   summary: RouteOptionSummary;
   notification: Notification;
   alternatives: Alternative[];
+  /** "llm" = pilihan ini dipilih agent navigasi LLM (menjadi pilihan pertama); `llmReason` alasannya (sudah divalidasi). */
+  pickedBy?: "llm";
+  llmReason?: string;
+}
+
+/** Pipeline yang diminta pengguna dan yang benar-benar dipakai. */
+export interface PipelineInfo {
+  requested: "default" | "llm";
+  /** "llm" bila minimal satu langkah LLM (agent navigasi atau narasi) berhasil dipakai. */
+  used: "default" | "llm";
+  navigation: "default" | "llm";
+  narration: "template" | "llm";
+  /** Mengapa permintaan LLM turun ke default (mode LLM dimatikan, klien belum ada, ...). */
+  reason?: string;
+  /** Catatan langkah LLM yang gagal atau ditolak pagar. */
+  notes: string[];
+  model?: string;
+  steps?: number;
 }
 
 export interface JourneyPlan {
@@ -634,8 +660,16 @@ export interface JourneyPlan {
   /**
    * Beberapa pilihan rute, urut: paling aksesibel (sama dengan `route`), moderat, tercepat, lalu rute lain (`kinds`
    * kosong). Pilihan yang sama digabung (`kinds` lebih dari satu). Field utama rencana (`route`, `assessments`, `warnings`, ...) = pilihan pertama.
+   * Pada pipeline LLM, pilihan agent navigasi menjadi yang pertama.
    */
   options?: RouteOption[];
+  /** Pipeline yang diminta dan yang dipakai. */
+  pipeline: PipelineInfo;
+  /**
+   * Informasi layanan operator (dari akun X atau input admin) yang relevan dengan rute. `status: "approved"` sudah diperiksa
+   * admin dan memengaruhi navigasi; `status: "pending"` hanya informasi dan belum diverifikasi.
+   */
+  serviceInfo: AdvisoryView[];
 }
 
 export type ErrorCode =

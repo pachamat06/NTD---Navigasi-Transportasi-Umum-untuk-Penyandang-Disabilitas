@@ -7,6 +7,9 @@ import { ClaudeClient } from "./ai/llm/ClaudeClient";
 import { GptClient } from "./ai/llm/GptClient";
 import type { LlmClient } from "./ai/llm/LlmClient";
 import { NavigationAgent } from "./ai/NavigationAgent";
+import { FixturePostSource, XApiPostSource, type PostSource } from "./ai/reader/PostSource";
+import { ReaderConfigService } from "./ai/reader/ReaderConfig";
+import { ServiceInfoReaderAgent } from "./ai/reader/ServiceInfoReaderAgent";
 import { VisionService, type VisionClientFactory } from "./ai/vision/VisionService";
 import { ToolRegistry } from "./ai/ToolRegistry";
 import type { Config } from "./config";
@@ -20,6 +23,7 @@ import { AlternativeService } from "./domain/AlternativeService";
 import { ContentService } from "./domain/content";
 import { FacilityAnalysisService } from "./domain/FacilityAnalysisService";
 import { RouteSyncService } from "./domain/routeSync";
+import { ServiceAdvisoryService } from "./domain/serviceAdvisory";
 import { RoutePlannerService } from "./domain/RoutePlannerService";
 import { StationService } from "./domain/StationService";
 import type { Logger } from "./http/middleware";
@@ -43,6 +47,13 @@ export interface Services {
   guard: GroundingGuard;
   llm: LlmClient | null;
   agent: NavigationAgent;
+  /** Informasi layanan operator dan antrean persetujuan admin. */
+  advisories: ServiceAdvisoryService;
+  /** Sumber postingan akun operator (X API atau fixture); null = tanpa pembacaan otomatis. */
+  postSource: PostSource | null;
+  readerConfig: ReaderConfigService;
+  /** Agent pembaca informasi layanan dari akun X operator. */
+  reader: ServiceInfoReaderAgent;
   /** AI pembaca denah stasiun untuk halaman admin. */
   vision: VisionService;
   auth: AuthService;
@@ -64,7 +75,18 @@ export function createSource(config: Config): CommuteSource {
     : new FixtureCommuteSource();
 }
 
-export function createServices(opts: { config: Config; store: Store; log: Logger; source?: CommuteSource; llm?: LlmClient | null; visionFactory?: VisionClientFactory }): Services {
+export function createPostSource(config: Config): PostSource | null {
+  const c = config.serviceInfo;
+  if (c.source === "none") return null;
+  if (c.source === "fixture") {
+    if (!c.fixtureFile) throw new Error("SERVICE_INFO_FIXTURE_FILE wajib diisi untuk SERVICE_INFO_SOURCE=fixture.");
+    return FixturePostSource.fromFile(c.fixtureFile);
+  }
+  if (!c.xBearerToken) throw new Error("X_API_BEARER_TOKEN wajib diisi untuk SERVICE_INFO_SOURCE=x.");
+  return new XApiPostSource({ bearerToken: c.xBearerToken, baseUrl: c.xBaseUrl, timeoutMs: c.timeoutMs });
+}
+
+export function createServices(opts: { config: Config; store: Store; log: Logger; source?: CommuteSource; llm?: LlmClient | null; visionFactory?: VisionClientFactory; postSource?: PostSource | null }): Services {
   const { config, store, log } = opts;
   const source = opts.source ?? createSource(config);
   // GTFS Transjakarta (koridor BRT 1–14 dan lin BRT turunannya) melengkapi data TransJakarta yang tidak ada di Commute.
@@ -86,9 +108,13 @@ export function createServices(opts: { config: Config; store: Store; log: Logger
   const tools = new ToolRegistry({ stations, planner, facilities, alternatives });
   const guard = new GroundingGuard();
   const llm = opts.llm === undefined ? createLlm(config) : opts.llm;
-  const agent = new NavigationAgent(tools, stations, content, guard, llm, log);
+  const advisories = new ServiceAdvisoryService(store.advisories);
+  const agent = new NavigationAgent(tools, stations, content, guard, llm, log, advisories);
+  const postSource = opts.postSource === undefined ? createPostSource(config) : opts.postSource;
+  const readerConfig = new ReaderConfigService(store.serverConfig);
+  const reader = new ServiceInfoReaderAgent({ source: postSource, config: readerConfig, advisories, llm, stations, content, log });
   const vision = new VisionService(config.vision, store.serverConfig, opts.visionFactory);
   const auth = new AuthService(store.admins, config.admin.tokenSecret, config.admin.tokenTtlMinutes);
   const tests = new TestRunner(agent, store.tests);
-  return { config, store, log, source, commute, gtfs, content, stations, planner, routeSync, facilities, alternatives, tools, guard, llm, agent, vision, auth, tests, startedAt: new Date() };
+  return { config, store, log, source, commute, gtfs, content, stations, planner, routeSync, facilities, alternatives, tools, guard, llm, agent, advisories, postSource, readerConfig, reader, vision, auth, tests, startedAt: new Date() };
 }

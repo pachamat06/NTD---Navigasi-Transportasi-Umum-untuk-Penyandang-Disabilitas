@@ -13,7 +13,9 @@ import type {
   JourneyPlan,
   Line,
   Mode,
+  Notice,
   Notification,
+  PipelineInfo,
   Platform,
   Route,
   RouteOption,
@@ -25,10 +27,13 @@ import type {
   TransferAccess,
   TransferNeed,
 } from "../domain/models";
+import { advisoryAvoidStations, advisoryEffectOn, isRelevant, NO_EFFECT, toView, type AdvisoryEffect, type ServiceAdvisory, type ServiceAdvisoryService } from "../domain/serviceAdvisory";
 import type { StationService } from "../domain/StationService";
 import { AppError } from "../errors";
 import { ATTRIBUTION, factsForPrompt, type GroundingGuard, type PlanFacts } from "./GroundingGuard";
+import { LlmNavigator, type GuardView, type NavHost } from "./LlmNavigator";
 import type { LlmClient } from "./llm/LlmClient";
+import { resolvePipeline, type PipelineChoice } from "./pipeline";
 import type { ToolRegistry } from "./ToolRegistry";
 import { inactiveMessage } from "../domain/stationStatus";
 
@@ -54,6 +59,11 @@ export interface PlanInput {
   entranceId?: string;
   /** Pintu keluar di stasiun tujuan yang dipilih pengguna. */
   exitId?: string;
+  /**
+   * "default" (bawaan): algoritma deterministik dan notifikasi template, tanpa LLM. "llm": agent navigasi LLM memilih rute
+   * dan LLM menyusun narasi. Hanya berlaku bila mode LLM menyala (admin); selain itu turun ke default.
+   */
+  pipeline?: PipelineChoice;
 }
 
 /** Satu rute yang sudah dilengkapi dan dinilai. */
@@ -64,6 +74,8 @@ interface Evaluated {
   alternatives: Alternative[];
   summary: RouteOptionSummary;
   origin?: RouteOption["origin"];
+  /** Dampak informasi layanan yang disetujui pada rute ini. */
+  advisory: AdvisoryEffect;
 }
 
 export interface AgentLogger {
@@ -94,6 +106,8 @@ export class NavigationAgent {
     private guard: GroundingGuard,
     private llm: LlmClient | null,
     private log: AgentLogger = { warn: () => {} },
+    /** Informasi layanan operator (agent pembaca + persetujuan admin). Tanpa ini, rute tidak terpengaruh informasi layanan. */
+    private advisories: ServiceAdvisoryService | null = null,
   ) {}
 
   async rencanakan(input: PlanInput, ctx: RequestContext): Promise<JourneyPlan> {
@@ -101,6 +115,15 @@ export class NavigationAgent {
     const when = input.at ? new Date(input.at) : ctx.now;
     const snap = await this.content.snapshot(ctx, when);
     ctx.cacheTtlSeconds = snap.settings.cacheTtlSeconds;
+
+    // Pipeline: default (tanpa LLM) atau LLM; hanya bila mode LLM menyala dan klien ada. Informasi layanan: yang disetujui
+    // mengubah navigasi di kedua pipeline; yang belum diperiksa hanya tampil sebagai info (dan konteks agent LLM), dan
+    // hanya selama mode LLM menyala.
+    const requested: PipelineChoice = input.pipeline ?? "default";
+    const pipe = resolvePipeline({ requested, llmEnabled: snap.settings.llmEnabled, llm: this.llm, skipLlm: ctx.skipLlm === true });
+    const pipeline: PipelineInfo = { requested, used: "default", navigation: "default", narration: "template", notes: [], ...(pipe.reason ? { reason: pipe.reason } : {}) };
+    const activeInfo = this.advisories ? await this.advisories.active(when, { includePending: snap.settings.llmEnabled }) : [];
+    const effective = activeInfo.filter((a) => a.status === "approved");
 
     const all = await this.stations.list(ctx);
     const byId = new Map(all.map((s) => [s.id, s]));
@@ -114,7 +137,10 @@ export class NavigationAgent {
       const st = byId.get(id)!;
       if (st.inactive) throw new AppError("INVALID", inactiveMessage(st.name, { source: "ntd", ...(st.inactiveNote ? { note: st.inactiveNote } : {}) }));
     }
-    const avoid = (input.avoid ?? []).filter((id) => id !== originId && id !== destinationId);
+    const userAvoid = (input.avoid ?? []).filter((id) => id !== originId && id !== destinationId);
+    // Stasiun yang terganggu atau ditutup menurut informasi layanan yang disetujui admin dihindari sebagai titik transfer.
+    const advisoryAvoid = advisoryAvoidStations(effective).filter((id) => id !== originId && id !== destinationId && !userAvoid.includes(id));
+    const avoid = [...userAvoid, ...advisoryAvoid];
     const warnings: string[] = [];
 
     // 1. Rute dari dataset.
@@ -147,8 +173,10 @@ export class NavigationAgent {
       if (pick?.route) {
         route = pick.route;
         await assessAndStore(route);
-      } else {
+      } else if (transferStationIds(route).some((t) => userAvoid.includes(t))) {
         warnings.push("Rute tanpa stasiun yang ingin dihindari tidak ditemukan; ditampilkan rute dasar.");
+      } else {
+        warnings.push("Rute tanpa titik pindah yang terdampak gangguan layanan tidak ditemukan; ditampilkan rute dasar.");
       }
     }
 
@@ -249,7 +277,10 @@ export class NavigationAgent {
       if (r.fareComplete === false) w.push("Tarif sebagian ruas tidak tersedia di dataset, sehingga total tarif belum lengkap.");
       const noData = assessments.filter((a) => !a.dataAvailable).map((a) => byId.get(a.stationId)!.name);
       if (noData.length) w.push(`Data fasilitas belum tersedia untuk: ${noData.join(", ")}.`);
-      return { route: r, assessments, warnings: w, alternatives: altRoutes, summary: summarize(r, assessments, avoidModes) };
+      // Informasi layanan yang disetujui admin: mengurangi skor rute yang melewati stasiun/lini terdampak dan memberi peringatan.
+      const advisory = advisoryEffectOn(r, effective);
+      w.push(...advisory.notes);
+      return { route: r, assessments, warnings: w, alternatives: altRoutes, summary: summarize(r, assessments, avoidModes, advisory), advisory };
     };
 
     const evaluated: (Evaluated & { origin: RouteOption["origin"] })[] = [];
@@ -262,26 +293,152 @@ export class NavigationAgent {
         this.log.warn("pilihan rute dilewati", { error: (e as Error).message });
       }
     }
-    const picked = pickOptions(evaluated, when);
-    const primary = picked[0].e;
-
-    // Pengumuman aktif untuk stasiun, lini, dan hub pada rute.
-    const routeIds = routeStationIds(primary.route);
-    const lineIds = [...new Set(evaluated.flatMap((x) => x.route.legs.flatMap((l) => (l.lineId ? [l.lineId] : []))))];
-    const hubIds = [...new Set(evaluated.flatMap((x) => routeStationIds(x.route)).map((id) => byId.get(id)?.hubId).filter((x): x is string => !!x))];
-    const notices = snap.notices({ stationIds: [...new Set(evaluated.flatMap((x) => routeStationIds(x.route)))], lineIds, hubIds });
-    const common = [...warnings];
-    for (const n of notices) if (n.severity !== "info") common.push(noticeText(n));
-    if (ctx.staleSince) common.push("Sumber data sedang tidak dapat dihubungi; sebagian data diambil dari salinan tersimpan.");
-
-    // 5. Notifikasi: LLM bila aktif (pilihan utama saja), divalidasi Grounding Guard; cadangan template statis.
     const all2 = nameIndex(all);
-    const factsOf = (e: Evaluated): PlanFacts => ({ route: e.route, assessments: e.assessments, alternatives: e.alternatives, stations: details, knownStationNames: all2, notices });
-    const notification = await this.susunNotifikasi(factsOf(primary), lines, snap, ctx.skipLlm === true);
     const lineName = (id: string) => {
       const l = lines.find((x) => x.id === id);
       return l ? { name: l.name, operator: l.operator } : undefined;
     };
+    const nameOf = (id: string) => byId.get(id)?.name ?? evaluated.map((x) => x.route.stopNames?.[id]).find((x) => !!x) ?? id;
+    /** Pengumuman aktif untuk stasiun, lini, dan hub pada sekumpulan rute. */
+    const noticesFor = (rs: Route[]) => {
+      const stationIds = [...new Set(rs.flatMap((r) => routeStationIds(r)))];
+      const lineIds = [...new Set(rs.flatMap((r) => r.legs.flatMap((l) => (l.lineId ? [l.lineId] : []))))];
+      const hubIds = [...new Set(stationIds.map((id) => byId.get(id)?.hubId).filter((x): x is string => !!x))];
+      return snap.notices({ stationIds, lineIds, hubIds });
+    };
+    const factsFor = (e: Evaluated, ns: Notice[]): PlanFacts => ({ route: e.route, assessments: e.assessments, alternatives: e.alternatives, stations: details, knownStationNames: all2, notices: ns });
+
+    // Agent navigasi LLM (pipeline "llm"): memilih satu rute dari kandidat dan boleh meminta rute lain lewat planner.
+    // Pilihannya melewati pagar (checkChoice); bila gagal atau ditolak, pemilihan default dipakai.
+    let llmPick: { e: (typeof evaluated)[number]; reason?: string } | null = null;
+    if (pipe.use === "llm") {
+      const sig = (r: Route) => r.legs.map((l) => `${l.type}:${l.lineId ?? ""}:${l.stops[0]}>${l.stops[l.stops.length - 1]}`).join("|");
+      const overviewOf = (e: (typeof evaluated)[number], i: number, kinds: RouteOptionKind[]) => ({
+        indeks: i,
+        asal: e.origin,
+        jenisDefault: kinds,
+        moda: [...new Set(e.route.legs.filter((l) => l.type === "RIDE").map((l) => l.mode).filter((m): m is Mode => !!m))],
+        stasiun: routeStationIds(e.route).map(nameOf),
+        transfer: e.route.transfers,
+        menit: e.route.timeComplete ? e.route.totalMinutes : null,
+        tarif: e.route.totalFare,
+        skorAksesibilitas: e.summary.accessScore,
+        kebutuhanTakTerpenuhi: e.summary.unmetNeeds,
+        memakaiModaDihindari: e.summary.usesAvoidedModes,
+        dampakInfoLayanan: e.summary.advisoryImpact ?? "none",
+        peringatan: e.warnings.slice(0, 5),
+      });
+      const host: NavHost = {
+        plan: { asal: nameOf(originId), tujuan: nameOf(destinationId), kebutuhan: needs, hindariModa: avoidModes, berangkat: when.toISOString() },
+        overview: () => {
+          const kinds = new Map(pickOptions(evaluated, when).map((p) => [p.e, p.kinds] as const));
+          return evaluated.map((e, i) => overviewOf(e, i, kinds.get(e) ?? []));
+        },
+        detail: (i) => {
+          const e = evaluated[i];
+          return e ? { ...overviewOf(e, i, []), fakta: factsForPrompt(factsFor(e, noticesFor([e.route]))) } : null;
+        },
+        facility: async (id) => {
+          if (!byId.has(id)) throw new Error("stasiun tidak dikenal");
+          const r = await this.tools.call("cek_fasilitas", { stationId: id }, ctx, snap);
+          return { stasiun: nameOf(id), skor: r.assessment.score, memadai: r.assessment.adequate, dataTersedia: r.assessment.dataAvailable, fasilitas: r.facilities.amenities, catatan: r.assessment.notes ?? [] };
+        },
+        serviceInfo: (q) =>
+          activeInfo
+            .filter((a) => (!q.stationId && !q.lineId ? true : isRelevant(a, { stationIds: q.stationId ? [q.stationId] : [], lineIds: q.lineId ? [q.lineId] : [] })))
+            .slice(0, 20)
+            .map((a) => ({
+              id: a.id,
+              status: a.status === "approved" ? "disetujui" : "belum_diverifikasi",
+              kategori: a.category,
+              ...(a.status === "approved" ? { dampak: a.impact } : {}),
+              ringkasan: a.summary,
+              stasiun: a.stationIds.map(nameOf),
+              lini: a.lineIds,
+              sumber: `@${a.source.account}`,
+              berakhir: a.expiresAt,
+            })),
+        explore: async (c) => {
+          const modes = [...new Set([...avoidModes, ...((c.avoidModes ?? []) as Mode[])])];
+          const known = evaluated.map((x) => x.route);
+          let raw: Route | null;
+          if (c.viaStationId) {
+            if (!byId.has(c.viaStationId)) return { index: null, catatan: "Stasiun perantara tidak dikenal." };
+            raw = await this.tools.call("ambil_rute", { fromId: originId, toId: destinationId, viaId: c.viaStationId, at: input.at, avoidModes: modes, needs }, ctx, snap);
+          } else if (c.avoidStationIds?.length) {
+            const extra = c.avoidStationIds.filter((id) => id !== originId && id !== destinationId);
+            const vs = await this.tools.call("variasi_rute", { fromId: originId, toId: destinationId, avoidModes: modes, known, at: input.at, avoid: [...new Set([...avoid, ...extra])] }, ctx, snap);
+            raw = vs[0] ?? null;
+          } else {
+            raw = await this.tools.call("ambil_rute", { fromId: originId, toId: destinationId, at: input.at, avoidModes: modes, needs }, ctx, snap);
+          }
+          if (!raw) return { index: null, catatan: "Tidak ada rute dengan batasan itu." };
+          if (known.some((r) => sig(r) === sig(raw!))) return { index: null, catatan: "Rute itu sudah ada pada daftar kandidat." };
+          try {
+            const e = { ...(await evaluate(raw, [])), origin: "variasi" as const };
+            evaluated.push(e);
+            return { index: evaluated.length - 1, catatan: "Kandidat baru ditambahkan.", kandidat: overviewOf(e, evaluated.length - 1, []) };
+          } catch (err) {
+            return { index: null, catatan: `Rute baru gagal dinilai: ${(err as Error).message}` };
+          }
+        },
+        guardViews: (): GuardView[] => evaluated.map((e) => ({ unmetNeeds: e.summary.unmetNeeds, usesAvoidedModes: e.summary.usesAvoidedModes, advisoryImpact: e.summary.advisoryImpact ?? "none" })),
+      };
+      const out = await new LlmNavigator(this.llm!).decide(host);
+      if (out.ok) {
+        llmPick = { e: evaluated[out.index], ...(out.reason ? { reason: out.reason } : {}) };
+        pipeline.navigation = "llm";
+        pipeline.steps = out.steps;
+        pipeline.notes.push(...out.notes);
+      } else {
+        pipeline.notes.push(out.why);
+        this.log.warn("agent navigasi LLM tidak dipakai", { reason: out.why });
+      }
+    }
+
+    let picked = pickOptions(evaluated, when);
+    if (llmPick) {
+      const chosen = llmPick.e;
+      const hit = picked.findIndex((p) => p.e === chosen);
+      if (hit > 0) picked = [picked[hit], ...picked.filter((_, i) => i !== hit)];
+    }
+    const primary = picked[0].e;
+
+    const notices = noticesFor(evaluated.map((x) => x.route));
+    const common = [...warnings];
+    for (const n of notices) if (n.severity !== "info") common.push(noticeText(n));
+    if (ctx.staleSince) common.push("Sumber data sedang tidak dapat dihubungi; sebagian data diambil dari salinan tersimpan.");
+
+    // Informasi layanan operator yang relevan dengan salah satu rute: yang disetujui memengaruhi navigasi, yang belum
+    // diperiksa hanya tampil sebagai info.
+    const scope = {
+      stationIds: [...new Set(evaluated.flatMap((x) => routeStationIds(x.route)))],
+      lineIds: [...new Set(evaluated.flatMap((x) => x.route.legs.flatMap((l) => [l.lineId, ...(l.options ?? []).map((o) => o.lineId)]).filter((x): x is string => !!x)))],
+      operators: [...new Set(evaluated.flatMap((x) => x.route.legs.map((l) => l.operator)).filter((x): x is string => !!x))],
+    };
+    // Informasi yang disetujui dan membuat rute menghindari stasiunnya tetap ditampilkan walau tidak ada kandidat yang melewatinya lagi.
+    const relevantInfo: ServiceAdvisory[] = activeInfo.filter((a) => isRelevant(a, scope) || (a.status === "approved" && a.stationIds.some((id) => advisoryAvoid.includes(id))));
+    if (advisoryAvoid.length) common.push(`Rute menghindari titik pindah ${advisoryAvoid.map(nameOf).join(", ")} karena informasi layanan yang disetujui admin.`);
+    const serviceInfo = relevantInfo.map(toView);
+    // Hanya untuk narasi LLM: informasi layanan sebagai pengumuman berlabel jelas (disetujui vs belum diverifikasi).
+    const advisoryNotices: Notice[] =
+      pipe.use === "llm"
+        ? relevantInfo.map((a) => ({
+            id: a.id,
+            scope: "global",
+            severity: a.status === "approved" && a.impact !== "info" ? "warning" : "info",
+            title: a.status === "approved" ? "Info layanan (disetujui admin)" : "Info layanan (belum diverifikasi)",
+            message: a.summary,
+          }))
+        : [];
+
+    // 5. Notifikasi: LLM hanya pada pipeline "llm" (pilihan utama saja), divalidasi Grounding Guard; cadangan template statis.
+    const factsOf = (e: Evaluated): PlanFacts => factsFor(e, notices);
+    const notification = await this.susunNotifikasi(factsOf(primary), advisoryNotices, lines, pipe.use === "llm");
+    pipeline.narration = notification.source === "LLM" ? "llm" : "template";
+    pipeline.used = pipeline.navigation === "llm" || pipeline.narration === "llm" ? "llm" : "default";
+    if (pipeline.used === "llm" && this.llm) pipeline.model = this.llm.model;
+    if (requested === "llm" && pipeline.used === "default" && !pipeline.reason) pipeline.reason = "LLM tidak dapat dipakai untuk permintaan ini; memakai pipeline default.";
     const options: RouteOption[] = picked.map((p, i) => ({
       kinds: p.kinds,
       origin: p.e.origin,
@@ -291,6 +448,7 @@ export class NavigationAgent {
       summary: p.e.summary,
       notification: i === 0 ? notification : this.guard.fallback(factsOf(p.e), lineName),
       alternatives: p.e.alternatives,
+      ...(llmPick && p.e === llmPick.e ? { pickedBy: "llm" as const, ...(llmPick.reason ? { llmReason: llmPick.reason } : {}) } : {}),
     }));
 
     return {
@@ -310,23 +468,30 @@ export class NavigationAgent {
       departAt: when.toISOString(),
       departMode: input.at ? "at" : "now",
       options,
+      pipeline,
+      serviceInfo,
     };
   }
 
-  private async susunNotifikasi(facts: PlanFacts, lines: Line[], snap: ContentSnapshot, skipLlm: boolean): Promise<Notification> {
+  /**
+   * Notifikasi ringkasan rute. `useLlm` hanya true pada pipeline "llm" (mode LLM menyala dan klien ada); pipeline default
+   * selalu memakai template. `extraNotices` (informasi layanan) hanya dikirim ke LLM, divalidasi bersama fakta lainnya.
+   */
+  private async susunNotifikasi(facts: PlanFacts, extraNotices: Notice[], lines: Line[], useLlm: boolean): Promise<Notification> {
     const lineName = (id: string) => {
       const l = lines.find((x) => x.id === id);
       return l ? { name: l.name, operator: l.operator } : undefined;
     };
     const template = () => this.guard.fallback(facts, lineName);
-    if (!this.llm || !snap.settings.llmEnabled || skipLlm) return template();
+    if (!this.llm || !useLlm) return template();
+    const llmFacts: PlanFacts = { ...facts, notices: [...facts.notices, ...extraNotices] };
     try {
       const text = await this.llm.complete({
         system: SYSTEM_PROMPT,
-        prompt: `Data hasil tool (JSON):\n${JSON.stringify(factsForPrompt(facts))}\n\nSusun notifikasi ringkasan rute.`,
+        prompt: `Data hasil tool (JSON):\n${JSON.stringify(factsForPrompt(llmFacts))}\n\nSusun notifikasi ringkasan rute.`,
         maxTokens: 2000,
       });
-      const check = this.guard.validate(text, facts);
+      const check = this.guard.validate(text, llmFacts);
       if (check.ok) return { text, source: "LLM", grounded: true };
       this.log.warn("notifikasi LLM gagal validasi grounding; memakai template", { reasons: check.reasons });
     } catch (e) {
@@ -501,9 +666,9 @@ function comparableMinutes(r: Route): number {
  * stasiun naik/turun bila tanpa pindah) dan separuh rata-rata stasiun naik, turun, dan pindah; dikurangi 12 per fasilitas
  * yang dibutuhkan tetapi tidak ada/rusak (5 bila datanya belum ada), 4 per kendala jalur (menyeberang, celah bertangga,
  * JPO tanpa lift), 3 per pindah, dan 2 per jalan kaki antarstasiun. Rute yang tetap memakai moda yang dihindari
- * dikurangi 40.
+ * dikurangi 40; rute yang terdampak informasi layanan yang disetujui admin dikurangi 8 (delay), 30 (gangguan), atau 60 (penutupan).
  */
-export function summarize(r: Route, assessments: StationAssessment[], avoidModes: readonly Mode[]): RouteOptionSummary {
+export function summarize(r: Route, assessments: StationAssessment[], avoidModes: readonly Mode[], advisory: AdvisoryEffect = NO_EFFECT): RouteOptionSummary {
   const byId = new Map(assessments.map((a) => [a.stationId, a]));
   const rides = r.legs.filter((l) => l.type === "RIDE");
   const endIds = new Set<string>();
@@ -527,7 +692,7 @@ export function summarize(r: Route, assessments: StationAssessment[], avoidModes
     assessments.filter((a) => a.journey && (a.journey.via === "sebidang" || a.journey.via === "crosswalk" || (!a.journey.level && a.journey.lift !== "available" && a.journey.pathLift !== "available"))).length +
     rides.filter((l) => l.boardAt?.gap?.level === "tangga").length;
   const usesAvoided = usesModes(r, avoidModes);
-  const rankScore = Math.round(0.5 * weakest + 0.5 * avg - unmetPoints - 4 * obstacles - 3 * r.transfers - 2 * walks - (usesAvoided ? 40 : 0));
+  const rankScore = Math.round(0.5 * weakest + 0.5 * avg - unmetPoints - 4 * obstacles - 3 * r.transfers - 2 * walks - (usesAvoided ? 40 : 0) - advisory.penalty);
   const accessScore = Math.max(0, Math.min(100, rankScore));
   const first = rides[0];
   const last = rides[rides.length - 1];
@@ -541,6 +706,7 @@ export function summarize(r: Route, assessments: StationAssessment[], avoidModes
     transfers: r.transfers,
     unmetNeeds,
     usesAvoidedModes: usesAvoided,
+    ...(advisory.impact !== "none" ? { advisoryImpact: advisory.impact, advisoryIds: advisory.ids } : {}),
   };
 }
 

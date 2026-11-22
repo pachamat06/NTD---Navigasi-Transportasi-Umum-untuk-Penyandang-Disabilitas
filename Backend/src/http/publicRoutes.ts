@@ -3,8 +3,10 @@
 import { Router } from "express";
 import { z } from "zod";
 import { ATTRIBUTION } from "../ai/GroundingGuard";
+import { llmAvailability } from "../ai/pipeline";
 import { AMENITY_LABEL } from "../domain/FacilityAnalysisService";
 import { TRANSFER_NEEDS } from "../domain/models";
+import { isRelevant, toView } from "../domain/serviceAdvisory";
 import { AppError } from "../errors";
 import type { Services } from "../services";
 import { ok, parse } from "./middleware";
@@ -22,6 +24,11 @@ export const planSchema = z.object({
   /** Pintu masuk di stasiun asal dan pintu keluar di stasiun tujuan (id dari `entrances` detail stasiun). */
   entranceId: z.string().trim().min(1).max(200).optional(),
   exitId: z.string().trim().min(1).max(200).optional(),
+  /**
+   * Pipeline: "default" (bawaan, tanpa LLM) atau "llm" (agent navigasi LLM + narasi LLM). "llm" hanya berlaku bila mode LLM
+   * menyala (lihat `llm` pada /api/meta); selain itu permintaan turun ke default dan alasannya ada di `pipeline.reason`.
+   */
+  pipeline: z.enum(["default", "llm"]).optional(),
   /**
    * Waktu berangkat (ISO 8601, mis. "2026-11-10T08:00:00+07:00"). Kosong = sekarang. Rute tercepat, jam berangkat/tiba,
    * waktu tunggu, frekuensi, dan pengumuman dihitung pada waktu ini. Paling awal 1 hari lalu, paling lambat 90 hari lagi.
@@ -51,7 +58,23 @@ export function publicRoutes(s: Services): Router {
       amenityLabels: AMENITY_LABEL,
       dataSource: s.commute.sourceName,
       preview: req.ctx.preview,
+      // Pilihan pipeline untuk pengguna: "llm" hanya ada bila admin menyalakan mode LLM dan klien LLM tersedia.
+      llm: llmAvailability(snap.settings.llmEnabled, s.llm),
     });
+  });
+
+  // Informasi layanan operator (dari akun X atau input admin) yang boleh dilihat pengguna: yang disetujui admin (memengaruhi
+  // navigasi) dan, selama mode LLM menyala, yang belum diverifikasi (info saja). Teks asli postingan tidak ikut.
+  r.get("/service-info", async (req, res) => {
+    const q = parse(z.object({ stationId: stationId.optional(), lineId: z.string().max(80).optional(), hubId: z.string().max(80).optional() }), req.query);
+    const snap = await s.content.snapshot(req.ctx);
+    const active = await s.advisories.active(req.ctx.now, { includePending: snap.settings.llmEnabled });
+    let items = active;
+    if (q.stationId || q.lineId || q.hubId) {
+      const hubMembers = q.hubId ? ((await s.stations.hubs(req.ctx)).find((h) => h.id === q.hubId)?.memberIds ?? []) : [];
+      items = active.filter((a) => isRelevant(a, { stationIds: [...(q.stationId ? [q.stationId] : []), ...hubMembers], lineIds: q.lineId ? [q.lineId] : [] }));
+    }
+    ok(res, items.map(toView));
   });
 
   // Pencarian stasiun untuk autocomplete: langsung ke StationService tanpa agen.

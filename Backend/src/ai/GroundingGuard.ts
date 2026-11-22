@@ -94,6 +94,8 @@ export class GroundingGuard {
       }
     }
     for (const s of f.stations.values()) for (const c of s.codes) nums.add(c.replace(/\D/g, ""));
+    // Angka pada pengumuman dan informasi layanan yang ikut dikirim ke LLM adalah fakta yang sah untuk disebut.
+    for (const n of f.notices) for (const m of `${n.title} ${n.message}`.matchAll(/\d+(?:[.,]\d+)*/g)) nums.add(m[0]);
     return nums;
   }
 

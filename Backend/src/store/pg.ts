@@ -10,7 +10,11 @@ import type {
   ContentItem,
   ContentKind,
   ContentRepository,
+  NewServiceAdvisory,
   ServerConfigRepository,
+  ServiceAdvisory,
+  ServiceAdvisoryPatch,
+  ServiceAdvisoryRepository,
   Store,
   TestCase,
   TestRepository,
@@ -96,6 +100,18 @@ function rowToRun(r: QueryResultRow): TestRun {
     results: r.results,
     triggeredBy: r.triggered_by,
   };
+}
+
+const advisoryKey = (a: Pick<ServiceAdvisory, "source">) => (a.source.postId ? `${a.source.type}:${a.source.account.toLowerCase()}:${a.source.postId}` : null);
+
+/** Kolom `data` memuat semua isian selain id, status, kedaluwarsa, dan stempel waktu. */
+function advisoryData(a: Omit<ServiceAdvisory, "id" | "status" | "createdAt" | "updatedAt" | "expiresAt">) {
+  const { source, operator, category, impact, summary, stationIds, lineIds, validFrom, extraction, reviewedBy, reviewedAt, reviewNote } = a;
+  return { source, operator, category, impact, summary, stationIds, lineIds, validFrom, extraction, reviewedBy, reviewedAt, reviewNote };
+}
+
+function rowToAdvisory(r: QueryResultRow): ServiceAdvisory {
+  return { ...r.data, id: r.id, status: r.status, expiresAt: new Date(r.expires_at).toISOString(), createdAt: r.created_at, updatedAt: r.updated_at };
 }
 
 export function createPgStore(pool: Pool): Store {
@@ -294,6 +310,43 @@ export function createPgStore(pool: Pool): Store {
     },
   };
 
+  const advisories: ServiceAdvisoryRepository = {
+    async list(filter = {}) {
+      const where: string[] = [];
+      const params: unknown[] = [];
+      if (filter.status) where.push(`status = $${params.push(filter.status)}`);
+      if (filter.activeAt) {
+        where.push(`status <> 'rejected'`);
+        where.push(`expires_at > $${params.push(filter.activeAt)}`);
+      }
+      const limit = params.push(filter.limit ?? 500);
+      const rows = await q(`SELECT * FROM service_advisories ${where.length ? `WHERE ${where.join(" AND ")}` : ""} ORDER BY posted_at DESC, created_at DESC LIMIT $${limit}`, params);
+      return rows.map(rowToAdvisory);
+    },
+    async get(id) {
+      const [r] = await q("SELECT * FROM service_advisories WHERE id = $1", [id]);
+      return r ? rowToAdvisory(r) : null;
+    },
+    async findBySource(type, account, postId) {
+      const [r] = await q("SELECT * FROM service_advisories WHERE source_key = $1", [`${type}:${account.toLowerCase()}:${postId}`]);
+      return r ? rowToAdvisory(r) : null;
+    },
+    async create(a: NewServiceAdvisory) {
+      const [r] = await q(
+        `INSERT INTO service_advisories (id, status, source_key, posted_at, expires_at, data) VALUES ($1, $2, $3, $4, $5, $6) RETURNING *`,
+        [randomUUID(), a.status, advisoryKey(a), a.source.postedAt, a.expiresAt, json(advisoryData(a))],
+      );
+      return rowToAdvisory(r);
+    },
+    async update(id, patch: ServiceAdvisoryPatch) {
+      const cur = await advisories.get(id);
+      if (!cur) return null;
+      const next = { ...cur, ...patch };
+      const [r] = await q(`UPDATE service_advisories SET status = $2, expires_at = $3, data = $4, updated_at = now() WHERE id = $1 RETURNING *`, [id, next.status, next.expiresAt, json(advisoryData(next))]);
+      return rowToAdvisory(r);
+    },
+  };
+
   return {
     kind: "postgres",
     cache,
@@ -302,6 +355,7 @@ export function createPgStore(pool: Pool): Store {
     tests,
     audit,
     serverConfig,
+    advisories,
     ping: async () => {
       try {
         await q("SELECT 1");

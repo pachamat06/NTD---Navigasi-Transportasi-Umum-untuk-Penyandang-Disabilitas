@@ -2,7 +2,7 @@
 
 API perencanaan perjalanan aksesibel untuk NTD (Navigasi Transportasi Umum untuk Penyandang Disabilitas), mengikuti rancangan Bab III laporan RPL Kelompok 11.
 
-Stack: Node.js 22+, Express 5, TypeScript, PostgreSQL 16, zod. LLM opsional (Claude atau GPT) hanya untuk menyusun kalimat notifikasi.
+Stack: Node.js 22+, Express 5, TypeScript, PostgreSQL 16, zod. LLM opsional (Claude atau GPT), dipakai dua agent pada mode LLM: agent navigasi dan agent pembaca informasi layanan akun X operator (lihat [Mode LLM dengan dua agent](#mode-llm-dengan-dua-agent)).
 
 ## Menjalankan
 
@@ -34,7 +34,8 @@ Semua variabel lingkungan terdokumentasi di [.env.example](.env.example).
 | Lapisan rancangan | Implementasi |
 | --- | --- |
 | REST Controller / PlanController | `src/http/publicRoutes.ts`, `src/app.ts` |
-| Agen Navigasi (Planner) | `src/ai/NavigationAgent.ts`: pipeline tool deterministik, satu panggilan LLM untuk narasi |
+| Agen Navigasi (Planner) | `src/ai/NavigationAgent.ts`: pipeline tool deterministik (default, tanpa LLM). Pipeline LLM (opsional, `pipeline: "llm"`): `src/ai/LlmNavigator.ts` memilih rute lewat tool-calling, ditambah satu panggilan LLM untuk narasi |
+| Agen Pembaca | `src/ai/reader/`: membaca akun X operator, mengekstrak informasi layanan, antrean persetujuan admin (`src/domain/serviceAdvisory.ts`) |
 | Tool Registry | `src/ai/ToolRegistry.ts`: `cari_stasiun`, `ambil_rute`, `cek_fasilitas`, `cari_alternatif` |
 | Layanan domain | `src/domain/StationService.ts`, `RoutePlannerService.ts`, `FacilityAnalysisService.ts`, `AlternativeService.ts` |
 | Grounding Guard | `src/ai/GroundingGuard.ts`: cek nama stasiun, angka, dan klaim fasilitas; gagal berarti template statis. Disclaimer ditambahkan sistem |
@@ -82,14 +83,15 @@ Respons sukses `{"status":"ok","data":...}`; gagal `{"status":"error","code","me
 | Method | Path | Keterangan |
 | --- | --- | --- |
 | GET | `/health` | Cek hidup |
-| GET | `/api/meta` | Disclaimer, atribusi, bobot skor, label fasilitas, sumber data |
+| GET | `/api/meta` | Disclaimer, atribusi, bobot skor, label fasilitas, sumber data, dan `llm` (`available`, `pipelines`, `defaultPipeline`, `reason?`): pilihan pipeline LLM hanya ada bila admin menyalakan mode LLM dan klien LLM tersedia |
+| GET | `/api/service-info?stationId=&lineId=&hubId=` | Informasi layanan operator yang boleh dilihat pengguna: yang disetujui admin dan, selama mode LLM menyala, yang belum diverifikasi (`status: "pending"`, info saja) |
 | GET | `/api/stations?q=&limit=` | Daftar stasiun, atau pencarian untuk autocomplete |
 | GET | `/api/stations/:id` | Detail stasiun: fasilitas tergabung, skor, peron (`platforms`), pintu akses, info, pengumuman |
 | GET | `/api/network` | Data awal GUI: semua stasiun (fasilitas + skor, `commuteIds` untuk posisi peta), lini, hub, dan `map` (posisi stop dan bentuk jalur dari admin) |
 | GET | `/api/map` | Posisi stop dan bentuk jalur dari admin saja |
 | GET | `/api/lines`, `/api/hubs` | Lini dan hub antarmoda |
 | GET | `/api/notices?stationId=&lineId=&hubId=` | Pengumuman aktif |
-| POST | `/api/plan` | Rencana perjalanan (UC-01). Body `{originId, destinationId, viaStationId?, avoid?, avoidModes?, needs?, at?}`; `avoidModes` berisi moda yang dihindari (`RAIL`, `SUBWAY`, `TRAM`, `BUS`, `MONORAIL`); `needs` berisi fasilitas yang wajib ada saat pindah (`lift`, `eskalator`, `ramp`) |
+| POST | `/api/plan` | Rencana perjalanan (UC-01). Body `{originId, destinationId, viaStationId?, avoid?, avoidModes?, needs?, at?, pipeline?}`; `avoidModes` berisi moda yang dihindari (`RAIL`, `SUBWAY`, `TRAM`, `BUS`, `MONORAIL`); `needs` berisi fasilitas yang wajib ada saat pindah (`lift`, `eskalator`, `ramp`); `pipeline` = `default` (bawaan) atau `llm` |
 
 Dengan `avoidModes`, bila rute dataset memakai moda yang dihindari, backend mencari rute sendiri di atas urutan stasiun lini yang diizinkan (`/lines`, termasuk cabang) dan perpindahan di hub, lalu meminta `/fares` untuk tiap ruas naik agar tarif dan jadwalnya tetap dari dataset. Ruas yang tarifnya tidak tersedia disusun dari urutan stasiun lini (tarif 0, waktu kosong) dan diberi peringatan. Bila tidak ada rute yang lolos, rute dataset tetap ditampilkan dengan peringatan.
 
@@ -99,7 +101,27 @@ Rute dilengkapi dari Commute: jarak, petunjuk, dan pintu keluar jalan kaki saat 
 
 Ruas naik memuat `platform` (nomor peron dari /fares) dan `boardAt` (peron beserta fasilitas dan celahnya) bila peron dapat dipastikan. Pengecekan `needs` memakai fasilitas peron tempat naik/turun bila tim sudah mengisinya, dan peringatan ditambahkan bila naik kendaraan perlu menaiki anak tangga.
 
-`POST /api/plan` mengembalikan rute (bentuk sama dengan `Frontend/src/lib/types.ts`), penilaian fasilitas tiap stasiun transit, hingga 3 alternatif via stasiun lain di hub yang sama, pengumuman terkait, narasi notifikasi, peringatan (mis. data dari cache), disclaimer, dan atribusi.
+`POST /api/plan` mengembalikan rute (bentuk sama dengan `Frontend/src/lib/types.ts`), penilaian fasilitas tiap stasiun transit, hingga 3 alternatif via stasiun lain di hub yang sama, pengumuman terkait, narasi notifikasi, peringatan (mis. data dari cache), disclaimer, dan atribusi. Tambahan: `pipeline` (diminta dan dipakai) dan `serviceInfo` (informasi layanan operator yang relevan dengan rute).
+
+### Mode LLM dengan dua agent
+
+Rancangan lengkap: [`docs/rancangan-dua-agent-llm.md`](../docs/rancangan-dua-agent-llm.md).
+
+- **Sakelar admin**: `llmEnabled` pada `/settings` (draft, lalu `/publish`). Mati = tidak ada pemakaian LLM sama sekali (agent navigasi, narasi, dan pembacaan X). Menyala + klien LLM ada = pengguna boleh memilih `pipeline: "llm"`.
+- **Pipeline default** (bawaan, tanpa LLM): algoritma deterministik dan notifikasi template. Pipeline **LLM**: agent navigasi memilih satu rute dari kandidat planner lewat tool-calling (`lihat_pilihan_rute`, `detail_rute`, `cek_fasilitas`, `info_layanan`, `cari_rute_baru`, `pilih_rute`), pilihannya melewati pagar (`checkChoice`), lalu LLM menyusun narasi yang divalidasi Grounding Guard. Bila LLM mati atau gagal, permintaan turun ke default (`pipeline.reason` / `pipeline.notes`).
+- **Agent pembaca** membaca postingan akun operator (X API resmi, berbayar per postingan; atau fixture; atau teks yang ditempel admin lewat `/service-info/ingest`), mengekstrak informasi layanan dengan LLM, dan mengantre sebagai `pending`. Informasi `pending` hanya tampil sebagai info (`serviceInfo`, `/api/service-info`) dan **tidak mengubah navigasi**. Setelah admin menyetujui (`/service-info/:id/approve`), rute yang melewati stasiun/lini terdampak dikurangi skornya (delay 8, gangguan 30, penutupan 60), stasiun terganggu dihindari sebagai titik pindah, dan peringatan ditambahkan, sampai `expiresAt`.
+- **X API**: `SERVICE_INFO_SOURCE=x` + `X_API_BEARER_TOKEN`. Harga (per 22 November 2026): baca postingan US$0,005 dan baca pengguna US$0,010 per sumber daya yang dikembalikan, tanpa tier gratis; hanya postingan baru (`since_id`) yang ditagih. Pembacaan bawaan **mati**; admin mengaktifkannya, mengisi akun, dan menetapkan anggaran bulanan di `/ai/reader`.
+
+Endpoint admin tambahan (peran admin kecuali ditandai):
+
+| Method | Path | Keterangan |
+| --- | --- | --- |
+| GET | `/ai/status` | Mode LLM (terbit dan draft), klien, ketersediaan, status pembaca, jumlah informasi pending |
+| GET, PUT | `/ai/reader` | Konfigurasi pembaca (akun, interval, anggaran, saring kata kunci) dan status; PUT hanya admin |
+| GET | `/service-info?status=&limit=` | Antrean informasi layanan (editor boleh melihat) |
+| GET, PATCH | `/service-info/:id` | Detail (termasuk teks asli postingan); ubah isian selama `pending` (editor boleh) |
+| POST | `/service-info/:id/approve` · `/reject` · `/expire` | Setujui (dengan perubahan opsional; dampak selain `info` wajib punya stasiun/lini), tolak, atau akhiri lebih awal (hanya admin) |
+| POST | `/service-info/ingest` · `/service-info/poll` | Tempel postingan manual; baca akun sekarang (hanya admin, dibatasi laju) |
 
 ### Admin (`/api/admin`, Bearer token)
 
@@ -155,6 +177,7 @@ Halaman stasiun di admin punya "Isi otomatis dari gambar denah": foto papan dena
 - Set `NODE_ENV=production`, `DATABASE_URL` (pakai `?sslmode=require` untuk TLS), `ADMIN_TOKEN_SECRET` (min. 32 karakter, `openssl rand -hex 32`), `CORS_ORIGINS`, dan `ADMIN_ORIGINS`.
 - Isi `ADMIN_BOOTSTRAP_EMAIL/PASSWORD` sekali untuk membuat admin pertama, lalu hapus.
 - `npm run build && npm start`. Migrasi berjalan otomatis saat start (dikunci dengan advisory lock).
-- Tanpa `LLM_API_KEY`, notifikasi memakai template statis. Model Claude bawaan `claude-opus-5-5`; ganti lewat `LLM_MODEL`.
+- Tanpa `LLM_API_KEY`, notifikasi memakai template statis dan pilihan pipeline LLM tidak tersedia. Model Claude bawaan `claude-opus-5-5`; ganti lewat `LLM_MODEL`.
+- Pembacaan akun X (`SERVICE_INFO_SOURCE=x`) berjalan di satu instance saja (penjadwal dalam proses). Jangan menyalakannya di lebih dari satu replika.
 
 Catatan: perbaikan npm workspaces di root (`Backend`/`Frontend`) ada di patch Fase 0.

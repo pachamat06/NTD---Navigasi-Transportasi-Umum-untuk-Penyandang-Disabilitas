@@ -17,6 +17,9 @@ import { applyHubs } from "../domain/hubs";
 import type { DefaultPattern } from "../domain/routePatterns";
 import type { SyncSource } from "../domain/routeSync";
 import { buildSuggestions, FLOOR_PLAN_JSON_SCHEMA, FLOOR_PLAN_SYSTEM, floorPlanPrompt, MAX_IMAGES, parseFloorPlan, sniffImage, type FloorPlanResult } from "../ai/vision/floorPlan";
+import { llmAvailability } from "../ai/pipeline";
+import { readerConfigInput, X_PRICE_USD } from "../ai/reader/ReaderConfig";
+import { advisoryEditSchema, advisoryIngestSchema } from "../domain/serviceAdvisory";
 import { VisionError } from "../ai/vision/VisionClient";
 import { visionSettingsInput } from "../ai/vision/VisionService";
 import { ok, parse, rateLimit, requireAdmin } from "./middleware";
@@ -296,6 +299,114 @@ export function adminRoutes(s: Services): Router {
     const { apiKey, ...rest } = body;
     await audit(req, "ai.vision.update", null, { ...rest, apiKey: apiKey ? "(diganti)" : undefined });
     ok(res, view);
+  });
+
+  // ---------- Mode LLM dengan dua agent: status, pembaca akun X, dan antrean persetujuan informasi layanan ----------
+  // Sakelar mode LLM = `llmEnabled` pada /settings (draft, lalu /publish). Agent navigasi dipilih pengguna lewat `pipeline`
+  // pada /api/plan; agent pembaca membaca akun operator dan mengisi antrean `service-info` (status pending). Hanya yang
+  // disetujui di sini yang mengubah navigasi.
+  const readerView = async () => {
+    const [config, state, problem] = await Promise.all([s.readerConfig.get(), s.readerConfig.state(), s.reader.problem()]);
+    return {
+      config,
+      source: { kind: s.postSource?.kind ?? "none", configured: !!s.postSource },
+      problem,
+      usage: { month: state.usage.month, posts: state.usage.posts, users: state.usage.users, budget: config.monthlyPostBudget, approxCostUsd: Math.round((state.usage.posts * X_PRICE_USD.post + state.usage.users * X_PRICE_USD.user) * 1000) / 1000 },
+      prices: X_PRICE_USD,
+      lastPoll: state.lastPoll,
+    };
+  };
+
+  r.get("/ai/status", async (_req, res) => {
+    const published = (await s.content.snapshot(newContext())).settings.llmEnabled;
+    const draft = ((await s.store.content.get(SETTINGS_ID))?.draft as Partial<Settings> | null | undefined)?.llmEnabled ?? null;
+    ok(res, {
+      llm: {
+        enabled: published,
+        /** Nilai pada draft pengaturan yang belum dipublikasikan (null = tidak ada perubahan). */
+        draftEnabled: draft,
+        client: s.llm ? { provider: s.llm.name, model: s.llm.model, toolCalling: typeof s.llm.runTools === "function" } : null,
+        availability: llmAvailability(published, s.llm),
+      },
+      reader: await readerView(),
+      pendingAdvisories: (await s.advisories.list({ status: "pending", limit: 500 })).length,
+    });
+  });
+
+  r.get("/ai/reader", async (_req, res) => ok(res, await readerView()));
+
+  r.put("/ai/reader", requireAdmin("admin"), async (req, res) => {
+    const body = parse(readerConfigInput, req.body ?? {});
+    await s.readerConfig.update(body, actor(req));
+    await audit(req, "ai.reader.update", null, body);
+    ok(res, await readerView());
+  });
+
+  /** Stasiun dan lini pada isian informasi layanan harus dikenal sistem. */
+  const checkAdvisoryScope = async (patch: { stationIds?: string[]; lineIds?: string[] }) => {
+    const ctx = newContext({ preview: true });
+    const [stations, lines] = await Promise.all([s.stations.list(ctx), s.stations.lines(ctx)]);
+    const badStations = (patch.stationIds ?? []).filter((id) => !stations.some((x) => x.id === id));
+    const badLines = (patch.lineIds ?? []).filter((id) => !lines.some((x) => x.id === id));
+    if (badStations.length) throw new AppError("INVALID", `stationIds tidak dikenal: ${badStations.join(", ")}.`);
+    if (badLines.length) throw new AppError("INVALID", `lineIds tidak dikenal: ${badLines.join(", ")}.`);
+  };
+
+  r.get("/service-info", async (req, res) => {
+    const q = parse(z.object({ status: z.enum(["pending", "approved", "rejected"]).optional(), limit: z.coerce.number().int().min(1).max(500).default(100) }), req.query);
+    ok(res, await s.advisories.list(q));
+  });
+
+  // Tempel postingan operator secara manual (mis. bila akses X belum ada). Memakai LLM bila tersedia; hasilnya `pending`.
+  const ingestLimiter = rateLimit({ windowMs: 10 * 60_000, max: 30 });
+  r.post("/service-info/ingest", requireAdmin("admin"), ingestLimiter, async (req, res) => {
+    const body = parse(advisoryIngestSchema, req.body ?? {});
+    const a = await s.reader.ingest(body);
+    await audit(req, "service_info.ingest", a.id, { account: a.source.account, by: a.extraction.by });
+    ok(res, a, 201);
+  });
+
+  // Jalankan pembacaan akun operator sekarang (di luar jadwal).
+  const pollLimiter = rateLimit({ windowMs: 60_000, max: 6 });
+  r.post("/service-info/poll", requireAdmin("admin"), pollLimiter, async (req, res) => {
+    const report = await s.reader.poll(`admin:${actor(req)}`);
+    await audit(req, "service_info.poll", null, { skipped: report.skipped, fetched: report.fetched, created: report.created, errors: report.errors.length });
+    ok(res, report);
+  });
+
+  r.get("/service-info/:id", async (req, res) => ok(res, await s.advisories.get(parse(idParam, req.params.id))));
+
+  r.patch("/service-info/:id", async (req, res) => {
+    const id = parse(idParam, req.params.id);
+    const body = parse(advisoryEditSchema, req.body ?? {});
+    await checkAdvisoryScope(body);
+    const a = await s.advisories.edit(id, body, actor(req));
+    await audit(req, "service_info.edit", id, body);
+    ok(res, a);
+  });
+
+  r.post("/service-info/:id/approve", requireAdmin("admin"), async (req, res) => {
+    const id = parse(idParam, req.params.id);
+    const body = parse(advisoryEditSchema, req.body ?? {});
+    await checkAdvisoryScope(body);
+    const a = await s.advisories.approve(id, body, actor(req));
+    await audit(req, "service_info.approve", id, { impact: a.impact, stationIds: a.stationIds, lineIds: a.lineIds, expiresAt: a.expiresAt });
+    ok(res, a);
+  });
+
+  r.post("/service-info/:id/reject", requireAdmin("admin"), async (req, res) => {
+    const id = parse(idParam, req.params.id);
+    const { note } = parse(z.object({ note: z.string().trim().max(300).optional() }), req.body ?? {});
+    const a = await s.advisories.reject(id, note, actor(req));
+    await audit(req, "service_info.reject", id, { note });
+    ok(res, a);
+  });
+
+  r.post("/service-info/:id/expire", requireAdmin("admin"), async (req, res) => {
+    const id = parse(idParam, req.params.id);
+    const a = await s.advisories.expire(id, actor(req));
+    await audit(req, "service_info.expire", id);
+    ok(res, a);
   });
 
   // ---------- Konten (fasilitas, pintu akses, pengumuman, info stasiun) ----------
