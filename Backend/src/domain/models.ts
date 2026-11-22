@@ -125,6 +125,36 @@ export interface Hub {
   source?: "commute" | "ntd" | "admin";
 }
 
+/**
+ * Tautan transfer antar dua stasiun/halte di luar hub (mis. halte BRT Matraman Baru dengan Stasiun Matraman): bisa dipakai
+ * pindah dengan berjalan kaki. Sumbernya: bawaan NTD (CURATED_LINKS) dan isian admin (jenis konten "station_link").
+ */
+export interface StationLink {
+  /** Kunci pasangan stasiun (urutan tidak berpengaruh), lihat `linkKey`. */
+  id: string;
+  fromId: string;
+  toId: string;
+  /** true = hanya bisa dari `fromId` ke `toId`; bawaan dua arah. */
+  oneWay?: boolean;
+  /** Jarak jalan kaki (m); null = pakai jarak garis lurus antar koordinat stasiun. */
+  distanceM: number | null;
+  minutes: number | null;
+  /** Akses yang tersedia di jalan itu (boleh lebih dari satu); kosong = belum diketahui. */
+  access: SegmentMeans[];
+  /** Jalur khusus pengguna disabilitas. */
+  dedicated?: boolean;
+  note?: string;
+  /** "ntd" = bawaan NTD, "admin" = diisi/dikonfirmasi admin. */
+  source: "ntd" | "admin";
+}
+
+/** Keterangan tautan pada ruas pindah rute. */
+export interface LegLink {
+  access: SegmentMeans[];
+  dedicated?: boolean;
+  source: "ntd" | "admin";
+}
+
 /** Fasilitas yang dibutuhkan pengguna saat pindah (mis. pengguna kursi roda butuh lift). */
 export const TRANSFER_NEEDS = ["lift", "eskalator", "ramp"] as const;
 export type TransferNeed = (typeof TRANSFER_NEEDS)[number];
@@ -159,6 +189,11 @@ export interface TransferAccess {
   platform?: string;
   /** Kebutuhan eskalator dianggap terpenuhi oleh lift di titik ini (`status` dan `platform` adalah milik lift). */
   substitute?: "lift";
+  /**
+   * Pemeriksaan ini untuk jalan kaki antara dua stasiun lewat tautan transfer (bukan untuk sebuah stasiun):
+   * `stationId` = stasiun asal jalan itu, `means` = akses yang tercatat pada tautan (kosong = belum diisi).
+   */
+  link?: { toId: string; means: SegmentMeans[] };
   /**
    * Lift/eskalator tidak dibutuhkan karena peron ini dicapai dari gate tanpa anak tangga (jalur yang dipakai di sini).
    * `status` tetap diisi apa adanya.
@@ -327,6 +362,8 @@ export interface RouteLeg {
   toExit?: ExitRef;
   /** Ruas pindah: status fasilitas yang dibutuhkan pengguna di kedua ujung. */
   access?: TransferAccess[];
+  /** Ruas pindah antarstasiun lewat tautan transfer di luar hub: akses yang tersedia di jalan itu. */
+  link?: LegLink;
 }
 
 export interface Route {

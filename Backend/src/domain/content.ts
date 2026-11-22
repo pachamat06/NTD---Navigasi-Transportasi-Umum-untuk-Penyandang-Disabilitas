@@ -265,6 +265,34 @@ export const hubSchema = z
 
 export type HubContent = z.infer<typeof hubSchema> & { id: string };
 
+/**
+ * Tautan transfer antar dua stasiun/halte di luar hub (satu isian per pasangan stasiun, urutan tidak berpengaruh): bisa
+ * dipakai pindah dengan berjalan kaki, mis. halte BRT Matraman Baru dengan Stasiun Matraman. `access` = akses yang tersedia
+ * di jalan itu (tangga, eskalator, lift, ramp, datar; boleh lebih dari satu), kosong = belum diketahui. Isian dengan pasangan
+ * yang sama menggantikan tautan bawaan NTD; `disabled` menghapus tautan bawaan yang keliru.
+ */
+export const stationLinkSchema = z
+  .object({
+    fromId: z.string().min(1).max(80),
+    toId: z.string().min(1).max(80),
+    /** true = hanya dari `fromId` ke `toId`; bawaan dua arah. */
+    oneWay: z.boolean().optional(),
+    distanceM: z.number().min(0).max(3000).nullable().optional(),
+    minutes: z.number().min(0).max(60).nullable().optional(),
+    access: z.array(z.enum(SEGMENT_MEANS)).max(SEGMENT_MEANS.length).default([]),
+    /** Jalur khusus pengguna disabilitas. */
+    dedicated: z.boolean().optional(),
+    /** Asal data: diisi sendiri, atau usulan otomatis dari dataset (kedekatan/Commute) yang dikonfirmasi admin. */
+    source: z.enum(["manual", "dataset"]).default("manual"),
+    syncedAt: isoDate.optional(),
+    disabled: z.boolean().optional(),
+    note: z.string().max(300).optional(),
+  })
+  .refine((l) => l.fromId !== l.toId, { message: "kedua stasiun harus berbeda", path: ["toId"] })
+  .refine((l) => new Set(l.access).size === l.access.length, { message: "akses tidak boleh ganda", path: ["access"] });
+
+export type StationLinkContent = z.infer<typeof stationLinkSchema> & { id: string };
+
 /** Id stasiun/lini: slug NTD (mis. "manggarai") atau id turunan `operator:kode` (mis. "lrtj:pka", "ntd:stasiun-baru"). */
 const datasetId = z
   .string()
@@ -371,6 +399,7 @@ export const SCHEMAS: Record<Exclude<ContentKind, "settings">, z.ZodType> = {
   map_track: mapTrackSchema,
   route_pattern: routePatternSchema,
   hub: hubSchema,
+  station_link: stationLinkSchema,
   station_status: stationStatusSchema,
   station: stationSchema,
   line: lineSchema,
@@ -396,6 +425,7 @@ export class ContentSnapshot {
   private tracks: MapTrack[] = [];
   private patterns = new Map<string, RoutePattern>();
   private hubs = new Map<string, HubContent>();
+  private links = new Map<string, StationLinkContent>();
   private statuses = new Map<string, StationStatusContent>();
   private stationRows = new Map<string, StationContent>();
   private lineRows = new Map<string, LineContent>();
@@ -473,6 +503,12 @@ export class ContentSnapshot {
           // Satu isian per id hub; entri terbaru menang.
           const h = v as z.infer<typeof hubSchema>;
           this.hubs.set(h.hubId, { ...h, id: it.id });
+          break;
+        }
+        case "station_link": {
+          // Satu isian per pasangan stasiun (urutan tidak berpengaruh); entri terbaru menang.
+          const l = v as z.infer<typeof stationLinkSchema>;
+          this.links.set([l.fromId, l.toId].sort().join("~"), { ...l, id: it.id });
           break;
         }
         case "station": {
@@ -559,6 +595,11 @@ export class ContentSnapshot {
   /** Hub transfer yang dibuat/diubah admin. */
   hubOverrides(): HubContent[] {
     return [...this.hubs.values()];
+  }
+
+  /** Tautan transfer antar stasiun yang dibuat/diubah admin. */
+  linkOverrides(): StationLinkContent[] {
+    return [...this.links.values()];
   }
 
   allNotices(): Notice[] {

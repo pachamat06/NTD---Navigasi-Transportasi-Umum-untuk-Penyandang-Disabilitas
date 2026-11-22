@@ -37,6 +37,7 @@ import type { LlmSource } from "./llm/LlmService";
 import { resolvePipeline, type PipelineChoice } from "./pipeline";
 import type { ToolRegistry } from "./ToolRegistry";
 import { inactiveMessage } from "../domain/stationStatus";
+import { accessText, linkNeedStatus } from "../domain/stationLinks";
 
 export const MODE_LABEL: Record<Mode, string> = { RAIL: "kereta (KRL)", SUBWAY: "MRT", TRAM: "LRT", BUS: "bus TransJakarta", MONORAIL: "kereta layang bandara" };
 
@@ -605,6 +606,12 @@ export function withTransferAccess(route: Route, needs: TransferNeed[], details:
         access.push(a);
       }
     }
+    // Jalan kaki lewat tautan transfer: akses di jalan itu (tangga, eskalator, lift, ramp, datar) terhadap kebutuhan pengguna.
+    if (leg.link && leg.stops[0] !== leg.stops[leg.stops.length - 1])
+      for (const need of needs) {
+        const r = linkNeedStatus(leg.link.access, need);
+        access.push({ stationId: leg.stops[0], need, status: r.status, ...(r.substitute ? { substitute: r.substitute } : {}), link: { toId: leg.stops[leg.stops.length - 1], means: leg.link.access } });
+      }
     // Pindah di stasiun yang sama tanpa info peron menghasilkan entri kembar.
     const seen = new Set<string>();
     return { ...leg, access: access.filter((a) => !seen.has(JSON.stringify(a)) && !!seen.add(JSON.stringify(a))) };
@@ -807,6 +814,13 @@ export function accessWarnings(route: Route, byId: Map<string, Station>): string
       const st = byId.get(a.stationId)?.name ?? route.stopNames?.[a.stationId] ?? a.stationId;
       const name = a.platform ? `${st} (peron ${a.platform})` : st;
       const label = AMENITY_LABEL[a.need] ?? a.need;
+      if (a.link) {
+        // Jalan kaki antara dua stasiun lewat tautan transfer.
+        const to = byId.get(a.link.toId)?.name ?? route.stopNames?.[a.link.toId] ?? a.link.toId;
+        if (a.status === "absent") out.add(`Jalan kaki dari ${st} ke ${to} hanya tersedia lewat ${accessText(a.link.means)}; ${label.toLowerCase()} tidak tercatat di jalan itu, padahal Anda membutuhkannya untuk pindah. Pertimbangkan alternatif atau minta bantuan petugas.`);
+        else if (a.status === "unknown") out.add(`Akses jalan kaki dari ${st} ke ${to} (tangga, eskalator, lift, ramp, atau datar) belum tercatat; belum bisa dipastikan ${label.toLowerCase()} tersedia untuk pindah di sini.`);
+        continue;
+      }
       // Tidak dibutuhkan: peron dicapai tanpa anak tangga; penyeberangannya sudah dijelaskan crossingWarnings.
       if (a.notNeeded) continue;
       if (a.status === "out_of_service") out.add(`${label} di ${name} dilaporkan sedang tidak berfungsi; perpindahan di sini mungkin tidak bisa dilakukan.`);

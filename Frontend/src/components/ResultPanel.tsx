@@ -467,6 +467,7 @@ function RideBody({ leg, name, assessmentOf }: { leg: RouteLeg; name: (id: strin
 function TransferBody({ leg, name }: { leg: RouteLeg; name: (id: string) => string }) {
   const [open, setOpen] = useState(false);
   const hints = [
+    leg.link && `Akses jalan: ${leg.link.access.length ? leg.link.access.join(", ") : "belum diketahui"}${leg.link.dedicated ? " (jalur khusus disabilitas)" : ""}.`,
     leg.fromExit && `Keluar lewat ${exitText(leg.fromExit)}.`,
     leg.notes && !leg.turnaround ? leg.notes : undefined,
     leg.toExit && `Masuk lewat ${exitText(leg.toExit)}.`,
@@ -502,9 +503,10 @@ function TransferBody({ leg, name }: { leg: RouteLeg; name: (id: string) => stri
           {access.length > 0 && (
             <ul className="mt-1" aria-label="Fasilitas untuk pindah">
               {access.map((a) => (
-                <li key={`${a.stationId}-${a.need}-${a.platform ?? ""}`} className={a.status === "available" || a.notNeeded ? "" : "text-[var(--warn)]"}>
-                  <span aria-hidden>{a.status === "available" || a.notNeeded ? "✔" : "⚠"}</span> {AMENITY_LABEL[a.need]} di {name(a.stationId)}
-                  {a.platform ? ` (peron ${a.platform})` : ""}: {a.notNeeded ? `tidak dibutuhkan, peron dicapai ${accessText(a.notNeeded)}` : ACCESS_TEXT[a.status]}
+                <li key={`${a.stationId}-${a.need}-${a.platform ?? ""}-${a.link?.toId ?? ""}`} className={a.status === "available" || a.notNeeded ? "" : "text-[var(--warn)]"}>
+                  <span aria-hidden>{a.status === "available" || a.notNeeded ? "✔" : "⚠"}</span> {AMENITY_LABEL[a.need]}{" "}
+                  {a.link ? `di jalan ${name(a.stationId)} ke ${name(a.link.toId)}` : `di ${name(a.stationId)}`}
+                  {a.platform ? ` (peron ${a.platform})` : ""}: {a.notNeeded ? `tidak dibutuhkan, peron dicapai ${accessText(a.notNeeded)}` : a.substitute === "lift" ? "tersedia lewat lift" : ACCESS_TEXT[a.status]}
                 </li>
               ))}
             </ul>

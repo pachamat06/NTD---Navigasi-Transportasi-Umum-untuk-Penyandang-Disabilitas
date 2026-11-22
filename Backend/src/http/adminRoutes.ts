@@ -14,6 +14,7 @@ import { AppError } from "../errors";
 import type { ContentItem, ContentKind } from "../store/types";
 import type { Services } from "../services";
 import { applyHubs } from "../domain/hubs";
+import { applyLinks, linkKey, linkViews, suggestLinks } from "../domain/stationLinks";
 import type { DefaultPattern } from "../domain/routePatterns";
 import type { SyncSource } from "../domain/routeSync";
 import { buildSuggestions, FLOOR_PLAN_JSON_SCHEMA, FLOOR_PLAN_SYSTEM, floorPlanPrompt, MAX_IMAGES, parseFloorPlan, sniffImage, type FloorPlanResult } from "../ai/vision/floorPlan";
@@ -26,7 +27,7 @@ import { VisionError } from "../ai/vision/VisionClient";
 import { visionSettingsInput } from "../ai/vision/VisionService";
 import { ok, parse, rateLimit, requireAdmin } from "./middleware";
 
-const kindSchema = z.enum(["facility", "entrance", "notice", "station_info", "platform", "concourse", "map_stop", "map_track", "route_pattern", "hub", "station_status", "station", "line"]);
+const kindSchema = z.enum(["facility", "entrance", "notice", "station_info", "platform", "concourse", "map_stop", "map_track", "route_pattern", "hub", "station_link", "station_status", "station", "line"]);
 const idParam = z.string().min(1).max(80);
 
 /** Item yang terikat stasiun wajib punya stationId yang dikenal; pengumuman memakai targetId. */
@@ -499,6 +500,17 @@ export function adminRoutes(s: Services): Router {
       const same = (await s.store.content.list({ kind: "station_status", stationId: stationId ?? undefined })).find((it) => it.id !== selfId && !it.draftDeleted);
       if (same) throw new AppError("CONFLICT", "Status stasiun ini sudah ada; ubah entri yang ada.", { id: same.id });
     }
+    if (kind === "station_link") {
+      const unknown = [parsed.fromId, parsed.toId].filter((x) => !known.has(String(x)));
+      if (unknown.length) throw new AppError("INVALID", `Stasiun tidak dikenal: ${unknown.join(", ")}.`);
+      // Satu isian per pasangan stasiun (urutan tidak berpengaruh).
+      const key = linkKey(String(parsed.fromId), String(parsed.toId));
+      const same = (await s.store.content.list({ kind: "station_link" })).find((it) => {
+        const v = (it.draft ?? it.published) as { fromId?: string; toId?: string } | null;
+        return it.id !== selfId && !it.draftDeleted && !!v?.fromId && !!v.toId && linkKey(v.fromId, v.toId) === key;
+      });
+      if (same) throw new AppError("CONFLICT", "Tautan untuk pasangan stasiun ini sudah ada; ubah entri yang ada.", { id: same.id });
+    }
     if (kind === "hub") {
       const unknown = (parsed.memberIds as string[]).filter((x) => !known.has(x));
       if (unknown.length) throw new AppError("INVALID", `Anggota hub tidak dikenal: ${[...new Set(unknown)].join(", ")}.`);
@@ -514,7 +526,7 @@ export function adminRoutes(s: Services): Router {
 
   r.post("/content", async (req, res) => {
     const body = parse(z.object({ kind: kindSchema, stationId: z.string().max(80).nullable().optional(), data: z.unknown() }), req.body ?? {});
-    const stationId = body.kind === "notice" || body.kind === "map_track" || body.kind === "route_pattern" || body.kind === "hub" || body.kind === "line" ? null : (body.stationId ?? null);
+    const stationId = body.kind === "notice" || body.kind === "map_track" || body.kind === "route_pattern" || body.kind === "hub" || body.kind === "station_link" || body.kind === "line" ? null : (body.stationId ?? null);
     const data = await validateBody(body.kind, stationId, body.data);
     const item = await s.store.content.saveDraft({ kind: body.kind, stationId, data, by: actor(req) });
     await audit(req, "content.create", item.id, { kind: body.kind, stationId });
@@ -683,6 +695,42 @@ export function adminRoutes(s: Services): Router {
     const ctx = newContext({ preview: true });
     const [idx, stations, hubs] = await Promise.all([s.commute.index(ctx), s.stations.list(ctx), s.stations.hubs(ctx)]);
     ok(res, { source: q.source, radius: q.radius, suggestions: gtfsHubSuggestions(s.gtfs, idx, stations, hubs, q.radius) });
+  });
+
+  // ---------- Tautan transfer antar stasiun (di luar hub) ----------
+  // Tautan yang berlaku di pratinjau (bawaan NTD + isian admin, draf ikut) dan tautan bawaan sebelum isian admin. Dengan
+  // `stationId`, hanya tautan yang menyentuh stasiun itu, dilihat dari stasiun itu. Isian admin disunting lewat /content
+  // (jenis "station_link"), jadi ikut alur draf lalu publikasi.
+  r.get("/station-links", async (req, res) => {
+    const q = parse(z.object({ stationId: z.string().max(80).optional() }), req.query);
+    const ctx = newContext({ preview: true });
+    const [effective, stations] = await Promise.all([s.planner.links(ctx), s.stations.list(ctx)]);
+    const byId = new Map(stations.map((x) => [x.id, x]));
+    const base = applyLinks([], new Set(byId.keys()));
+    ok(res, { links: effective, base, ...(q.stationId ? { forStation: linkViews(effective, q.stationId, byId) } : {}) });
+  });
+
+  // Usulan tautan dari dataset: stasiun/halte yang berdekatan tetapi belum satu hub dan belum bertaut (jarak garis lurus).
+  // Dengan `stationId`, hanya pasangan untuk stasiun itu, dilengkapi jarak/waktu/petunjuk dari Commute (/transfers) bila ada.
+  // Hanya usulan: tidak ada yang disimpan sampai admin menyimpannya sebagai draf lalu mempublikasikannya.
+  r.get("/station-links/suggestions", async (req, res) => {
+    const q = parse(z.object({ stationId: z.string().max(80).optional(), radius: z.coerce.number().min(50).max(1000).default(300), limit: z.coerce.number().int().min(1).max(100).default(40) }), req.query);
+    const ctx = newContext({ preview: true });
+    const [stations, hubs, links] = await Promise.all([s.stations.list(ctx), s.stations.hubs(ctx), s.planner.links(ctx)]);
+    const byId = new Map(stations.map((x) => [x.id, x]));
+    const found = suggestLinks(stations, hubs, links, { radiusM: q.radius, ...(q.stationId ? { stationId: q.stationId } : {}) }).slice(0, q.limit);
+    const suggestions = await Promise.all(
+      found.map(async (x) => {
+        const walk = q.stationId ? ((await s.commute.getWalk(x.fromId, x.toId, ctx).catch(() => undefined)) ?? (await s.commute.getWalk(x.toId, x.fromId, ctx).catch(() => undefined))) : undefined;
+        return {
+          ...x,
+          fromName: byId.get(x.fromId)?.name ?? x.fromId,
+          toName: byId.get(x.toId)?.name ?? x.toId,
+          ...(walk ? { walk: { distanceM: walk.distanceM, minutes: walk.minutes, ...(walk.notes ? { notes: walk.notes.slice(0, 300) } : {}) } } : {}),
+        };
+      }),
+    );
+    ok(res, { radius: q.radius, suggestions });
   });
 
   // ---------- Pengaturan (bobot skor, ambang, disclaimer, LLM, TTL cache) ----------

@@ -7,6 +7,7 @@ import { llmAvailability } from "../ai/pipeline";
 import { AMENITY_LABEL } from "../domain/FacilityAnalysisService";
 import { TRANSFER_NEEDS } from "../domain/models";
 import { isRelevant, toView } from "../domain/serviceAdvisory";
+import { linkViews } from "../domain/stationLinks";
 import { AppError } from "../errors";
 import type { Services } from "../services";
 import { ok, parse } from "./middleware";
@@ -90,7 +91,17 @@ export function publicRoutes(s: Services): Router {
     req.ctx.cacheTtlSeconds = snap.settings.cacheTtlSeconds;
     const detail = await s.stations.detail(id, req.ctx, snap);
     if (!detail) throw new AppError("NOT_FOUND", `Stasiun "${id}" tidak ditemukan.`);
-    ok(res, detail);
+    // Stasiun/halte lain yang bisa dicapai dengan berjalan kaki di luar hub (tautan transfer) beserta aksesnya.
+    const [links, all] = await Promise.all([s.planner.links(req.ctx), s.stations.list(req.ctx)]);
+    ok(res, { ...detail, links: linkViews(links, id, new Map(all.map((x) => [x.id, x]))) });
+  });
+
+  // Tautan transfer antar stasiun di luar hub (jalan kaki beserta akses: tangga, eskalator, lift, ramp, datar).
+  r.get("/station-links", async (req, res) => {
+    const q = parse(z.object({ stationId: stationId.optional() }), req.query);
+    const [links, all] = await Promise.all([s.planner.links(req.ctx), s.stations.list(req.ctx)]);
+    const byId = new Map(all.map((x) => [x.id, x]));
+    ok(res, q.stationId ? linkViews(links, q.stationId, byId) : links);
   });
 
   // Data awal GUI dalam satu panggilan: semua stasiun beserta fasilitas dan skornya (untuk peta), lini, dan hub.

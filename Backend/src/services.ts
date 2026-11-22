@@ -96,7 +96,9 @@ export function createServices(opts: { config: Config; store: Store; log: Logger
   const facilities = new FacilityAnalysisService(commute);
   const stationStatuses = async (ctx: RequestContext) => (await content.snapshot(ctx)).stationStatuses();
   const stations = new StationService(commute, facilities, patterns, hubOverrides, stationStatuses);
-  const planner = new RoutePlannerService(commute, gtfs, patterns, hubOverrides);
+  // Tautan transfer antar stasiun di luar hub (jalan kaki beserta akses), di atas tautan bawaan NTD.
+  const linkOverrides = async (ctx: RequestContext) => (await content.snapshot(ctx)).linkOverrides();
+  const planner = new RoutePlannerService(commute, gtfs, patterns, hubOverrides, linkOverrides);
   const routeSync = new RouteSyncService(commute, planner, gtfs);
   const alternatives = new AlternativeService(planner, facilities);
   const tools = new ToolRegistry({ stations, planner, facilities, alternatives });

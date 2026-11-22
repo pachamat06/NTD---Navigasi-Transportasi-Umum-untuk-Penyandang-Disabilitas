@@ -182,6 +182,34 @@ export function StationDetail({
               </ul>
             </div>
           )}
+          {full?.data?.links && full.data.links.length > 0 && (
+            <div>
+              <p className="text-sm font-semibold">Terhubung ke stasiun lain</p>
+              <p className="text-xs text-[var(--muted)]">Bisa pindah dengan berjalan kaki, di luar hub transfer.</p>
+              <ul className="mt-1 flex flex-col gap-2">
+                {full.data.links.map((l) => (
+                  <li key={l.linkId} className="rounded-lg bg-[var(--surface-2)] p-3 text-sm">
+                    <p className="font-semibold">
+                      {l.otherName}
+                      {l.distanceM !== null && (
+                        <span className="font-normal text-[var(--muted)]">
+                          {" "}
+                          · {l.distanceEstimated ? "± " : ""}
+                          {l.distanceM} m{l.minutes !== null ? ` · ${l.minutes} mnt` : ""}
+                        </span>
+                      )}
+                    </p>
+                    <p>
+                      Akses jalan: {l.access.length ? l.access.join(", ") : "belum diketahui"}
+                      {l.dedicated ? " (jalur khusus disabilitas)" : ""}
+                      {l.oneWay ? " · satu arah" : ""}
+                    </p>
+                    {l.note && <p className="text-[var(--muted)]">{l.note}</p>}
+                  </li>
+                ))}
+              </ul>
+            </div>
+          )}
           {full?.data && full.data.info.length > 0 && (
             <div>
               <p className="text-sm font-semibold">Informasi lain</p>

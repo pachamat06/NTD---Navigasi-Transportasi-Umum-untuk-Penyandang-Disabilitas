@@ -305,7 +305,26 @@ export interface StationInfo {
 }
 
 /** Detail stasiun dari GET /api/stations/:id. */
+/** Stasiun/halte lain yang bisa dicapai dengan berjalan kaki di luar hub (tautan transfer), beserta akses jalannya. */
+export interface StationLinkView {
+  linkId: string;
+  otherId: string;
+  otherName: string;
+  /** Jarak tautan; bila belum diisi, jarak garis lurus (`distanceEstimated`). */
+  distanceM: number | null;
+  distanceEstimated?: boolean;
+  minutes: number | null;
+  /** Akses di jalan itu (boleh lebih dari satu); kosong = belum diketahui. */
+  access: SegmentMeans[];
+  dedicated?: boolean;
+  note?: string;
+  oneWay?: boolean;
+  source: "ntd" | "admin";
+}
+
 export interface StationDetailData extends NetworkStation {
+  /** Terhubung ke stasiun lain lewat jalan kaki (tautan transfer di luar hub). */
+  links?: StationLinkView[];
   platforms?: Platform[];
   entrances: Entrance[];
   /** Concourse isian tim (stasiun yang gate-nya tidak langsung ke peron). */
@@ -361,6 +380,8 @@ export interface RouteLeg {
   toExit?: ExitRef;
   /** Status fasilitas yang dibutuhkan pengguna di kedua ujung perpindahan. */
   access?: TransferAccess[];
+  /** Ruas pindah antarstasiun lewat tautan transfer di luar hub: akses yang tersedia di jalan itu. */
+  link?: { access: SegmentMeans[]; dedicated?: boolean; source: "ntd" | "admin" };
 }
 
 export type TransferNeed = "lift" | "eskalator" | "ramp";
@@ -385,6 +406,10 @@ export interface TransferAccess {
   status: AmenityStatus | "out_of_service";
   /** Status diambil dari peron ini. */
   platform?: string;
+  /** Pemeriksaan untuk jalan kaki antara dua stasiun lewat tautan transfer (`stationId` = asal jalan itu). */
+  link?: { toId: string; means: SegmentMeans[] };
+  /** Kebutuhan eskalator dianggap terpenuhi oleh lift. */
+  substitute?: "lift";
   /** Lift/eskalator tidak dibutuhkan karena peron dicapai dari gate tanpa anak tangga. */
   notNeeded?: { via: AccessVia; gate?: string; dedicated?: boolean; stepFree?: boolean; concourse?: ConcourseRoute };
 }

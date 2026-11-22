@@ -87,7 +87,7 @@ export class ToolRegistry {
           ? d.planner.getRouteVia(i.fromId, i.viaId, i.toId, ctx, i.at)
           : i.avoidModes?.length
             ? d.planner.getRouteAvoiding(i.fromId, i.toId, i.avoidModes, ctx, i.at, i.needs?.length ? WALK_WEIGHT.SLOW : WALK_WEIGHT.AVERAGE)
-            : d.planner.getRoute(i.fromId, i.toId, ctx, i.at);
+            : d.planner.getRoute(i.fromId, i.toId, ctx, i.at, { needs: i.needs });
         const found = await route;
         if (!found || !i.needs?.length) return found as Tools[N]["out"];
         // Halte BRT gabungan dua arah: fasilitas tiap arah diperiksa lewat id turunan per kode (mis. tj:h00267s).
