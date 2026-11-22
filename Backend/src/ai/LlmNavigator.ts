@@ -12,6 +12,8 @@ export const MAX_EXPLORE = 2;
 /** Gambaran numerik satu kandidat untuk pagar pilihan. */
 export interface GuardView {
   unmetNeeds: number;
+  /** Dari unmetNeeds: yang pasti tidak terpenuhi (bukan sekadar belum diketahui). */
+  unmetCertain?: number;
   usesAvoidedModes: boolean;
   advisoryImpact: "none" | "delay" | "disruption" | "closure";
 }
@@ -84,7 +86,11 @@ const chooseIn = z.object({ indeks: z.number().int().min(0), alasan: z.string().
 export function checkChoice(index: number, views: GuardView[]): string | null {
   const v = views[index];
   if (!v) return `indeks ${index} tidak ada`;
-  const minUnmet = Math.min(...views.map((x) => x.unmetNeeds));
+  // Urutan perbandingan sama dengan pemilihan default: yang pasti tidak terpenuhi dulu, baru jumlah yang belum terpenuhi.
+  const certain = (x: GuardView) => x.unmetCertain ?? 0;
+  const minCertain = Math.min(...views.map(certain));
+  if (certain(v) > minCertain) return "kebutuhan fasilitas pasti tidak terpenuhi padahal ada kandidat yang tidak pasti gagal";
+  const minUnmet = Math.min(...views.filter((x) => certain(x) === minCertain).map((x) => x.unmetNeeds));
   if (v.unmetNeeds > minUnmet) return "kebutuhan fasilitas tak terpenuhi lebih banyak daripada kandidat lain";
   if (v.usesAvoidedModes && views.some((x) => !x.usesAvoidedModes)) return "memakai moda yang dihindari padahal ada rute lain";
   const level = { none: 0, delay: 1, disruption: 2, closure: 3 } as const;

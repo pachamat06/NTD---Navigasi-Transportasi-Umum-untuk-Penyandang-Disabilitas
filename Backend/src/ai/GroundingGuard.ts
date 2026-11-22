@@ -223,7 +223,7 @@ export function factsForPrompt(f: PlanFacts): unknown {
         : l.platform
           ? { peronNaik: { nomor: l.platform } }
           : {}),
-      ...(l.access?.length ? { aksesPindah: l.access.map((a) => ({ stasiun: st(a.stationId)?.name ?? a.stationId, ...(a.platform ? { peron: a.platform } : {}), fasilitas: AMENITY_LABEL[a.need], status: a.status, ...(a.notNeeded ? { tidakDibutuhkan: "peron dicapai tanpa anak tangga" } : {}) })) } : {}),
+      ...(l.access?.length ? { aksesPindah: l.access.map((a) => ({ stasiun: st(a.stationId)?.name ?? a.stationId, ...(a.platform ? { peron: a.platform } : {}), fasilitas: AMENITY_LABEL[a.need], status: a.status, ...(a.notNeeded ? { tidakDibutuhkan: "peron dicapai tanpa anak tangga" } : {}), ...(a.substitute ? { digantiOleh: "lift (lift tersedia dan menggantikan eskalator)" } : {}) })) } : {}),
     })),
     totalTarif: f.route.totalFare,
     totalMenit: f.route.timeComplete ? f.route.totalMinutes : null,

@@ -157,6 +157,8 @@ export interface TransferAccess {
   status: AmenityDetailStatus;
   /** Status diambil dari peron ini (bukan stasiun keseluruhan). */
   platform?: string;
+  /** Kebutuhan eskalator dianggap terpenuhi oleh lift di titik ini (`status` dan `platform` adalah milik lift). */
+  substitute?: "lift";
   /**
    * Lift/eskalator tidak dibutuhkan karena peron ini dicapai dari gate tanpa anak tangga (jalur yang dipakai di sini).
    * `status` tetap diisi apa adanya.
@@ -605,6 +607,8 @@ export interface RouteOptionSummary {
    */
   advisoryImpact?: "delay" | "disruption" | "closure";
   advisoryIds?: string[];
+  /** Dari `unmetNeeds`: jumlah yang PASTI tidak terpenuhi (data tercatat tidak ada atau rusak), bukan yang belum diketahui. */
+  unmetCertain?: number;
 }
 
 /** Satu pilihan rute (gaya TfL): rute, penilaian stasiun untuk rute itu, peringatan, dan ringkasan. */

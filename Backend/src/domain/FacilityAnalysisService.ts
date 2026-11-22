@@ -218,10 +218,14 @@ export function applyPlatformExits(entrances: Entrance[], platforms: Platform[])
   });
 }
 
-/** Kebutuhan pengguna terpenuhi: fasilitasnya tersedia, atau lift/eskalator tidak dibutuhkan karena semua peron dicapai tanpa anak tangga. */
+/**
+ * Kebutuhan pengguna terpenuhi: fasilitasnya tersedia, atau lift/eskalator tidak dibutuhkan karena semua peron dicapai tanpa
+ * anak tangga. Lift menggantikan eskalator: stasiun yang hanya punya lift tetap memenuhi kebutuhan eskalator.
+ */
 export function needMet(need: AmenityType, amenities: Record<AmenityType, AmenityStatus>, layout?: LayoutAccess): boolean {
   if (layout?.level && VERTICAL.includes(need)) return true;
-  return (pathStatus(layout, need) ?? amenities[need]) === "available";
+  const available = (t: AmenityType) => (pathStatus(layout, t) ?? amenities[t]) === "available";
+  return available(need) || (need === "eskalator" && available("lift"));
 }
 
 /**

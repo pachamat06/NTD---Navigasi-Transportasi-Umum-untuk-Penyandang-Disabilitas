@@ -396,7 +396,7 @@ export class NavigationAgent {
             return { index: null, catatan: `Rute baru gagal dinilai: ${(err as Error).message}` };
           }
         },
-        guardViews: (): GuardView[] => evaluated.map((e) => ({ unmetNeeds: e.summary.unmetNeeds, usesAvoidedModes: e.summary.usesAvoidedModes, advisoryImpact: e.summary.advisoryImpact ?? "none" })),
+        guardViews: (): GuardView[] => evaluated.map((e) => ({ unmetNeeds: e.summary.unmetNeeds, unmetCertain: e.summary.unmetCertain ?? 0, usesAvoidedModes: e.summary.usesAvoidedModes, advisoryImpact: e.summary.advisoryImpact ?? "none" })),
       };
       const out = await new LlmNavigator(llm!).decide(host);
       if (out.ok) {
@@ -576,28 +576,33 @@ export function withTransferAccess(route: Route, needs: TransferNeed[], details:
       const notNeeded = layout?.level
         ? { via: layout.via, gate: layout.gate, ...(layout.dedicated ? { dedicated: true } : {}), ...(layout.stepFree ? { stepFree: true } : {}), ...(layout.concourse ? { concourse: layout.concourse } : {}) }
         : undefined;
-      for (const need of needs) {
+      const resolve = (need: TransferNeed): TransferAccess => {
         const extra = notNeeded && need !== "ramp" ? { notNeeded } : {};
         // Jalur lewat concourse yang pindah lantai: lift/eskalator di ruas itulah yang dipakai.
         const path = !layout || layout.level ? undefined : need === "lift" ? layout.pathLift : need === "eskalator" ? layout.pathEscalator : undefined;
-        if (path) {
-          access.push({ stationId, need, status: path, platform: platforms.map((p) => p.code).join(", ") });
-          continue;
-        }
+        if (path) return { stationId, need, status: path, platform: platforms.map((p) => p.code).join(", ") };
         const known = platforms.filter((p) => p.amenities[need]);
         if (platforms.length && known.length === platforms.length) {
           const worst = known.reduce((a, b) => (RANK[b.amenities[need]!] < RANK[a.amenities[need]!] ? b : a));
-          access.push({ stationId, need, status: worst.amenities[need]!, platform: platforms.length === 1 ? worst.code : platforms.map((p) => p.code).join(", "), ...extra });
-          continue;
+          return { stationId, need, status: worst.amenities[need]!, platform: platforms.length === 1 ? worst.code : platforms.map((p) => p.code).join(", "), ...extra };
         }
         const ntd = d?.amenityDetails.find((x) => x.type === need && x.source === "ntd");
-        access.push({
+        return {
           stationId,
           need,
           status: ntd?.status === "out_of_service" ? "out_of_service" : (d?.amenities[need] ?? "unknown"),
           ...(notNeeded && need !== "ramp" ? { platform: platforms.map((p) => p.code).join(", ") } : {}),
           ...extra,
-        });
+        };
+      };
+      for (const need of needs) {
+        let a = resolve(need);
+        // Lift menggantikan eskalator: stasiun yang hanya punya lift tetap memenuhi kebutuhan eskalator.
+        if (need === "eskalator" && a.status !== "available" && !a.notNeeded) {
+          const lift = resolve("lift");
+          if (lift.status === "available") a = { ...lift, need, substitute: "lift" };
+        }
+        access.push(a);
       }
     }
     // Pindah di stasiun yang sama tanpa info peron menghasilkan entri kembar.
@@ -706,6 +711,8 @@ export function summarize(r: Route, assessments: StationAssessment[], avoidModes
   const weakest = tr.length ? Math.min(...tr.map(scoreOf)) : avg;
   const unmet = r.legs.flatMap((l) => l.access ?? []).filter((a) => a.status !== "available" && !a.notNeeded);
   const unmetNeeds = unmet.length;
+  // Yang pasti tidak terpenuhi (tercatat tidak ada atau rusak), berbeda dari yang hanya belum ada datanya.
+  const unmetCertain = unmet.filter((a) => a.status !== "unknown").length;
   // Fasilitas yang pasti tidak ada/rusak lebih berat daripada yang belum ada datanya.
   const unmetPoints = unmet.reduce((s, a) => s + (a.status === "unknown" ? 5 : 12), 0);
   const walks = r.legs.filter((l) => l.type === "TRANSFER" && l.stops[0] !== l.stops[l.stops.length - 1]).length;
@@ -726,6 +733,7 @@ export function summarize(r: Route, assessments: StationAssessment[], avoidModes
     ...(last?.arrivalAt ? { arrivalAt: last.arrivalAt } : {}),
     transfers: r.transfers,
     unmetNeeds,
+    unmetCertain,
     usesAvoidedModes: usesAvoided,
     ...(advisory.impact !== "none" ? { advisoryImpact: advisory.impact, advisoryIds: advisory.ids } : {}),
   };
@@ -748,7 +756,10 @@ export function pickOptions<T extends { route: Route; summary: RouteOptionSummar
   // Rute dasar (pertama, dari dataset) diberi kelebihan 3 poin agar rute susunan sendiri yang datanya kurang lengkap
   // tidak menggesernya karena selisih kecil; rute lain harus jelas lebih aksesibel.
   const bonus = (i: number) => acc(i) + (i === 0 ? 2.5 : 0);
-  const accessible = idx.reduce((a, b) => (bonus(b) > bonus(a) || (bonus(b) === bonus(a) && mins[b] < mins[a]) ? b : a), 0);
+  // Kebutuhan fasilitas yang PASTI tidak terpenuhi (tercatat tidak ada/rusak) selalu kalah dari yang hanya belum diketahui:
+  // rute dengan lebih sedikit yang pasti gagal didahulukan, baru skor.
+  const certain = (i: number) => list[i].summary.unmetCertain ?? 0;
+  const accessible = idx.reduce((a, b) => (certain(b) < certain(a) || (certain(b) === certain(a) && (bonus(b) > bonus(a) || (bonus(b) === bonus(a) && mins[b] < mins[a]))) ? b : a), 0);
   const fastest = idx.reduce((a, b) => (mins[b] < mins[a] - 0.5 || (Math.abs(mins[b] - mins[a]) <= 0.5 && acc(b) > acc(a)) ? b : a), 0);
   const fast = Math.max(1, mins[fastest]);
   const best = acc(accessible);
@@ -770,7 +781,7 @@ export function pickOptions<T extends { route: Route; summary: RouteOptionSummar
   }
   for (const o of out) o.kinds.sort((a, b) => KIND_ORDER.indexOf(a) - KIND_ORDER.indexOf(b));
   // Rute lain yang tidak terpilih tetap ditampilkan sebagai pilihan tambahan (tanpa jenis), paling aksesibel dulu.
-  const rest = idx.filter((i) => !out.some((o) => o.e === list[i])).sort((a, b) => acc(b) - acc(a) || mins[a] - mins[b]);
+  const rest = idx.filter((i) => !out.some((o) => o.e === list[i])).sort((a, b) => certain(a) - certain(b) || acc(b) - acc(a) || mins[a] - mins[b]);
   for (const i of rest) out.push({ e: list[i], kinds: [] });
   return out;
 }
