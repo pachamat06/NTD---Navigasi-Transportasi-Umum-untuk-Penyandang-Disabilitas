@@ -1,6 +1,6 @@
 # Rancangan: LLM dengan dua agent (navigasi dan pembaca informasi layanan X)
 
-Status: rancangan + implementasi backend (22 November 2026). Admin UI dan Frontend belum diubah; kontrak API ada di bagian 7.
+Status: rancangan + implementasi backend (22 November 2026). UI admin sudah dibuat di folder `RPL\admin` (halaman **Informasi layanan** dan kartu **Agent pembaca** di Pengaturan; folder itu bukan repo git, cadangan dan patch ada di `RPL\backup-admin`). Frontend (pemilih pipeline) belum diubah; kontrak API ada di bagian 7.
 
 ## 1. Kebutuhan
 
@@ -22,7 +22,7 @@ Status: rancangan + implementasi backend (22 November 2026). Admin UI dan Fronte
 | Agent navigasi LLM | Loop tool-calling yang **hanya bisa memilih dan menjelajah lewat tool domain** (rute dari planner, penilaian fasilitas). LLM tidak pernah menulis rute sendiri. | Fakta rute dan fasilitas tetap berasal dari data; risiko halusinasi dibatasi secara struktural. |
 | Pagar pilihan LLM | `checkChoice`: pilihan LLM ditolak (kembali ke pilihan default) bila kebutuhan fasilitas tak terpenuhi lebih banyak dari kandidat terbaik, memakai moda yang dihindari padahal ada rute lain, atau melewati penutupan yang sudah disetujui padahal ada rute lain. Alasan LLM wajib lolos pemeriksaan tautan dan angka. | Penyandang disabilitas yang salah diarahkan lebih berbahaya daripada rute yang kurang optimal. |
 | Penyimpanan informasi layanan | Tabel baru `service_advisories`, terpisah dari `content_items`. | Informasi yang belum disetujui harus terlihat pengguna (info saja), padahal draft `content_items` tidak terlihat pengguna. |
-| Efek navigasi | Hanya informasi **berstatus disetujui dan masih berlaku** yang mengubah navigasi: pengurangan skor rute (`delay` 8, `disruption` 30, `closure` 60) dan stasiun terdampak masuk daftar `avoid` titik transfer. Setiap rute terdampak diberi peringatan dan label. | Perubahan terukur, bisa dijelaskan, dan bisa diuji. |
+| Efek navigasi | Hanya informasi **berstatus disetujui dan masih berlaku** yang mengubah navigasi: pengurangan skor rute (`delay` 8, `disruption` 30, `closure` 60) dan, untuk `disruption`/`closure`, dicarikan rute **tambahan** yang menghindari stasiun terdampak sebagai titik transfer. Rute yang tetap melewatinya tidak dibuang (bisa jadi satu-satunya atau yang paling aksesibel), hanya dikurangi skornya. Setiap rute terdampak diberi peringatan dan label. | Perubahan terukur, bisa dijelaskan, dan bisa diuji. |
 | Masa berlaku | Setiap informasi punya `expiresAt` (bawaan: info 24 jam, delay 3 jam, gangguan 6 jam, penutupan 12 jam sejak postingan). Persetujuan tanpa `expiresAt` memakai bawaan itu. | Gangguan yang sudah lewat tidak boleh terus mengubah rute. |
 | Admin mematikan LLM | Pembacaan X berhenti dan informasi yang belum disetujui disembunyikan. Informasi yang **sudah disetujui admin** tetap berlaku sampai kedaluwarsa (isinya sudah diperiksa manusia, seperti pengumuman biasa). | Mematikan LLM tidak boleh tiba-tiba membuka kembali rute yang ditutup. |
 
@@ -135,7 +135,7 @@ Admin (`/api/admin`):
 ## 8. Batasan yang perlu diketahui
 
 - **Informasi belum disetujui ikut ke agent LLM** sebagai data berlabel `belum_diverifikasi`. Teks yang bersumber dari postingan publik tak tepercaya, jadi risiko injeksi prompt dibatasi oleh: ringkasan hanya data (bukan instruksi), pagar pilihan, pemeriksaan alasan, dan fakta rute yang selalu dari tool domain. Bila risiko ini tidak dapat diterima, informasi `pending` dapat dikeluarkan dari tool `info_layanan`.
-- **Stasiun ditutup (`closure`/`disruption`) dihindari hanya sebagai titik transfer**, dan stasiun naik/turun tetap bisa dipilih pengguna. Rute yang berhenti di stasiun itu dikurangi skornya dan diberi peringatan.
+- **Stasiun ditutup atau terganggu (`closure`/`disruption`) hanya dihindari sebagai titik transfer** lewat rute tambahan; stasiun naik/turun tetap bisa dipilih pengguna. Rute yang melewatinya dikurangi skornya dan diberi peringatan, tetapi tidak dibuang. Ditemukan saat uji UI: bila semua rute pindah di stasiun itu, versi awal yang membuang kandidat justru menghilangkan rute yang paling aksesibel.
 - **Pencocokan nama stasiun** memakai nama yang tercatat di NTD (mis. "Setiabudi (LRT)" hanya cocok bila ditulis lengkap). Nama yang disebut LLM tetapi tidak cocok dicatat di `extraction.unmatched` agar admin melengkapi saat menyetujui.
 - **Kuota X per siklus tagihan** diperkirakan dengan bulan kalender UTC; tagihan resmi mengikuti siklus akun X.
 - **Satu instance**: penjadwal pembacaan berjalan dalam proses server, jadi hanya satu replika yang boleh menyalakan pembacaan.
@@ -143,7 +143,7 @@ Admin (`/api/admin`):
 
 ## 9. Di luar cakupan (tindak lanjut)
 
-- UI admin untuk antrean persetujuan dan UI Frontend untuk pemilih pipeline.
+- UI Frontend untuk pemilih pipeline (dan menampilkan `serviceInfo`, `pickedBy`, `llmReason`).
 - Pratinjau admin "bagaimana rute berubah jika disetujui".
 - Penutupan otomatis informasi lama saat operator memposting "kembali normal".
 - Pengujian klien X ke akun X sungguhan dan pengujian migrasi pada PostgreSQL sungguhan di lingkungan terpisah.

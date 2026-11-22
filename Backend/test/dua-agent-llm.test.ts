@@ -339,7 +339,24 @@ describe("Informasi layanan: baru mengubah navigasi setelah disetujui admin", ()
     expect(first.route.legs.some((l: any) => [l.stops[0], l.stops[l.stops.length - 1]].includes("bni-city"))).toBe(false);
     expect(first.summary.advisoryImpact).toBeUndefined();
     expect(first.route.legs.some((l: any) => l.lineId === "krl-cikarang")).toBe(true);
-    expect(first.warnings.join(" ")).toMatch(/Rute menghindari titik pindah Sudirman Baru BNI City karena informasi layanan yang disetujui admin/);
+    expect(first.warnings.join(" ")).toMatch(/Rute dipilih agar menghindari titik pindah Sudirman Baru BNI City yang terdampak informasi layanan yang disetujui admin/);
+  });
+
+  it("gangguan di titik pindah yang tak terhindarkan: rute alternatif tidak dibuang, hanya dikurangi skornya", async () => {
+    const { app, services } = await makeTestApp();
+    const base = (await plan(app, JK_DA)).body.data;
+    expect(base.options).toHaveLength(3);
+    // Semua rute dari Jakarta Kota ke Dukuh Atas pindah di Manggarai.
+    const a = await services.advisories.create(advisory({ impact: "disruption", category: "gangguan", summary: "Gangguan sinyal di Manggarai.", stationIds: ["manggarai"], lineIds: [] }));
+    await services.advisories.approve(a.id, {}, "admin@ntd.test");
+    const after = (await plan(app, JK_DA)).body.data;
+    // Pilihan tetap ada dan urutannya tetap; yang berubah hanya skor (-30) dan peringatan.
+    expect(after.options).toHaveLength(3);
+    expect(after.options.map((o: any) => stopsOf(o.route))).toEqual(base.options.map((o: any) => stopsOf(o.route)));
+    expect(after.options.map((o: any) => o.summary.rankScore)).toEqual(base.options.map((o: any) => o.summary.rankScore - 30));
+    expect(after.options.every((o: any) => o.summary.advisoryImpact === "disruption")).toBe(true);
+    expect(after.options[0].warnings.join(" ")).toMatch(/Rute ini tetap melewati titik pindah Manggarai yang terdampak informasi layanan yang disetujui admin; rute yang menghindarinya kurang aksesibel atau tidak ada/);
+    expect(after.serviceInfo[0]).toMatchObject({ status: "approved", impact: "disruption" });
   });
 
   it("penutupan lini disetujui mengurangi skor rute yang memakainya dan memberi peringatan", async () => {
@@ -404,7 +421,7 @@ describe("Informasi layanan: baru mengubah navigasi setelah disetujui admin", ()
     const d = (await plan(app, JK_DA)).body.data;
     expect(d.serviceInfo.map((x: any) => x.status)).toEqual(["approved"]);
     // Yang disetujui tetap mengubah navigasi walau LLM dimatikan: bni-city dihindari sebagai titik pindah.
-    expect(d.options[0].warnings.join(" ")).toMatch(/Rute menghindari titik pindah Sudirman Baru BNI City/);
+    expect(d.options[0].warnings.join(" ")).toMatch(/Rute dipilih agar menghindari titik pindah Sudirman Baru BNI City/);
     expect(d.options[0].route.legs.some((l: any) => [l.stops[0], l.stops[l.stops.length - 1]].includes("bni-city"))).toBe(false);
     expect((await request(app).get("/api/service-info")).body.data.map((x: any) => x.status)).toEqual(["approved"]);
   });

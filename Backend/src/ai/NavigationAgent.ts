@@ -138,9 +138,12 @@ export class NavigationAgent {
       if (st.inactive) throw new AppError("INVALID", inactiveMessage(st.name, { source: "ntd", ...(st.inactiveNote ? { note: st.inactiveNote } : {}) }));
     }
     const userAvoid = (input.avoid ?? []).filter((id) => id !== originId && id !== destinationId);
-    // Stasiun yang terganggu atau ditutup menurut informasi layanan yang disetujui admin dihindari sebagai titik transfer.
+    // Stasiun yang terganggu atau ditutup menurut informasi layanan yang disetujui admin: dicarikan rute tambahan yang
+    // menghindarinya sebagai titik transfer. Rute yang tetap melewatinya tidak dibuang (bisa jadi satu-satunya, atau yang
+    // paling aksesibel); skornya saja yang dikurangi.
     const advisoryAvoid = advisoryAvoidStations(effective).filter((id) => id !== originId && id !== destinationId && !userAvoid.includes(id));
-    const avoid = [...userAvoid, ...advisoryAvoid];
+    const avoid = userAvoid;
+    const avoidWithAdvisory = [...userAvoid, ...advisoryAvoid];
     const warnings: string[] = [];
 
     // 1. Rute dari dataset.
@@ -173,10 +176,8 @@ export class NavigationAgent {
       if (pick?.route) {
         route = pick.route;
         await assessAndStore(route);
-      } else if (transferStationIds(route).some((t) => userAvoid.includes(t))) {
-        warnings.push("Rute tanpa stasiun yang ingin dihindari tidak ditemukan; ditampilkan rute dasar.");
       } else {
-        warnings.push("Rute tanpa titik pindah yang terdampak gangguan layanan tidak ditemukan; ditampilkan rute dasar.");
+        warnings.push("Rute tanpa stasiun yang ingin dihindari tidak ditemukan; ditampilkan rute dasar.");
       }
     }
 
@@ -210,6 +211,16 @@ export class NavigationAgent {
           return [] as Route[];
         });
       for (const v of variants) candidates.push({ route: v, alternatives: [], origin: "variasi" });
+      // Rute tambahan yang menghindari stasiun terganggu/ditutup (informasi layanan yang disetujui admin).
+      if (advisoryAvoid.length) {
+        const around = await this.tools
+          .call("variasi_rute", { fromId: originId, toId: destinationId, avoidModes, known: candidates.map((c) => c.route), at: input.at, avoid: avoidWithAdvisory }, ctx, snap)
+          .catch((e) => {
+            this.log.warn("variasi rute menghindari gangguan dilewati", { error: (e as Error).message });
+            return [] as Route[];
+          });
+        for (const v of around) candidates.push({ route: v, alternatives: [], origin: "variasi" });
+      }
     }
 
     const lines = await this.stations.lines(ctx);
@@ -367,7 +378,7 @@ export class NavigationAgent {
             raw = await this.tools.call("ambil_rute", { fromId: originId, toId: destinationId, viaId: c.viaStationId, at: input.at, avoidModes: modes, needs }, ctx, snap);
           } else if (c.avoidStationIds?.length) {
             const extra = c.avoidStationIds.filter((id) => id !== originId && id !== destinationId);
-            const vs = await this.tools.call("variasi_rute", { fromId: originId, toId: destinationId, avoidModes: modes, known, at: input.at, avoid: [...new Set([...avoid, ...extra])] }, ctx, snap);
+            const vs = await this.tools.call("variasi_rute", { fromId: originId, toId: destinationId, avoidModes: modes, known, at: input.at, avoid: [...new Set([...avoidWithAdvisory, ...extra])] }, ctx, snap);
             raw = vs[0] ?? null;
           } else {
             raw = await this.tools.call("ambil_rute", { fromId: originId, toId: destinationId, at: input.at, avoidModes: modes, needs }, ctx, snap);
@@ -418,7 +429,14 @@ export class NavigationAgent {
     };
     // Informasi yang disetujui dan membuat rute menghindari stasiunnya tetap ditampilkan walau tidak ada kandidat yang melewatinya lagi.
     const relevantInfo: ServiceAdvisory[] = activeInfo.filter((a) => isRelevant(a, scope) || (a.status === "approved" && a.stationIds.some((id) => advisoryAvoid.includes(id))));
-    if (advisoryAvoid.length) common.push(`Rute menghindari titik pindah ${advisoryAvoid.map(nameOf).join(", ")} karena informasi layanan yang disetujui admin.`);
+    if (advisoryAvoid.length) {
+      const stillThrough = transferStationIds(primary.route).filter((id) => advisoryAvoid.includes(id));
+      common.push(
+        stillThrough.length
+          ? `Rute ini tetap melewati titik pindah ${stillThrough.map(nameOf).join(", ")} yang terdampak informasi layanan yang disetujui admin; rute yang menghindarinya kurang aksesibel atau tidak ada.`
+          : `Rute dipilih agar menghindari titik pindah ${advisoryAvoid.map(nameOf).join(", ")} yang terdampak informasi layanan yang disetujui admin.`,
+      );
+    }
     const serviceInfo = relevantInfo.map(toView);
     // Hanya untuk narasi LLM: informasi layanan sebagai pengumuman berlabel jelas (disetujui vs belum diverifikasi).
     const advisoryNotices: Notice[] =
