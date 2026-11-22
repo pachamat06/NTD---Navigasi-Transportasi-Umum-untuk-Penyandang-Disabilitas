@@ -418,7 +418,7 @@ export class RoutePlannerService {
         ...(l.arrivalAt ? { arrivalAt: l.arrivalAt } : {}),
       };
     });
-    const route = totals(legs, fare.totalFare, fare.totalDistanceM);
+    const route = totals(withImplicitTransfers(legs), fare.totalFare, fare.totalDistanceM);
     return Object.keys(fare.stopNames ?? {}).length ? { ...route, stopNames: fare.stopNames } : route;
   }
 
@@ -792,6 +792,25 @@ export function parallelLines(stops: string[], primary: string, sequences: LineS
   };
   const found = sequences.filter((l) => l.lineId !== primary && same(l.lineId) && l.sequences.some((seq) => covers(seq, l.directed))).map((l) => l.lineId);
   return [primary, ...new Set(found)];
+}
+
+/**
+ * Dua ruas naik berurutan pada lini berbeda yang bersambung di stasiun yang sama berarti penumpang pindah lini di
+ * stasiun itu, walau dataset (/fares) tidak memberi ruas pindah di antaranya (mis. Kemayoran → Kampung Bandan → Jakarta
+ * Kota). Ruas pindah ditambahkan agar titik pindah itu ikut diperiksa: fasilitas yang dibutuhkan, alternatif di hub,
+ * jumlah pindah, dan waktu tunggu. Lini yang sama yang terpecah per segmen tarif tidak dianggap pindah.
+ */
+export function withImplicitTransfers(legs: RouteLeg[]): RouteLeg[] {
+  const out: RouteLeg[] = [];
+  for (const leg of legs) {
+    const prev = out[out.length - 1];
+    if (prev?.type === "RIDE" && leg.type === "RIDE" && prev.stops[prev.stops.length - 1] === leg.stops[0] && (!prev.lineId || !leg.lineId || prev.lineId !== leg.lineId)) {
+      const stop = leg.stops[0];
+      out.push({ type: "TRANSFER", stops: [stop, stop], distanceM: 0, minutes: null, fare: 0 });
+    }
+    out.push(leg);
+  }
+  return out;
 }
 
 export function totals(legs: RouteLeg[], totalFare?: number, totalDistanceM?: number): Route {
