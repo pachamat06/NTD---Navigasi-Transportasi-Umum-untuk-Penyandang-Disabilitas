@@ -653,6 +653,77 @@ export function adminRoutes(s: Services): Router {
     ok(res, { hubs: effective, base: applyHubs(base, [], new Set(stations.map((x) => x.id))) });
   });
 
+  // Hapus hub dengan aman. Hub buatan admin: isiannya dihapus (lewat draft, hilang setelah publikasi). Hub dari
+  // dataset (Commute atau bawaan NTD) tidak bisa dihapus dari sumbernya, jadi dinonaktifkan lewat isian admin
+  // ber-`disabled` (tetap lewat draft; hilang dari perencana rute setelah publikasi, dan tetap hilang walau
+  // dataset disinkron ulang). Hub yang isian adminnya menggantikan hub dataset juga dinonaktifkan, bukan dikembalikan.
+  const hubTarget = async (hubId: string) => {
+    const ctx = newContext({ preview: true });
+    const [commuteHubs, stations, effective, items] = await Promise.all([s.commute.getHubs(ctx), s.stations.list(ctx), s.stations.hubs(ctx), s.store.content.list({ kind: "hub" })]);
+    const base = applyHubs(commuteHubs, [], new Set(stations.map((x) => x.id))).find((h) => h.id === hubId);
+    const item = items.find((it) => ((it.draft ?? it.published) as { hubId?: string } | null)?.hubId === hubId);
+    const live = effective.find((h) => h.id === hubId);
+    if (!base && !item && !live) throw new AppError("NOT_FOUND", "Hub tidak ditemukan.");
+    return { ctx, base, item, live };
+  };
+
+  // Dampak penghapusan hub: pengumuman yang menargetkan hub itu dan sumber hub (menentukan caranya).
+  r.get("/hubs/:hubId/impact", async (req, res) => {
+    const hubId = parse(idParam, req.params.hubId);
+    const { base, item, live } = await hubTarget(hubId);
+    const notices = (await s.store.content.list({ kind: "notice" }))
+      .filter((it) => !it.draftDeleted)
+      .map((it) => ({ id: it.id, v: (it.draft ?? it.published) as { scope?: string; targetId?: string; title?: string } | null }))
+      .filter((x) => x.v?.scope === "hub" && x.v.targetId === hubId)
+      .map((x) => ({ id: x.id, title: x.v?.title ?? "" }));
+    const itemValue = (item?.draft ?? item?.published) as { disabled?: boolean } | null | undefined;
+    ok(res, {
+      hubId,
+      name: live?.name ?? base?.name ?? hubId,
+      source: base ? (base.source ?? "commute") : "admin",
+      method: base ? "disable" : "delete",
+      active: !!live,
+      alreadyDisabled: !live && !!base && !!itemValue?.disabled,
+      notices,
+    });
+  });
+
+  r.post("/hubs/:hubId/remove", async (req, res) => {
+    const hubId = parse(idParam, req.params.hubId);
+    const { base, item, live } = await hubTarget(hubId);
+    if (!base) {
+      // Hub buatan admin: hapus isiannya.
+      if (!item) throw new AppError("NOT_FOUND", "Hub tidak ditemukan.");
+      const removed = await s.store.content.markDeleted(item.id, actor(req));
+      await audit(req, "hub.remove", item.id, { hubId, method: "delete" });
+      return ok(res, { hubId, method: "delete", item: removed ? itemView(removed) : null });
+    }
+    // Hub dataset: nonaktifkan dengan isian admin, tanpa membuang isian (anggota, jalan kaki, gate) yang sudah ada.
+    const cur = (item && !item.draftDeleted ? (item.draft ?? item.published) : null) as Record<string, unknown> | null;
+    if (!live && cur?.disabled === true) throw new AppError("CONFLICT", "Hub ini sudah dinonaktifkan.", { id: item?.id });
+    const src = (cur ?? live ?? base) as { name: string; kind?: string; memberIds: string[]; walks?: unknown[]; gates?: unknown[]; syncedAt?: string };
+    const data = await validateBody(
+      "hub",
+      null,
+      {
+        hubId,
+        name: src.name,
+        kind: src.kind ?? "hub",
+        memberIds: src.memberIds,
+        walks: src.walks ?? [],
+        gates: src.gates ?? [],
+        source: "manual",
+        ...(src.syncedAt ? { syncedAt: src.syncedAt } : {}),
+        disabled: true,
+        note: "Dihapus admin",
+      },
+      item?.id,
+    );
+    const saved = await s.store.content.saveDraft({ ...(item ? { id: item.id } : {}), kind: "hub", stationId: null, data, by: actor(req) });
+    await audit(req, "hub.remove", saved.id, { hubId, method: "disable" });
+    ok(res, { hubId, method: "disable", item: itemView(saved) });
+  });
+
   // Data Commute untuk satu hub: anggota dan jalan kaki bila hub itu ada di /hubs, ditambah jalan kaki antaranggota
   // `members` dari /stations/{op}/{code}/transfers (untuk hub buatan admin).
   r.get("/hubs/defaults", async (req, res) => {
