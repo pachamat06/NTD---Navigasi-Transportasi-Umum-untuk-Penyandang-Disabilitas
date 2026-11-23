@@ -493,7 +493,19 @@ export interface Platform {
   gap?: PlatformGap;
   note?: string;
   source: DataSource;
+  /**
+   * Ada isian peron ini yang terisi otomatis dari ruas concourse → peron (lift, eskalator, ramp). Isian tim pada peron
+   * selalu menang, jadi hanya field yang masih kosong yang diturunkan. Tidak disimpan: dihitung saat detail dibaca.
+   */
+  accessFromConcourse?: {
+    fields: PlatformDerivedField[];
+    /** Ruas concourse sumbernya dan cara berpindah yang dicatat di sana. */
+    from: { concourse: string; name?: string; means: SegmentMeans[] }[];
+  };
 }
+
+/** Field peron yang dapat terisi otomatis dari concourse: status lift/eskalator/ramp, jumlah lift, dan kelompok eskalator. */
+export type PlatformDerivedField = "lift" | "eskalator" | "ramp" | "liftInfo" | "escalators";
 
 export interface Entrance {
   id: string;

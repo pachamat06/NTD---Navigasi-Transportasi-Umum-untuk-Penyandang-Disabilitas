@@ -294,6 +294,8 @@ export interface Platform {
   gap?: PlatformGap;
   note?: string;
   source: "dataset" | "ntd";
+  /** Sebagian isian peron ini terisi otomatis dari ruas concourse → peron. */
+  accessFromConcourse?: { fields: ("lift" | "eskalator" | "ramp" | "liftInfo" | "escalators")[]; from: { concourse: string; name?: string; means: SegmentMeans[] }[] };
 }
 
 export interface StationInfo {

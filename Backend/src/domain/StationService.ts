@@ -4,6 +4,7 @@
 import type { RequestContext } from "../context";
 import type { CommuteApiClient } from "../data/commute/CommuteApiClient";
 import type { ContentSnapshot } from "./content";
+import { applyConcourseAccess } from "./concourseAccess";
 import { applyPlatformExits, mergeGates, type FacilityAnalysisService } from "./FacilityAnalysisService";
 import type { Entrance, Hub, Line, Platform, Station, StationDetail } from "./models";
 import { applyPatternsToLines, type PatternProvider } from "./routePatterns";
@@ -99,7 +100,9 @@ export class StationService {
       dataset ? this.commute.getPlatforms(id, ctx) : Promise.resolve([]),
       dataset ? this.commute.getExits(id, ctx) : Promise.resolve([]),
     ]);
-    const merged = mergePlatforms(platforms, snap.platformsOf(id));
+    const concourses = snap.concoursesOf(id);
+    // Akses ruas concourse → peron yang sudah diisi otomatis menjadi akses peron (isian peron tetap menang).
+    const merged = applyConcourseAccess(mergePlatforms(platforms, snap.platformsOf(id)), concourses);
     return {
       ...st,
       ...facilities,
@@ -107,7 +110,7 @@ export class StationService {
       platforms: merged,
       // Akses peron ke pintu keluar (isian data peron) ikut menjadi jalur gate → peron.
       entrances: applyPlatformExits(mergeEntrances(exits, snap.entrancesOf(id)), merged),
-      concourses: snap.concoursesOf(id),
+      concourses,
       info: snap.infoOf(id),
       notices: snap.notices({ stationIds: [id], lineIds: st.lineIds, hubIds: st.hubId ? [st.hubId] : [] }).filter((n) => n.scope !== "global"),
     };

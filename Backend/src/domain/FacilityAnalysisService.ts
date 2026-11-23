@@ -4,6 +4,7 @@
 import type { RequestContext } from "../context";
 import type { CommuteApiClient } from "../data/commute/CommuteApiClient";
 import type { ContentSnapshot } from "./content";
+import { applyConcourseAccess } from "./concourseAccess";
 import {
   CORE_AMENITIES,
   EXTRA_AMENITIES,
@@ -72,7 +73,7 @@ export class FacilityAnalysisService {
     const overrides = snap.facilityOverrides(stationId);
     for (const o of overrides) details.set(o.type, o);
     // Fasilitas yang diisi pada peron otomatis mengisi fasilitas umum stasiun (peron punya lift = stasiun punya lift).
-    const derived = fromPlatforms(snap.platformsOf(stationId), snap.legacyPlatformToilet(stationId));
+    const derived = fromPlatforms(applyConcourseAccess(snap.platformsOf(stationId), snap.concoursesOf(stationId)), snap.legacyPlatformToilet(stationId));
     for (const d of derived) {
       const cur = details.get(d.type);
       // Isian tim untuk stasiun yang menyatakan sedang tidak berfungsi tetap dipakai.
