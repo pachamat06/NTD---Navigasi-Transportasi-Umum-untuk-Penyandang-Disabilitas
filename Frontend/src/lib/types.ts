@@ -63,12 +63,26 @@ export interface HubWalk {
   toExit?: ExitRef;
 }
 
+/** Gate/pintu anggota hub yang tersambung ke anggota lain, beserta fasilitas aksesibelnya (isian admin). */
+export interface HubGate {
+  id: string;
+  stationId: string;
+  name: string;
+  /** Anggota hub yang dicapai lewat gate ini; kosong = semua anggota lain. */
+  connectsTo: string[];
+  facilities: ("lift" | "ramp" | "eskalator" | "datar" | "tangga" | "guiding_block" | "toilet" | "kursi_roda" | "petugas_bantuan")[];
+  accessible: boolean;
+  openHours?: string;
+  note?: string;
+}
+
 export interface Hub {
   id: string;
   name: string;
   memberIds: string[];
   kind?: "hub" | "integrated";
   walks: HubWalk[];
+  gates?: HubGate[];
 }
 
 /** Posisi pemberhentian yang ditetapkan admin, dalam koordinat peta (pt). */
@@ -380,6 +394,9 @@ export interface RouteLeg {
   notes?: string;
   fromExit?: ExitRef;
   toExit?: ExitRef;
+  /** Ruas pindah antarstasiun hub: gate keluar dan gate masuk dari isian admin. */
+  fromGate?: HubGate;
+  toGate?: HubGate;
   /** Status fasilitas yang dibutuhkan pengguna di kedua ujung perpindahan. */
   access?: TransferAccess[];
   /** Ruas pindah antarstasiun lewat tautan transfer di luar hub: akses yang tersedia di jalan itu. */

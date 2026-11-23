@@ -114,6 +114,28 @@ export interface HubWalk {
   toExit?: ExitRef;
 }
 
+/** Fasilitas aksesibel pada gate/pintu stasiun yang dipakai berpindah di hub. */
+export const HUB_GATE_FACILITIES = ["lift", "ramp", "eskalator", "datar", "tangga", "guiding_block", "toilet", "kursi_roda", "petugas_bantuan"] as const;
+export type HubGateFacility = (typeof HUB_GATE_FACILITIES)[number];
+
+/**
+ * Gate/pintu stasiun anggota hub yang tersambung ke anggota lain (diisi admin), beserta fasilitas aksesibelnya.
+ * `connectsTo` kosong = gate dipakai ke semua anggota hub lain.
+ */
+export interface HubGate {
+  id: string;
+  stationId: string;
+  /** Pintu/gate stasiun (id entri `entrances` detail stasiun) yang dirujuk gate ini, bila dipilih dari data stasiun. */
+  entranceId?: string;
+  name: string;
+  connectsTo: string[];
+  facilities: HubGateFacility[];
+  /** Bisa dilalui tanpa anak tangga (pengguna kursi roda). */
+  accessible: boolean;
+  openHours?: string;
+  note?: string;
+}
+
 export interface Hub {
   id: string;
   name: string;
@@ -121,6 +143,8 @@ export interface Hub {
   kind?: "hub" | "integrated";
   memberIds: string[];
   walks: HubWalk[];
+  /** Gate/pintu anggota hub yang tersambung ke anggota lain (isian admin). */
+  gates?: HubGate[];
   /** Asal hub: "commute" = /hubs Commute Data API, "ntd" = hub bawaan NTD, "admin" = dibuat/diubah admin. */
   source?: "commute" | "ntd" | "admin";
 }
@@ -360,6 +384,9 @@ export interface RouteLeg {
   notes?: string;
   fromExit?: ExitRef;
   toExit?: ExitRef;
+  /** Ruas pindah antarstasiun hub: gate keluar di stasiun asal dan gate masuk di stasiun tujuan (isian admin). */
+  fromGate?: HubGate;
+  toGate?: HubGate;
   /** Ruas pindah: status fasilitas yang dibutuhkan pengguna di kedua ujung. */
   access?: TransferAccess[];
   /** Ruas pindah antarstasiun lewat tautan transfer di luar hub: akses yang tersedia di jalan itu. */

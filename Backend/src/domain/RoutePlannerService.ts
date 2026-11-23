@@ -8,10 +8,10 @@ import type { CommuteApiClient, FareResult, LineHeadway } from "../data/commute/
 import { lineIdOf, lineRefOf, type StationIndex } from "../data/commute/station-index";
 import type { TjGtfs } from "../data/gtfs/TjGtfs";
 import type { Frequency, Hub, Line, Mode, RideOption, Route, RouteLeg, Station, StationLink, TransferNeed } from "./models";
-import { applyHubs, straightDistanceM, walkBetween, type HubProvider } from "./hubs";
+import { applyHubs, gateToward, straightDistanceM, walkBetween, type HubProvider } from "./hubs";
 import { applyLinks, legLink, linkBetween, linkFailsNeeds, type LinkProvider } from "./stationLinks";
 import { isLocal } from "./datasetOverlay";
-import { applyPatternsToSequences, patternMinutes, type LineSequences, type PatternProvider } from "./routePatterns";
+import { applyPatternsToSequences, patternMinutes, patternStops, type LineSequences, type PatternProvider } from "./routePatterns";
 import { jakartaDayHour } from "../data/commute/HttpCommuteSource";
 import { headwayAround, isoAt, jakartaMinutes, matchTrips, medianMinutes, nextTrip, serviceHours, terminusTrips, typicalMinutes, type TripMatch } from "./railTimetable";
 
@@ -34,7 +34,7 @@ export const WALK_WEIGHT = { AVERAGE: 2, SLOW: 4 } as const;
 const UNKNOWN_HOP_KM = 1;
 
 /** Ruas naik pada satu lini; lineId "" = berjalan kaki antar stasiun di hub. */
-interface Ride {
+export interface Ride {
   lineId: string;
   stops: string[];
 }
@@ -94,13 +94,56 @@ export class RoutePlannerService {
       throw failure;
     }
     const lines = await this.commute.getLines(ctx);
-    return this.withLinks(await this.fixDirections(this.enrich(fare, lines), lines, ctx), ctx);
+    const dataset = await this.followPatterns(await this.fixDirections(this.enrich(fare, lines), lines, ctx), ctx);
+    if (opts.topology === false) return this.withLinks(dataset, ctx);
+    return this.withLinks((await this.adminNetworkRoute(fromId, toId, dataset, ctx, at)) ?? dataset, ctx);
   }
 
   /** Ruas pindah antarstasiun yang tertaut (tautan transfer) diberi akses, jarak, dan waktu dari tautan itu. */
   private async withLinks(route: Route, ctx: RequestContext): Promise<Route> {
     const links = await this.links(ctx);
     return links.length ? applyLinksToRoute(route, links) : route;
+  }
+
+  /**
+   * Rute dataset (/fares) tidak mengenal hub, halte, dan stasiun yang ditambah admin (mis. hub Manggarai: LRT Manggarai
+   * ↔ Halte Manggarai Temporer). Bila rute di atas urutan lini + hub yang berlaku memakai salah satunya dan jelas lebih
+   * ringkas (ukuran biaya yang sama dengan findRides), rute itu yang dipakai. null = tetap rute dataset.
+   */
+  private async adminNetworkRoute(fromId: string, toId: string, dataset: Route, ctx: RequestContext, at?: string): Promise<Route | null> {
+    const [stations, lines, hubs, sequences] = await Promise.all([this.commute.getStations(ctx), this.commute.getLines(ctx), this.hubs(ctx), this.sequences(ctx)]);
+    const byId = new Map(stations.map((s) => [s.id, s]));
+    const rides = findRides(fromId, toId, sequences, hubs, byId, WALK_WEIGHT.AVERAGE);
+    if (!rides || !usesLocalNetwork(rides, hubs, byId)) return null;
+    const cost = ridesCost(rides, hubs, byId);
+    if (cost >= routeCost(dataset, byId) * 0.9 - 0.5) return null;
+    return this.routeFromRides(rides, [], new Map(lines.map((l) => [l.id, l])), stations, hubs, ctx, at).catch(() => null);
+  }
+
+  /**
+   * Ruas naik pada lini yang diatur admin mengikuti urutan pemberhentian pengaturan itu (mis. koridor dialihkan karena
+   * pekerjaan jalan, atau halte sementara arah tertentu), sehingga daftar halte dan garis peta sesuai pengaturan admin.
+   */
+  async followPatterns(route: Route, ctx: RequestContext): Promise<Route> {
+    const patterns = this.patterns ? await this.patterns(ctx) : [];
+    if (!patterns.length) return route;
+    let changed = false;
+    const legs = route.legs.map((leg) => {
+      if (leg.type !== "RIDE" || leg.stops.length < 2) return leg;
+      const lineIds = [leg.lineId, ...(leg.options ?? []).map((o) => o.lineId)].filter((x): x is string => !!x);
+      const stops = patternStops(patterns, lineIds, leg.stops[0], leg.stops[leg.stops.length - 1]);
+      if (!stops || stops.join(">") === leg.stops.join(">")) return leg;
+      changed = true;
+      return { ...leg, stops };
+    });
+    if (!changed) return route;
+    // Nama pemberhentian baru (mis. halte sementara) untuk ditampilkan.
+    const names = { ...(route.stopNames ?? {}) };
+    if (route.stopNames) {
+      const stations = await this.commute.getStations(ctx);
+      for (const id of legs.flatMap((l) => l.stops)) if (!names[id]) names[id] = stations.find((s) => s.id === id)?.name ?? id;
+    }
+    return { ...route, legs, ...(route.stopNames ? { stopNames: names } : {}) };
   }
 
   /** true bila salah satu stasiun bukan stasiun dataset (lihat datasetOverlay.ts). */
@@ -387,7 +430,7 @@ export class RoutePlannerService {
     const from = ride.stops[0];
     const to = ride.stops[ride.stops.length - 1];
     const fromDataset = await this.getRoute(from, to, ctx, at, { topology: false }).catch(() => null);
-    if (fromDataset && !usesModes(fromDataset, avoidModes)) {
+    if (fromDataset && !usesModes(fromDataset, avoidModes) && servesRide(fromDataset, ride.lineId)) {
       // Ruas pindah di ujung tidak diperlukan; perpindahan disusun oleh pemanggil.
       const legs = fromDataset.legs.slice();
       while (legs[0]?.type === "TRANSFER") legs.shift();
@@ -462,22 +505,31 @@ export class RoutePlannerService {
    *   lin lain dari operator yang sama yang berhenti di semua pemberhentian ruas itu berurutan;
    * - ruas naik tanpa jadwal: frekuensi lin di pemberhentian naik (gabungan bila ada beberapa pilihan).
    */
-  async annotate(route: Route, ctx: RequestContext, at?: string): Promise<Route> {
+  async annotate(route: Route, ctx: RequestContext, at?: string, opts: { needs?: readonly string[] } = {}): Promise<Route> {
     const when = new Date(at ?? ctx.now.toISOString());
     // Moda rel: perjalanan dari jadwal Commute untuk tiap ruas naik (waktu tempuh dan frekuensi).
     const rail = await this.railTrips(route.legs, ctx, when);
     const needsParallel = route.legs.some((l) => l.type === "RIDE" && !l.options && l.lineId);
-    const [lines, sequences] = await Promise.all([this.commute.getLines(ctx), needsParallel ? this.sequences(ctx) : Promise.resolve([])]);
+    const walking = route.legs.some((l) => l.type === "TRANSFER" && l.stops[0] !== l.stops[l.stops.length - 1]);
+    const [lines, sequences, hubs] = await Promise.all([
+      this.commute.getLines(ctx),
+      needsParallel ? this.sequences(ctx) : Promise.resolve([]),
+      walking ? this.hubs(ctx).catch(() => [] as Hub[]) : Promise.resolve([] as Hub[]),
+    ]);
     const lineById = new Map(lines.map((l) => [l.id, l]));
     const legs = await Promise.all(
       route.legs.map(async (leg): Promise<RouteLeg> => {
         if (leg.type === "TRANSFER") {
           const [a, b] = [leg.stops[0], leg.stops[leg.stops.length - 1]];
           if (a === b) return leg;
+          // Gate/pintu yang tersambung di kedua ujung (isian admin pada hub), beserta fasilitas aksesibelnya.
+          const fromGate = gateToward(hubs, a, b, opts.needs);
+          const toGate = gateToward(hubs, b, a, opts.needs);
+          const gated: RouteLeg = { ...leg, ...(fromGate ? { fromGate } : {}), ...(toGate ? { toGate } : {}) };
           const walk = await this.commute.getWalk(a, b, ctx).catch(() => undefined);
-          if (!walk) return leg;
+          if (!walk) return gated;
           return {
-            ...leg,
+            ...gated,
             distanceM: leg.distanceM || walk.distanceM,
             ...(leg.minutes === null && walk.minutes !== null ? { minutes: walk.minutes } : {}),
             ...(walk.notes && !leg.link ? { notes: walk.notes } : {}),
@@ -927,6 +979,74 @@ export function transferStationIds(route: Route): string[] {
   return [...new Set(route.legs.filter((l) => l.type === "TRANSFER").flatMap((l) => l.stops))];
 }
 
+/** Jarak (km) antara dua pemberhentian bersebelahan untuk membandingkan rute; tanpa koordinat = UNKNOWN_HOP_KM. */
+function hopKm(stations: Map<string, Station>, a: string, b: string): number {
+  const p = stations.get(a);
+  const q = stations.get(b);
+  const d = p && q && hasCoords(p) && hasCoords(q) ? km(p, q) : 0;
+  return d > 0 ? d : UNKNOWN_HOP_KM;
+}
+
+/**
+ * Biaya rute dengan ukuran findRides (setara km): jarak naik, TRANSFER_COST_KM tiap pindah lini/berbalik arah, dan
+ * jalan kaki antarstasiun (jarak × `walkWeight`). Hanya untuk membandingkan rute.
+ */
+export function routeCost(route: Route, stations: Map<string, Station>, walkWeight: number = WALK_WEIGHT.AVERAGE): number {
+  let cost = 0;
+  let prevRide = false;
+  for (const leg of route.legs) {
+    const [a, b] = [leg.stops[0], leg.stops[leg.stops.length - 1]];
+    if (leg.type === "RIDE") {
+      if (prevRide) cost += TRANSFER_COST_KM;
+      for (let i = 1; i < leg.stops.length; i++) cost += hopKm(stations, leg.stops[i - 1], leg.stops[i]);
+      prevRide = true;
+      continue;
+    }
+    prevRide = false;
+    cost += TRANSFER_COST_KM;
+    if (a !== b) cost += (leg.distanceM > 0 ? leg.distanceM / 1000 : hopKm(stations, a, b)) * walkWeight;
+  }
+  return cost;
+}
+
+/** Biaya hasil findRides dengan ukuran yang sama dengan routeCost (jalan kaki memakai jarak data hub bila ada). */
+export function ridesCost(rides: Ride[], hubs: Hub[], stations: Map<string, Station>, walkWeight: number = WALK_WEIGHT.AVERAGE): number {
+  const legs: RouteLeg[] = rides.map((r) => {
+    if (r.lineId) return { type: "RIDE", lineId: r.lineId, stops: r.stops, distanceM: 0, minutes: null, fare: 0 };
+    const walk = walkBetween(hubs, r.stops[0], r.stops[1]);
+    return { type: "TRANSFER", stops: r.stops, distanceM: walk?.distanceM ?? 0, minutes: null, fare: 0 };
+  });
+  return routeCost(totals(legs), stations, walkWeight);
+}
+
+/**
+ * true bila ruas hasil findRides memakai jaringan yang tidak dikenal /fares: jalan kaki di hub bawaan NTD atau hub
+ * yang diatur admin, atau pemberhentian yang bukan stasiun Commute (tambahan admin, impor GTFS, bawaan NTD).
+ */
+export function usesLocalNetwork(rides: Ride[], hubs: Hub[], stations: Map<string, Station>): boolean {
+  const foreign = (id: string) => {
+    const src = stations.get(id)?.source;
+    return !!src && src !== "commute";
+  };
+  return rides.some((r) => {
+    if (r.stops.some(foreign)) return true;
+    if (r.lineId) return false;
+    const [a, b] = r.stops;
+    return hubs.some((h) => h.source !== "commute" && h.memberIds.includes(a) && h.memberIds.includes(b));
+  });
+}
+
+/**
+ * Rute dataset untuk satu ruas naik pada lini `lineId` boleh dipakai bila tidak berjalan kaki ke stasiun lain dan
+ * tidak berpindah ke lini lain di tengahnya (rute /fares yang memutar tidak menggantikan ruas yang sudah dipilih).
+ */
+export function servesRide(route: Route, lineId: string): boolean {
+  if (route.legs.some((l) => l.type === "TRANSFER" && l.stops[0] !== l.stops[l.stops.length - 1] && !l.turnaround)) return false;
+  const rides = route.legs.filter((l) => l.type === "RIDE");
+  if (rides.length <= 1) return rides.length === 1;
+  return rides.every((l) => l.lineId === lineId || !!l.options?.some((o) => o.lineId === lineId));
+}
+
 /**
  * Dijkstra di atas (stasiun, lini): naik ke stasiun berikut pada ruas lini berbiaya jaraknya, pindah lini di
  * stasiun yang sama atau berjalan ke stasiun lain di hub berbiaya TRANSFER_COST_KM. Hasilnya dipecah menjadi
@@ -943,12 +1063,7 @@ export function findRides(
 ): Ride[] | null {
   const transferCost = opts.transferCost ?? TRANSFER_COST_KM;
   const noTransfer = opts.noTransferAt ?? new Set<string>();
-  const hop = (a: string, b: string) => {
-    const p = stations.get(a);
-    const q = stations.get(b);
-    const d = p && q && hasCoords(p) && hasCoords(q) ? km(p, q) : 0;
-    return d > 0 ? d : UNKNOWN_HOP_KM;
-  };
+  const hop = (a: string, b: string) => hopKm(stations, a, b);
   // Tetangga per stasiun pada tiap lini.
   const rideNext = new Map<string, { lineId: string; to: string; cost: number }[]>();
   const linesAt = new Map<string, Set<string>>();
