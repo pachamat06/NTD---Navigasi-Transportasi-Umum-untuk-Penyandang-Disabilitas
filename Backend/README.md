@@ -2,7 +2,7 @@
 
 API perencanaan perjalanan aksesibel untuk NTD (Navigasi Transportasi Umum untuk Penyandang Disabilitas), mengikuti rancangan Bab III laporan RPL Kelompok 11.
 
-Stack: Node.js 22+, Express 5, TypeScript, PostgreSQL 16, zod. LLM opsional (Claude atau GPT) hanya untuk menyusun kalimat notifikasi.
+Stack: Node.js 22+, Express 5, TypeScript, PostgreSQL 16, zod. LLM opsional (Claude atau GPT), dipakai dua agent pada mode LLM: agent navigasi dan agent pembaca informasi layanan akun X operator (lihat [Mode LLM dengan dua agent](#mode-llm-dengan-dua-agent)).
 
 ## Menjalankan
 
@@ -34,7 +34,8 @@ Semua variabel lingkungan terdokumentasi di [.env.example](.env.example).
 | Lapisan rancangan | Implementasi |
 | --- | --- |
 | REST Controller / PlanController | `src/http/publicRoutes.ts`, `src/app.ts` |
-| Agen Navigasi (Planner) | `src/ai/NavigationAgent.ts`: pipeline tool deterministik, satu panggilan LLM untuk narasi |
+| Agen Navigasi (Planner) | `src/ai/NavigationAgent.ts`: pipeline tool deterministik (default, tanpa LLM). Pipeline LLM (opsional, `pipeline: "llm"`): `src/ai/LlmNavigator.ts` memilih rute lewat tool-calling, ditambah satu panggilan LLM untuk narasi |
+| Agen Pembaca | `src/ai/reader/`: membaca akun X operator, mengekstrak informasi layanan, antrean persetujuan admin (`src/domain/serviceAdvisory.ts`) |
 | Tool Registry | `src/ai/ToolRegistry.ts`: `cari_stasiun`, `ambil_rute`, `cek_fasilitas`, `cari_alternatif` |
 | Layanan domain | `src/domain/StationService.ts`, `RoutePlannerService.ts`, `FacilityAnalysisService.ts`, `AlternativeService.ts` |
 | Grounding Guard | `src/ai/GroundingGuard.ts`: cek nama stasiun, angka, dan klaim fasilitas; gagal berarti template statis. Disclaimer ditambahkan sistem |
@@ -59,7 +60,8 @@ Dataset tidak memuat semua informasi aksesibilitas, jadi tim melengkapinya lewat
 
 - `facility`: koreksi status lift, eskalator, toilet aksesibel, ramp, dll. (`available`, `absent`, `out_of_service` dengan `until`, `unknown`). Menimpa dataset untuk jenis yang sama.
 - `entrance`: pintu akses/gate stasiun (nama, lokasi, fitur seperti lift/ramp/guiding block, jam buka, jumlah dan arah eskalator, lift). Dengan `exitRef`, isian tim melengkapi pintu dataset yang sama (`/exits` Commute) dan mewarisi papan petunjuknya. `platformLinks` mencatat peron yang dicapai dari gate itu dan caranya (`langsung`, `crosswalk`, `sebidang`, `jpo`, `terowongan`). Gate yang tidak langsung ke peron memakai `concourseLinks`: concourse yang dicapai dan cara berpindah ke sana (`means`: `datar`, `ramp`, `lift`, `eskalator`, `tangga`, plus `lift` berisi jumlah/status dan `dedicated`). Satu gate boleh punya keduanya.
-- `concourse` (migrasi `006_concourses.sql`): area penghubung antara gate dan peron, satu entri per `code` per stasiun (`name`, `level`, `paid` untuk area setelah gerbang tiket). `platformLinks` berisi ruas concourse ke tiap peron dengan `means`, lift, eskalator, dan `dedicated` yang sama seperti ruas gate. Data pintu lama tanpa concourse tetap berlaku apa adanya.
+- `concourse` (migrasi `006_concourses.sql`): area penghubung antara gate dan peron, satu entri per `code` per stasiun (`name`, `level`, `paid` untuk area setelah gerbang tiket). `platformLinks` berisi ruas concourse ke tiap peron dengan `means`, lift, eskalator, dan `dedicated` yang sama seperti ruas gate. Data pintu lama tanpa concourse tetap berlaku apa adanya. Ruas concourse → peron juga mengisi akses peron secara otomatis (`platform.accessFromConcourse`): lift, eskalator, dan ramp yang tercantum pada ruas, jumlah/lokasi lift, dan kelompok eskalatornya diturunkan ke peron terkait tanpa input ganda (`domain/concourseAccess.ts`). Hanya fakta yang dicatat yang diturunkan (ruas tanpa lift tidak membuat peron 'tidak ada lift'), isian tim pada data peron menang per field, dan turunan tidak disimpan sehingga ikut berubah bila concourse diubah. Fasilitas umum stasiun ikut terisi dari peron itu seperti isian peron biasa.
+- Fasilitas umum stasiun dari pintu (`fromEntrances` di `domain/FacilityAnalysisService.ts`): lift, eskalator, dan ramp yang tercatat pada pintu/gate aksesibel (`lift`/`escalators`/`features`) ikut menjadi fasilitas stasiun dan masuk skor, tanpa diisi dua kali. Hanya fakta tercatat yang diturunkan (pintu tanpa lift bukan bukti stasiun tanpa lift; lift rusak/berjumlah 0 tidak diturunkan), isian fasilitas tim pada stasiun menang, dan turunan tidak disimpan (dihitung saat dibaca). Toilet tidak dapat diturunkan dari pintu.
 - `platform`: peron hasil survei (`code`, jenis `island`/`side`/`bay`, nomor jalur, lin dan arah yang dilayani, fasilitas per peron, eskalator `{count, direction: naik|turun|bergantian, connects}`, lift, dan celah peron dengan kendaraan `{level: sejajar|sedikit|tangga, steps, horizontalCm, verticalCm, boardingAid}`). Nomor peron dan arah diambil dari dataset (`/timetable/grouped`); isian tim menimpa dataset untuk nomor peron yang sama. Butuh migrasi `003_platforms.sql`.
 - `station_info`: info lain (kontak layanan, layanan pendampingan, dll.).
 - `notice`: pengumuman/notifikasi untuk stasiun, lini, hub, atau global, dengan periode aktif dan tingkat (`info`, `warning`, `critical`).
@@ -82,24 +84,48 @@ Respons sukses `{"status":"ok","data":...}`; gagal `{"status":"error","code","me
 | Method | Path | Keterangan |
 | --- | --- | --- |
 | GET | `/health` | Cek hidup |
-| GET | `/api/meta` | Disclaimer, atribusi, bobot skor, label fasilitas, sumber data |
+| GET | `/api/meta` | Disclaimer, atribusi, bobot skor, label fasilitas, sumber data, dan `llm` (`available`, `pipelines`, `defaultPipeline`, `reason?`): pilihan pipeline LLM hanya ada bila admin menyalakan mode LLM dan klien LLM tersedia |
+| GET | `/api/service-info?stationId=&lineId=&hubId=` | Informasi layanan operator yang boleh dilihat pengguna: yang disetujui admin dan, selama mode LLM menyala, yang belum diverifikasi (`status: "pending"`, info saja) |
 | GET | `/api/stations?q=&limit=` | Daftar stasiun, atau pencarian untuk autocomplete |
 | GET | `/api/stations/:id` | Detail stasiun: fasilitas tergabung, skor, peron (`platforms`), pintu akses, info, pengumuman |
 | GET | `/api/network` | Data awal GUI: semua stasiun (fasilitas + skor, `commuteIds` untuk posisi peta), lini, hub, dan `map` (posisi stop dan bentuk jalur dari admin) |
 | GET | `/api/map` | Posisi stop dan bentuk jalur dari admin saja |
 | GET | `/api/lines`, `/api/hubs` | Lini dan hub antarmoda |
 | GET | `/api/notices?stationId=&lineId=&hubId=` | Pengumuman aktif |
-| POST | `/api/plan` | Rencana perjalanan (UC-01). Body `{originId, destinationId, viaStationId?, avoid?, avoidModes?, needs?, at?}`; `avoidModes` berisi moda yang dihindari (`RAIL`, `SUBWAY`, `TRAM`, `BUS`, `MONORAIL`); `needs` berisi fasilitas yang wajib ada saat pindah (`lift`, `eskalator`, `ramp`) |
+| POST | `/api/plan` | Rencana perjalanan (UC-01). Body `{originId, destinationId, viaStationId?, avoid?, avoidModes?, needs?, at?, pipeline?}`; `avoidModes` berisi moda yang dihindari (`RAIL`, `SUBWAY`, `TRAM`, `BUS`, `MONORAIL`); `needs` berisi fasilitas yang wajib ada saat pindah (`lift`, `eskalator`, `ramp`); `pipeline` = `default` (bawaan) atau `llm` |
 
 Dengan `avoidModes`, bila rute dataset memakai moda yang dihindari, backend mencari rute sendiri di atas urutan stasiun lini yang diizinkan (`/lines`, termasuk cabang) dan perpindahan di hub, lalu meminta `/fares` untuk tiap ruas naik agar tarif dan jadwalnya tetap dari dataset. Ruas yang tarifnya tidak tersedia disusun dari urutan stasiun lini (tarif 0, waktu kosong) dan diberi peringatan. Bila tidak ada rute yang lolos, rute dataset tetap ditampilkan dengan peringatan.
 
-Dengan `needs`, tiap ruas pindah memuat `access` (status tiap fasilitas di kedua ujung), titik pindah yang tidak memenuhi dicarikan alternatif di hub yang sama, jalan kaki diberi bobot lebih berat, dan peringatan ditambahkan bila fasilitas tidak tercatat, rusak, atau belum ada datanya.
+Dengan `needs`, tiap ruas pindah memuat `access` (status tiap fasilitas di kedua ujung), titik pindah yang tidak memenuhi dicarikan alternatif di hub yang sama, jalan kaki diberi bobot lebih berat, dan peringatan ditambahkan bila fasilitas tidak tercatat, rusak, atau belum ada datanya. **Lift menggantikan eskalator**: stasiun yang hanya punya lift tetap memenuhi kebutuhan `eskalator` (ruas pindah diberi `substitute: "lift"`); sebaliknya tidak berlaku. Pindah lini di stasiun yang sama tanpa ruas pindah dari dataset tetap dihitung sebagai titik pindah. Pilihan "paling aksesibel" mendahulukan rute dengan paling sedikit kebutuhan yang **pasti** tidak terpenuhi (`summary.unmetCertain`: tercatat tidak ada atau rusak) sebelum membandingkan skor, sehingga rute yang hanya belum diketahui datanya mengalahkan rute yang pasti gagal.
 
 Rute dilengkapi dari Commute: jarak, petunjuk, dan pintu keluar jalan kaki saat pindah (`/stations/{op}/{code}/transfers`); lin paralel yang berhenti di pemberhentian yang sama dengan tarif sama sebagai `options` (mis. TJ 4, 4D, 5, 5C dari Matraman ke Kesatrian; dari `serviceLines` /fares, atau urutan halte lin operator yang sama); dan `frequency` (headway gabungan, `/stations/{op}/{code}/headway`) karena /fares tidak memberi jam keberangkatan. `at` diteruskan ke /fares untuk tarif peak/off-peak.
 
 Ruas naik memuat `platform` (nomor peron dari /fares) dan `boardAt` (peron beserta fasilitas dan celahnya) bila peron dapat dipastikan. Pengecekan `needs` memakai fasilitas peron tempat naik/turun bila tim sudah mengisinya, dan peringatan ditambahkan bila naik kendaraan perlu menaiki anak tangga.
 
-`POST /api/plan` mengembalikan rute (bentuk sama dengan `Frontend/src/lib/types.ts`), penilaian fasilitas tiap stasiun transit, hingga 3 alternatif via stasiun lain di hub yang sama, pengumuman terkait, narasi notifikasi, peringatan (mis. data dari cache), disclaimer, dan atribusi.
+`POST /api/plan` mengembalikan rute (bentuk sama dengan `Frontend/src/lib/types.ts`), penilaian fasilitas tiap stasiun transit, hingga 3 alternatif via stasiun lain di hub yang sama, pengumuman terkait, narasi notifikasi, peringatan (mis. data dari cache), disclaimer, dan atribusi. Tambahan: `pipeline` (diminta dan dipakai) dan `serviceInfo` (informasi layanan operator yang relevan dengan rute).
+
+### Mode LLM dengan dua agent
+
+Rancangan lengkap: [`docs/rancangan-dua-agent-llm.md`](../docs/rancangan-dua-agent-llm.md).
+
+- **Sakelar admin**: `llmEnabled` pada `/settings` (draft, lalu `/publish`). Mati = tidak ada pemakaian LLM sama sekali (agent navigasi, narasi, dan pembacaan X). Menyala + klien LLM ada = pengguna boleh memilih `pipeline: "llm"`.
+- **Pipeline default** (bawaan, tanpa LLM): algoritma deterministik dan notifikasi template. Pipeline **LLM**: agent navigasi memilih satu rute dari kandidat planner lewat tool-calling (`lihat_pilihan_rute`, `detail_rute`, `cek_fasilitas`, `info_layanan`, `cari_rute_baru`, `pilih_rute`), pilihannya melewati pagar (`checkChoice`), lalu LLM menyusun narasi yang divalidasi Grounding Guard. Bila LLM mati atau gagal, permintaan turun ke default (`pipeline.reason` / `pipeline.notes`).
+- **Agent pembaca** membaca postingan akun operator (X API resmi, berbayar per postingan; atau fixture; atau teks yang ditempel admin lewat `/service-info/ingest`), mengekstrak informasi layanan dengan LLM, dan mengantre sebagai `pending`. Informasi `pending` hanya tampil sebagai info (`serviceInfo`, `/api/service-info`) dan **tidak mengubah navigasi**. Setelah admin menyetujui (`/service-info/:id/approve`), rute yang melewati stasiun/lini terdampak dikurangi skornya (delay 8, gangguan 30, penutupan 60), dicarikan rute tambahan yang menghindari stasiun terganggu sebagai titik pindah (rute yang tetap melewatinya tidak dibuang), dan peringatan ditambahkan, sampai `expiresAt`.
+- **Kunci API**: diisi di admin (Pengaturan, kartu LLM dan kartu Agent pembaca) agar mudah diganti dan tidak perlu ada di `.env`. Disimpan **terenkripsi** (AES-256-GCM, kunci turunan `ADMIN_TOKEN_SECRET`) di tabel `server_config`, berlaku tanpa restart, dan tidak pernah dikirim ke browser atau dicatat di log aktivitas (hanya empat karakter terakhir). Kunci di `.env` (`LLM_API_KEY`, `X_API_BEARER_TOKEN`) tetap berfungsi sebagai cadangan; kunci admin menang. Bila `ADMIN_TOKEN_SECRET` berubah, kunci tersimpan tidak terbaca dan harus diisi ulang. Catatan: cadangan basis data memuat kunci terenkripsi, jadi simpan `ADMIN_TOKEN_SECRET` terpisah dari cadangan.
+- **X API**: token dari admin atau `X_API_BEARER_TOKEN`; `SERVICE_INFO_SOURCE=fixture` hanya untuk uji. Harga (per 22 November 2026): baca postingan US$0,005 dan baca pengguna US$0,010 per sumber daya yang dikembalikan, tanpa tier gratis; hanya postingan baru (`since_id`) yang ditagih. Pembacaan bawaan **mati**; admin mengaktifkannya, mengisi akun, dan menetapkan anggaran bulanan di `/ai/reader`.
+
+Endpoint admin tambahan (peran admin kecuali ditandai):
+
+| Method | Path | Keterangan |
+| --- | --- | --- |
+| GET | `/ai/status` | Mode LLM (terbit dan draft), klien, ketersediaan, status pembaca, jumlah informasi pending |
+| GET, PUT | `/ai/llm` | Penyedia, model, batas waktu, dan kunci API LLM (kunci tidak pernah dikembalikan); PUT hanya admin |
+| POST | `/ai/llm/test` | Uji koneksi LLM dengan satu panggilan singkat; galat penyedia ditampilkan apa adanya (hanya admin, dibatasi laju) |
+| GET, PUT | `/ai/reader` | Konfigurasi pembaca (akun, interval, anggaran, saring kata kunci, token X `xBearerToken`/`clearXToken`) dan status; PUT hanya admin |
+| GET | `/service-info?status=&limit=` | Antrean informasi layanan (editor boleh melihat) |
+| GET, PATCH | `/service-info/:id` | Detail (termasuk teks asli postingan); ubah isian selama `pending` (editor boleh) |
+| POST | `/service-info/:id/approve` · `/reject` · `/expire` | Setujui (dengan perubahan opsional; dampak selain `info` wajib punya stasiun/lini), tolak, atau akhiri lebih awal (hanya admin) |
+| POST | `/service-info/ingest` · `/service-info/poll` | Tempel postingan manual; baca akun sekarang (hanya admin, dibatasi laju) |
 
 ### Admin (`/api/admin`, Bearer token)
 
@@ -133,6 +159,9 @@ Hanya origin di `ADMIN_ORIGINS` yang boleh memanggil lewat browser. Peran `admin
 
 - Sinkron rute dari GTFS Transjakarta mengisi waktu antarhalte, frekuensi rata-rata (ditimbang lama jendela frekuensi), dan jam layanan. Dari Commute, moda rel memakai jadwal hari kerja (`/stations/{op}/{code}/timetable`): waktu = median selisih jam berangkat pada nomor perjalanan yang sama di dua stasiun berurutan, frekuensi = rata-rata jarak keberangkatan dari stasiun awal, jam layanan = keberangkatan pertama–terakhir. TransJakarta lewat Commute memakai GTFS untuk waktu dan `/headway` (pukul 08.00) untuk frekuensi dan jam layanan. Pemberhentian yang belum dikenal NTD dibuang.
 - Hub transfer berlaku = `/hubs` Commute + hub bawaan NTD (`CURATED_HUBS`, mis. halte TransJakarta Cawang ↔ stasiun LRT Cawang, 170 m dari `/transfers`) + konten `hub` dari admin (id sama menggantikan, `disabled` menonaktifkan). Hub dipakai pencarian rute topologi, alternatif di hub, dan `hubId` stasiun. Hub tanpa data jalan kaki memakai jarak garis lurus antarkoordinat.
+- Rute antara dua stasiun dataset tetap dari `/fares`, kecuali rute di atas urutan lini + hub yang berlaku memakai jaringan yang tidak dikenal Commute (hub bawaan NTD/admin, atau halte/stasiun tambahan admin/GTFS) dan biayanya (ukuran `findRides`) minimal 10% lebih ringkas. Contoh: LRT Pramuka → Pasar Rumput lewat hub Manggarai (LRT Manggarai ↔ Halte Manggarai Temporer) alih-alih memutar lewat Rawamangun.
+- Ruas naik pada lini yang punya pengaturan rute admin mengikuti urutan pemberhentian pengaturan itu (`patternStops`), mis. koridor dialihkan karena pekerjaan jalan; dengan begitu daftar halte dan bentuk jalur peta (`map_track`) dari admin ikut terpakai.
+- Konten `hub` boleh memuat `gates`: gate/pintu tiap anggota (`stationId`, `name`), anggota yang dicapai lewat gate itu (`connectsTo`, kosong = semua), fasilitas aksesibel (`lift`, `ramp`, `eskalator`, `datar`, `tangga`, `guiding_block`, `toilet`, `kursi_roda`, `petugas_bantuan`), `accessible`, `openHours`, `note`. Ruas jalan kaki antaranggota hub di hasil rute diberi `fromGate`/`toGate`; gate aksesibel dan yang punya fasilitas kebutuhan pengguna (`needs`) diutamakan. Isian hub lama tanpa `gates` tetap berlaku (tidak perlu migrasi).
 
 #### Stasiun dan rute manual, sinkron dataset
 
@@ -155,6 +184,7 @@ Halaman stasiun di admin punya "Isi otomatis dari gambar denah": foto papan dena
 - Set `NODE_ENV=production`, `DATABASE_URL` (pakai `?sslmode=require` untuk TLS), `ADMIN_TOKEN_SECRET` (min. 32 karakter, `openssl rand -hex 32`), `CORS_ORIGINS`, dan `ADMIN_ORIGINS`.
 - Isi `ADMIN_BOOTSTRAP_EMAIL/PASSWORD` sekali untuk membuat admin pertama, lalu hapus.
 - `npm run build && npm start`. Migrasi berjalan otomatis saat start (dikunci dengan advisory lock).
-- Tanpa `LLM_API_KEY`, notifikasi memakai template statis. Model Claude bawaan `claude-opus-5-5`; ganti lewat `LLM_MODEL`.
+- Tanpa `LLM_API_KEY`, notifikasi memakai template statis dan pilihan pipeline LLM tidak tersedia. Model Claude bawaan `claude-opus-5-5`; ganti lewat `LLM_MODEL`.
+- Pembacaan akun X (`SERVICE_INFO_SOURCE=x`) berjalan di satu instance saja (penjadwal dalam proses). Jangan menyalakannya di lebih dari satu replika.
 
 Catatan: perbaikan npm workspaces di root (`Backend`/`Frontend`) ada di patch Fase 0.

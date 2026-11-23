@@ -4,11 +4,12 @@ import { useEffect, useRef, useState, type ReactNode } from "react";
 import { fetchNotices, fetchStationDetail, planJourney } from "@/lib/api";
 import { optionsOf, SORT_LABEL, sortedIndices, type SortPref } from "@/lib/journey";
 import { useNetwork } from "@/lib/network";
-import type { Alternative, ApiResult, Entrance, GateChoice, JourneyPlan, Mode, Notice, TransferNeed } from "@/lib/types";
+import type { Alternative, ApiResult, Entrance, GateChoice, JourneyPlan, Mode, Notice, Pipeline, TransferNeed } from "@/lib/types";
 import { AboutDialog, SettingsDialog, StationDetail, type DisplaySettings } from "./Dialogs";
 import { Chevron, EscalatorIcon, LevelIcon, LiftIcon, ModeIcon, RampIcon, SwapIcon, WalkIcon } from "./Icons";
 import { JourneyResults } from "./JourneyResults";
 import { NoticeBanner, ResultPanel } from "./ResultPanel";
+import { PipelineChoice, PipelineNote, ServiceInfoList } from "./ServiceInfo";
 import { StationCombobox } from "./StationCombobox";
 import { TransitMap } from "./TransitMap";
 
@@ -25,6 +26,7 @@ const RETRYABLE = ["API_DOWN", "NETWORK", "RATE_LIMITED", "INTERNAL"];
 
 const STEPS = ["Mencari rute", "Memeriksa fasilitas stasiun", "Mencari alternatif transfer", "Menyusun ringkasan"];
 const SETTINGS_KEY = "ntd-display";
+const PIPELINE_KEY = "ntd-pipeline";
 const DEFAULT_SETTINGS: DisplaySettings = { textSize: 0, highContrast: false, reduceMotion: false };
 /** Lebar panel samping di layar lebar (px), termasuk jarak 12 px dari tepi. */
 const PANEL_W = 440;
@@ -147,6 +149,10 @@ export function Planner() {
   const [customNeeds, setCustomNeeds] = useState(false);
   const preset = customNeeds ? "custom" : (NEED_PRESETS.find((p) => p.needs && sameNeeds(p.needs, needs))?.id ?? "custom");
   const [sort, setSort] = useState<SortPref>("aksesibel");
+  // Cara mencari rute: standar (tanpa LLM) atau LLM. Pilihan LLM hanya berlaku bila admin menyalakan mode LLM dan klien LLM tersedia.
+  const [pipelineChoice, setPipelineChoice] = useState<Pipeline>("default");
+  const llmOn = !!meta?.llm?.available && meta.llm.pipelines.includes("llm");
+  const pipeline: Pipeline = llmOn ? pipelineChoice : "default";
   const [prefsOpen, setPrefsOpen] = useState(false);
   // Waktu: berangkat sekarang, atau berangkat/tiba pada tanggal dan jam tertentu (WIB).
   const [timeKind, setTimeKind] = useState<"depart" | "arrive">("depart");
@@ -194,6 +200,11 @@ export function Planner() {
     const saved = loadSettings();
     if (saved !== DEFAULT_SETTINGS) queueMicrotask(() => setSettings(saved));
     queueMicrotask(() => setTimeRef(Date.now()));
+    try {
+      if (window.localStorage.getItem(PIPELINE_KEY) === "llm") queueMicrotask(() => setPipelineChoice("llm"));
+    } catch {
+      /* penyimpanan tidak tersedia: abaikan */
+    }
     const mq = window.matchMedia("(min-width: 768px)");
     const sync = () => setWide(mq.matches);
     sync();
@@ -237,7 +248,7 @@ export function Planner() {
     const at = opts.at ?? chosenAt;
     const kind = opts.kind ?? timeKind;
     const arriveBy = kind === "arrive" && at ? at : undefined;
-    const base: PlanOpts = { avoid: opts.avoid ?? [], avoidModes, needs, entranceId: gate.entranceId || undefined, exitId: gate.exitId || undefined };
+    const base: PlanOpts = { avoid: opts.avoid ?? [], avoidModes, needs, pipeline, entranceId: gate.entranceId || undefined, exitId: gate.exitId || undefined };
     // Permintaan ke Backend berjalan sejak awal; langkah di layar hanya penanda kemajuan.
     const request = arriveBy ? planByArrival(origin, destination, base, arriveBy) : planJourney(origin, destination, { ...base, at });
     let done = false;
@@ -251,7 +262,10 @@ export function Planner() {
     const res = await request;
     if (runId.current !== id) return;
     if (res.status === "ok") {
-      setOptionIndex(sortedIndices(optionsOf(res.data), sort, arriveBy)[0] ?? 0);
+      // Pilihan agen AI (bila ada) dipilih lebih dulu; selain itu mengikuti urutan tampilan pilihan pengguna.
+      const opts2 = optionsOf(res.data);
+      const llmIdx = opts2.findIndex((o) => o.pickedBy === "llm");
+      setOptionIndex(llmIdx >= 0 ? llmIdx : (sortedIndices(opts2, sort, arriveBy)[0] ?? 0));
       setView("list");
       setPhase({ kind: "result", plan: res.data, arriveBy });
     } else setPhase({ kind: "error", code: res.code, message: res.message });
@@ -366,6 +380,7 @@ export function Planner() {
   const prefSummary = [
     avoidModes.length ? `Tanpa ${avoidModes.map((m) => MODE_LABEL[m]).join(", ")}` : "Semua moda",
     SORT_LABEL[sort],
+    ...(pipeline === "llm" ? ["Dengan LLM"] : []),
     NEED_PRESETS.find((p) => p.id === preset)?.id === "custom"
       ? `Butuh ${needs.map((n) => NEED_LABEL[n].toLowerCase()).join(", ") || "-"}`
       : NEED_PRESETS.find((p) => p.id === preset)?.label,
@@ -583,6 +598,21 @@ export function Planner() {
                 </fieldset>
               )}
 
+              {llmOn && (
+                <PipelineChoice
+                  value={pipelineChoice}
+                  onChange={(p) => {
+                    setPipelineChoice(p);
+                    try {
+                      window.localStorage.setItem(PIPELINE_KEY, p);
+                    } catch {
+                      /* penyimpanan tidak tersedia: abaikan */
+                    }
+                    changed();
+                  }}
+                />
+              )}
+
               <fieldset>
                 <legend className="mb-1 font-semibold">Tampilkan</legend>
                 <div className="pref-list">
@@ -712,6 +742,13 @@ export function Planner() {
                   </button>
                 </div>
               </section>
+            )}
+
+            {plan && (
+              <>
+                <PipelineNote plan={plan} />
+                <ServiceInfoList items={plan.serviceInfo} />
+              </>
             )}
 
             {plan && view === "list" && (

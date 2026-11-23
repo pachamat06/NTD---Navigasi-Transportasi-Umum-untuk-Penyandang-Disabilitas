@@ -63,12 +63,26 @@ export interface HubWalk {
   toExit?: ExitRef;
 }
 
+/** Gate/pintu anggota hub yang tersambung ke anggota lain, beserta fasilitas aksesibelnya (isian admin). */
+export interface HubGate {
+  id: string;
+  stationId: string;
+  name: string;
+  /** Anggota hub yang dicapai lewat gate ini; kosong = semua anggota lain. */
+  connectsTo: string[];
+  facilities: ("lift" | "ramp" | "eskalator" | "datar" | "tangga" | "guiding_block" | "toilet" | "kursi_roda" | "petugas_bantuan")[];
+  accessible: boolean;
+  openHours?: string;
+  note?: string;
+}
+
 export interface Hub {
   id: string;
   name: string;
   memberIds: string[];
   kind?: "hub" | "integrated";
   walks: HubWalk[];
+  gates?: HubGate[];
 }
 
 /** Posisi pemberhentian yang ditetapkan admin, dalam koordinat peta (pt). */
@@ -106,6 +120,36 @@ export interface Meta {
   scoring: { weights: Record<AmenityType, number>; threshold: number };
   amenityLabels: Record<string, string>;
   dataSource: string;
+  /** Pilihan pipeline untuk pengguna: "llm" hanya ada bila admin menyalakan mode LLM dan klien LLM tersedia. */
+  llm?: { available: boolean; pipelines: Pipeline[]; defaultPipeline: Pipeline; reason?: string };
+}
+
+/** "default" = algoritma NTD tanpa LLM; "llm" = agent navigasi LLM memilih rute dan LLM menyusun narasi. */
+export type Pipeline = "default" | "llm";
+
+/** Informasi layanan operator (gangguan, keterlambatan, penutupan). "approved" sudah diperiksa admin dan memengaruhi rute. */
+export interface ServiceInfoItem {
+  id: string;
+  status: "approved" | "pending";
+  verified: boolean;
+  category: string;
+  impact?: "info" | "delay" | "disruption" | "closure";
+  summary: string;
+  operator: string | null;
+  stationIds: string[];
+  lineIds: string[];
+  source: { type: "x" | "manual"; account: string; url: string | null; postedAt: string };
+  expiresAt: string;
+}
+
+export interface PipelineInfo {
+  requested: Pipeline;
+  used: Pipeline;
+  navigation: Pipeline;
+  narration: "template" | "llm";
+  reason?: string;
+  notes: string[];
+  model?: string;
 }
 
 export interface StationAssessment {
@@ -264,6 +308,8 @@ export interface Platform {
   gap?: PlatformGap;
   note?: string;
   source: "dataset" | "ntd";
+  /** Sebagian isian peron ini terisi otomatis dari ruas concourse → peron. */
+  accessFromConcourse?: { fields: ("lift" | "eskalator" | "ramp" | "liftInfo" | "escalators")[]; from: { concourse: string; name?: string; means: SegmentMeans[] }[] };
 }
 
 export interface StationInfo {
@@ -275,7 +321,28 @@ export interface StationInfo {
 }
 
 /** Detail stasiun dari GET /api/stations/:id. */
+/** Stasiun/halte lain yang bisa dicapai dengan berjalan kaki di luar hub (tautan transfer), beserta akses jalannya. */
+export interface StationLinkView {
+  linkId: string;
+  otherId: string;
+  otherName: string;
+  /** Jarak tautan; bila belum diisi, jarak garis lurus (`distanceEstimated`). */
+  distanceM: number | null;
+  distanceEstimated?: boolean;
+  minutes: number | null;
+  /** Akses di jalan itu (boleh lebih dari satu); kosong = belum diketahui. */
+  access: SegmentMeans[];
+  dedicated?: boolean;
+  /** Gate/pintu yang dilewati: milik stasiun ini atau stasiun seberang (`stationId`). */
+  gates?: HubGate[];
+  note?: string;
+  oneWay?: boolean;
+  source: "ntd" | "admin";
+}
+
 export interface StationDetailData extends NetworkStation {
+  /** Terhubung ke stasiun lain lewat jalan kaki (tautan transfer di luar hub). */
+  links?: StationLinkView[];
   platforms?: Platform[];
   entrances: Entrance[];
   /** Concourse isian tim (stasiun yang gate-nya tidak langsung ke peron). */
@@ -329,8 +396,13 @@ export interface RouteLeg {
   notes?: string;
   fromExit?: ExitRef;
   toExit?: ExitRef;
+  /** Ruas pindah antarstasiun hub: gate keluar dan gate masuk dari isian admin. */
+  fromGate?: HubGate;
+  toGate?: HubGate;
   /** Status fasilitas yang dibutuhkan pengguna di kedua ujung perpindahan. */
   access?: TransferAccess[];
+  /** Ruas pindah antarstasiun lewat tautan transfer di luar hub: akses yang tersedia di jalan itu. */
+  link?: { access: SegmentMeans[]; dedicated?: boolean; gates?: HubGate[]; source: "ntd" | "admin" };
 }
 
 export type TransferNeed = "lift" | "eskalator" | "ramp";
@@ -355,6 +427,10 @@ export interface TransferAccess {
   status: AmenityStatus | "out_of_service";
   /** Status diambil dari peron ini. */
   platform?: string;
+  /** Pemeriksaan untuk jalan kaki antara dua stasiun lewat tautan transfer (`stationId` = asal jalan itu). */
+  link?: { toId: string; means: SegmentMeans[] };
+  /** Kebutuhan eskalator dianggap terpenuhi oleh lift. */
+  substitute?: "lift";
   /** Lift/eskalator tidak dibutuhkan karena peron dicapai dari gate tanpa anak tangga. */
   notNeeded?: { via: AccessVia; gate?: string; dedicated?: boolean; stepFree?: boolean; concourse?: ConcourseRoute };
 }
@@ -405,9 +481,14 @@ export interface RouteOption {
     transfers: number;
     unmetNeeds: number;
     usesAvoidedModes: boolean;
+    /** Dampak informasi layanan yang disetujui admin pada rute ini. */
+    advisoryImpact?: "delay" | "disruption" | "closure";
   };
   notification: Notification;
   alternatives: Alternative[];
+  /** "llm" = dipilih agent navigasi LLM; `llmReason` alasannya. */
+  pickedBy?: "llm";
+  llmReason?: string;
 }
 
 export interface JourneyPlan {
@@ -428,6 +509,10 @@ export interface JourneyPlan {
   departMode?: "now" | "at";
   /** Pilihan rute: paling aksesibel (sama dengan `route`), moderat, tercepat, lalu rute lain. */
   options?: RouteOption[];
+  /** Pipeline yang diminta dan yang dipakai Backend. */
+  pipeline?: PipelineInfo;
+  /** Informasi layanan operator yang relevan dengan rute. */
+  serviceInfo?: ServiceInfoItem[];
 }
 
 export type ErrorCode = "NOT_FOUND" | "INVALID" | "API_DOWN" | "RATE_LIMITED" | "INTERNAL" | "NETWORK";

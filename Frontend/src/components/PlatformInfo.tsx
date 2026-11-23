@@ -90,6 +90,9 @@ export function PlatformDetails({ p, compact, station }: { p: Platform; compact?
         </p>
       )}
       {vertical.length > 0 && <p className="text-[var(--muted)]">{vertical.join(" · ")}</p>}
+      {p.accessFromConcourse && !compact && (
+        <p className="text-xs text-[var(--muted)]">Informasi akses ini diambil dari concourse {p.accessFromConcourse.from.map((f) => f.name ?? f.concourse).join(", ")}.</p>
+      )}
       {p.gap && (
         <p className={p.gap.level === "tangga" ? "text-[var(--warn)]" : "text-[var(--muted)]"}>
           <span aria-hidden>{p.gap.level === "tangga" ? "⚠" : "↔"}</span> Celah peron: {gapText(p.gap)}

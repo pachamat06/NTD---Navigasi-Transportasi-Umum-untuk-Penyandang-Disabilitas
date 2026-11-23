@@ -94,6 +94,8 @@ export class GroundingGuard {
       }
     }
     for (const s of f.stations.values()) for (const c of s.codes) nums.add(c.replace(/\D/g, ""));
+    // Angka pada pengumuman dan informasi layanan yang ikut dikirim ke LLM adalah fakta yang sah untuk disebut.
+    for (const n of f.notices) for (const m of `${n.title} ${n.message}`.matchAll(/\d+(?:[.,]\d+)*/g)) nums.add(m[0]);
     return nums;
   }
 
@@ -179,6 +181,11 @@ export class GroundingGuard {
         if (a.status !== "available" && !a.notNeeded) {
           const label = AMENITY_LABEL[a.need] ?? a.need;
           const st = name(a.stationId);
+          if (a.link) {
+            const to = name(a.link.toId);
+            notes.push(a.status === "absent" ? `Jalan kaki dari ${st} ke ${to} tidak punya ${label.toLowerCase()} yang Anda butuhkan.` : `Akses jalan kaki dari ${st} ke ${to} belum tercatat, jadi ${label.toLowerCase()} belum bisa dipastikan.`);
+            continue;
+          }
           notes.push(a.status === "out_of_service" ? `${label} di ${st} untuk pindah dilaporkan tidak berfungsi.` : a.status === "absent" ? `${label} untuk pindah tidak tercatat di ${st}.` : `Data ${label.toLowerCase()} untuk pindah di ${st} belum tersedia.`);
         }
     if (f.alternatives.length) {
@@ -221,7 +228,8 @@ export function factsForPrompt(f: PlanFacts): unknown {
         : l.platform
           ? { peronNaik: { nomor: l.platform } }
           : {}),
-      ...(l.access?.length ? { aksesPindah: l.access.map((a) => ({ stasiun: st(a.stationId)?.name ?? a.stationId, ...(a.platform ? { peron: a.platform } : {}), fasilitas: AMENITY_LABEL[a.need], status: a.status, ...(a.notNeeded ? { tidakDibutuhkan: "peron dicapai tanpa anak tangga" } : {}) })) } : {}),
+      ...(l.link ? { jalanKaki: { aksesJalan: l.link.access.length ? l.link.access : "belum diketahui", ...(l.link.dedicated ? { khususDisabilitas: true } : {}), ...(l.fromGate ? { pintuKeluar: l.fromGate.name } : {}), ...(l.toGate ? { pintuMasuk: l.toGate.name } : {}) } } : {}),
+      ...(l.access?.length ? { aksesPindah: l.access.map((a) => ({ stasiun: st(a.stationId)?.name ?? a.stationId, ...(a.platform ? { peron: a.platform } : {}), fasilitas: AMENITY_LABEL[a.need], status: a.status, ...(a.notNeeded ? { tidakDibutuhkan: "peron dicapai tanpa anak tangga" } : {}), ...(a.substitute ? { digantiOleh: "lift (lift tersedia dan menggantikan eskalator)" } : {}) })) } : {}),
     })),
     totalTarif: f.route.totalFare,
     totalMenit: f.route.timeComplete ? f.route.totalMinutes : null,

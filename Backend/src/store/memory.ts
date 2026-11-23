@@ -8,8 +8,12 @@ import type {
   CacheRepository,
   ContentItem,
   ContentRepository,
+  NewServiceAdvisory,
   ServerConfigEntry,
   ServerConfigRepository,
+  ServiceAdvisory,
+  ServiceAdvisoryPatch,
+  ServiceAdvisoryRepository,
   Store,
   TestCase,
   TestRepository,
@@ -205,6 +209,39 @@ class MemoryServerConfig implements ServerConfigRepository {
   }
 }
 
+class MemoryAdvisories implements ServiceAdvisoryRepository {
+  private m = new Map<string, ServiceAdvisory>();
+  private keyOf = (a: Pick<ServiceAdvisory, "source">) => (a.source.postId ? `${a.source.type}:${a.source.account.toLowerCase()}:${a.source.postId}` : null);
+  async list(filter: { status?: ServiceAdvisory["status"]; activeAt?: Date; limit?: number } = {}) {
+    return [...this.m.values()]
+      .filter((a) => (!filter.status || a.status === filter.status) && (!filter.activeAt || (a.status !== "rejected" && Date.parse(a.expiresAt) > filter.activeAt.getTime())))
+      .sort((a, b) => Date.parse(b.source.postedAt) - Date.parse(a.source.postedAt) || b.createdAt.getTime() - a.createdAt.getTime())
+      .slice(0, filter.limit ?? 500)
+      .map(clone);
+  }
+  async get(id: string) {
+    return clone(this.m.get(id) ?? null);
+  }
+  async findBySource(type: "x" | "manual", account: string, postId: string) {
+    const key = `${type}:${account.toLowerCase()}:${postId}`;
+    return clone([...this.m.values()].find((a) => this.keyOf(a) === key) ?? null);
+  }
+  async create(input: NewServiceAdvisory) {
+    const key = this.keyOf(input);
+    if (key && [...this.m.values()].some((a) => this.keyOf(a) === key)) throw new Error("duplicate advisory source");
+    const now = new Date();
+    const a: ServiceAdvisory = { ...clone(input), id: randomUUID(), createdAt: now, updatedAt: now };
+    this.m.set(a.id, a);
+    return clone(a);
+  }
+  async update(id: string, patch: ServiceAdvisoryPatch) {
+    const a = this.m.get(id);
+    if (!a) return null;
+    Object.assign(a, clone(patch), { updatedAt: new Date() });
+    return clone(a);
+  }
+}
+
 export function createMemoryStore(): Store {
   return {
     kind: "memory",
@@ -214,6 +251,7 @@ export function createMemoryStore(): Store {
     tests: new MemoryTests(),
     audit: new MemoryAudit(),
     serverConfig: new MemoryServerConfig(),
+    advisories: new MemoryAdvisories(),
     ping: async () => true,
     close: async () => {},
   };

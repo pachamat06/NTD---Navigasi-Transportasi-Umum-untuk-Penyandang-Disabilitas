@@ -112,10 +112,11 @@ describe("API publik", () => {
 });
 
 describe("Notifikasi LLM dan Grounding Guard", () => {
+  // Narasi LLM hanya pada pipeline "llm"; pipeline default (bawaan) tidak memanggil LLM sama sekali.
   it("memakai teks LLM bila lolos validasi", async () => {
     const llm = new FakeLlm("Naik Lin Cikarang dari Tanah Abang ke Sudirman Baru BNI City, lalu berjalan kaki ke Dukuh Atas BNI. Lift tercatat tersedia di Dukuh Atas BNI.");
     const { app } = await makeTestApp({ llm });
-    const res = await plan(app, { originId: "tanah-abang", destinationId: "dukuh-atas-mrt" });
+    const res = await plan(app, { originId: "tanah-abang", destinationId: "dukuh-atas-mrt", pipeline: "llm" });
     expect(res.body.data.notification).toEqual({ text: llm.reply, source: "LLM", grounded: true });
     expect(llm.calls).toBe(1);
   });
@@ -123,11 +124,19 @@ describe("Notifikasi LLM dan Grounding Guard", () => {
   it("beralih ke template bila LLM berhalusinasi atau gagal", async () => {
     const llm = new FakeLlm("Transit di Manggarai, lift tersedia di Sudirman. Perjalanan 45 menit.");
     const { app } = await makeTestApp({ llm });
-    const res = await plan(app, { originId: "tanah-abang", destinationId: "dukuh-atas-mrt" });
+    const res = await plan(app, { originId: "tanah-abang", destinationId: "dukuh-atas-mrt", pipeline: "llm" });
     expect(res.body.data.notification.source).toBe("TEMPLATE");
 
     llm.reply = new Error("timeout");
-    expect((await plan(app, { originId: "tanah-abang", destinationId: "dukuh-atas-mrt" })).body.data.notification.source).toBe("TEMPLATE");
+    expect((await plan(app, { originId: "tanah-abang", destinationId: "dukuh-atas-mrt", pipeline: "llm" })).body.data.notification.source).toBe("TEMPLATE");
+  });
+
+  it("pipeline default tidak memanggil LLM walau LLM tersedia dan menyala", async () => {
+    const llm = new FakeLlm("Naik Lin Cikarang.");
+    const { app } = await makeTestApp({ llm });
+    const res = await plan(app, { originId: "tanah-abang", destinationId: "dukuh-atas-mrt" });
+    expect(res.body.data.notification.source).toBe("TEMPLATE");
+    expect(llm.calls).toBe(0);
   });
 });
 

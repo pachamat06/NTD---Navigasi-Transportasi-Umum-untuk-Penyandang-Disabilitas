@@ -1,4 +1,5 @@
 import { createApp } from "./app";
+import { ReaderScheduler } from "./ai/reader/ReaderScheduler";
 import { loadConfig } from "./config";
 import { consoleLogger } from "./http/middleware";
 import { createServices } from "./services";
@@ -25,16 +26,24 @@ async function main() {
     await services.auth.bootstrap(config.admin.bootstrapEmail, config.admin.bootstrapPassword, (m) => log.info(m));
   }
 
+  // Pembacaan berkala informasi layanan operator. Selalu dijadwalkan; pembacaan baru berjalan bila admin mengaktifkannya,
+  // mode LLM menyala, kunci LLM dan token X (admin atau .env) tersedia.
+  const reader = new ReaderScheduler(services.reader, services.readerConfig, log);
+  reader.start();
+
   const app = createApp(services);
+  const llmInfo = await services.llm.client().then((c) => (c ? `${c.name}/${c.model}` : "belum dikonfigurasi (template)"));
   const server = app.listen(config.port, () => {
     log.info(`API running on http://localhost:${config.port}`, {
       commute: config.commute.source,
       store: store.kind,
-      llm: services.llm ? `${services.llm.name}/${services.llm.model}` : "none (template)",
+      llm: llmInfo,
+      serviceInfo: config.serviceInfo.source,
     });
   });
 
   const shutdown = () => {
+    reader.stop();
     server.close(() => void store.close().finally(() => process.exit(0)));
   };
   process.on("SIGTERM", shutdown);

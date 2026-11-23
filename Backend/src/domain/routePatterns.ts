@@ -104,6 +104,27 @@ export function patternMinutes(patterns: RoutePattern[], lineIds: string[], stop
   return null;
 }
 
+/**
+ * Urutan pemberhentian menurut pengaturan rute admin untuk naik salah satu `lineIds` dari `from` ke `to` (termasuk
+ * kedua ujung), mis. setelah admin mengalihkan koridor karena pekerjaan jalan. Lini dengan dua arah diatur hanya dibaca
+ * searah; lini dengan satu arah diatur berlaku dua arah. null = tidak ada pengaturan yang memuat keduanya berurutan.
+ */
+export function patternStops(patterns: RoutePattern[], lineIds: string[], from: string, to: string): string[] | null {
+  if (from === to) return null;
+  for (const lineId of lineIds) {
+    const ps = patterns.filter((p) => p.lineId === lineId);
+    if (!ps.length) continue;
+    const seqs = ps.flatMap((p) => [p.stops.map((s) => s.stationId), ...(p.branches ?? []).filter((b) => b.length >= 2)]);
+    const both = ps.length > 1 ? seqs : [...seqs, ...seqs.map((q) => [...q].reverse())];
+    for (const seq of both) {
+      const i = seq.indexOf(from);
+      const j = i >= 0 ? seq.indexOf(to, i + 1) : -1;
+      if (j > i) return seq.slice(i, j + 1);
+    }
+  }
+  return null;
+}
+
 /** Collapse pemberhentian berurutan yang sama (dua kode halte satu arah yang dipetakan ke satu stasiun NTD). */
 function collapse(stops: { stationId: string; minutes: number | null }[]) {
   const out: typeof stops = [];

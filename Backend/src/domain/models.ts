@@ -2,6 +2,8 @@
 // Bentuknya sengaja sama dengan Frontend/src/lib/types.ts agar GUI cukup mengganti mock-planner
 // dengan panggilan ke backend. Field tambahan bersifat opsional sehingga tidak merusak GUI.
 
+import type { AdvisoryView } from "./serviceAdvisory";
+
 export type Mode = "RAIL" | "SUBWAY" | "TRAM" | "BUS" | "MONORAIL";
 
 /** Status yang dipakai GUI. "absent" = tidak tercatat pada data, bukan pasti tidak ada. */
@@ -112,6 +114,28 @@ export interface HubWalk {
   toExit?: ExitRef;
 }
 
+/** Fasilitas aksesibel pada gate/pintu stasiun yang dipakai berpindah di hub. */
+export const HUB_GATE_FACILITIES = ["lift", "ramp", "eskalator", "datar", "tangga", "guiding_block", "toilet", "kursi_roda", "petugas_bantuan"] as const;
+export type HubGateFacility = (typeof HUB_GATE_FACILITIES)[number];
+
+/**
+ * Gate/pintu stasiun anggota hub yang tersambung ke anggota lain (diisi admin), beserta fasilitas aksesibelnya.
+ * `connectsTo` kosong = gate dipakai ke semua anggota hub lain.
+ */
+export interface HubGate {
+  id: string;
+  stationId: string;
+  /** Pintu/gate stasiun (id entri `entrances` detail stasiun) yang dirujuk gate ini, bila dipilih dari data stasiun. */
+  entranceId?: string;
+  name: string;
+  connectsTo: string[];
+  facilities: HubGateFacility[];
+  /** Bisa dilalui tanpa anak tangga (pengguna kursi roda). */
+  accessible: boolean;
+  openHours?: string;
+  note?: string;
+}
+
 export interface Hub {
   id: string;
   name: string;
@@ -119,8 +143,44 @@ export interface Hub {
   kind?: "hub" | "integrated";
   memberIds: string[];
   walks: HubWalk[];
+  /** Gate/pintu anggota hub yang tersambung ke anggota lain (isian admin). */
+  gates?: HubGate[];
   /** Asal hub: "commute" = /hubs Commute Data API, "ntd" = hub bawaan NTD, "admin" = dibuat/diubah admin. */
   source?: "commute" | "ntd" | "admin";
+}
+
+/**
+ * Tautan transfer antar dua stasiun/halte di luar hub (mis. halte BRT Matraman Baru dengan Stasiun Matraman): bisa dipakai
+ * pindah dengan berjalan kaki. Sumbernya: bawaan NTD (CURATED_LINKS) dan isian admin (jenis konten "station_link").
+ */
+export interface StationLink {
+  /** Kunci pasangan stasiun (urutan tidak berpengaruh), lihat `linkKey`. */
+  id: string;
+  fromId: string;
+  toId: string;
+  /** true = hanya bisa dari `fromId` ke `toId`; bawaan dua arah. */
+  oneWay?: boolean;
+  /** Jarak jalan kaki (m); null = pakai jarak garis lurus antar koordinat stasiun. */
+  distanceM: number | null;
+  minutes: number | null;
+  /** Akses yang tersedia di jalan itu (boleh lebih dari satu); kosong = belum diketahui. */
+  access: SegmentMeans[];
+  /** Jalur khusus pengguna disabilitas. */
+  dedicated?: boolean;
+  /** Gate/pintu yang dilewati di kedua ujung (isian admin); `connectsTo` = stasiun di seberangnya. Boleh lebih dari satu per sisi. */
+  gates?: HubGate[];
+  note?: string;
+  /** "ntd" = bawaan NTD, "admin" = diisi/dikonfirmasi admin. */
+  source: "ntd" | "admin";
+}
+
+/** Keterangan tautan pada ruas pindah rute. */
+export interface LegLink {
+  access: SegmentMeans[];
+  dedicated?: boolean;
+  /** Semua gate tautan di kedua ujung; yang dipilih untuk ruas ini ada di `fromGate`/`toGate` pada ruas. */
+  gates?: HubGate[];
+  source: "ntd" | "admin";
 }
 
 /** Fasilitas yang dibutuhkan pengguna saat pindah (mis. pengguna kursi roda butuh lift). */
@@ -155,6 +215,13 @@ export interface TransferAccess {
   status: AmenityDetailStatus;
   /** Status diambil dari peron ini (bukan stasiun keseluruhan). */
   platform?: string;
+  /** Kebutuhan eskalator dianggap terpenuhi oleh lift di titik ini (`status` dan `platform` adalah milik lift). */
+  substitute?: "lift";
+  /**
+   * Pemeriksaan ini untuk jalan kaki antara dua stasiun lewat tautan transfer (bukan untuk sebuah stasiun):
+   * `stationId` = stasiun asal jalan itu, `means` = akses yang tercatat pada tautan (kosong = belum diisi).
+   */
+  link?: { toId: string; means: SegmentMeans[] };
   /**
    * Lift/eskalator tidak dibutuhkan karena peron ini dicapai dari gate tanpa anak tangga (jalur yang dipakai di sini).
    * `status` tetap diisi apa adanya.
@@ -321,8 +388,13 @@ export interface RouteLeg {
   notes?: string;
   fromExit?: ExitRef;
   toExit?: ExitRef;
+  /** Ruas pindah antarstasiun hub: gate keluar di stasiun asal dan gate masuk di stasiun tujuan (isian admin). */
+  fromGate?: HubGate;
+  toGate?: HubGate;
   /** Ruas pindah: status fasilitas yang dibutuhkan pengguna di kedua ujung. */
   access?: TransferAccess[];
+  /** Ruas pindah antarstasiun lewat tautan transfer di luar hub: akses yang tersedia di jalan itu. */
+  link?: LegLink;
 }
 
 export interface Route {
@@ -452,7 +524,19 @@ export interface Platform {
   gap?: PlatformGap;
   note?: string;
   source: DataSource;
+  /**
+   * Ada isian peron ini yang terisi otomatis dari ruas concourse → peron (lift, eskalator, ramp). Isian tim pada peron
+   * selalu menang, jadi hanya field yang masih kosong yang diturunkan. Tidak disimpan: dihitung saat detail dibaca.
+   */
+  accessFromConcourse?: {
+    fields: PlatformDerivedField[];
+    /** Ruas concourse sumbernya dan cara berpindah yang dicatat di sana. */
+    from: { concourse: string; name?: string; means: SegmentMeans[] }[];
+  };
 }
+
+/** Field peron yang dapat terisi otomatis dari concourse: status lift/eskalator/ramp, jumlah lift, dan kelompok eskalator. */
+export type PlatformDerivedField = "lift" | "eskalator" | "ramp" | "liftInfo" | "escalators";
 
 export interface Entrance {
   id: string;
@@ -597,6 +681,14 @@ export interface RouteOptionSummary {
   unmetNeeds: number;
   /** Rute memakai moda yang ingin dihindari (tidak ada rute lain). */
   usesAvoidedModes: boolean;
+  /**
+   * Dampak informasi layanan operator yang SUDAH DISETUJUI admin pada rute ini (mengurangi `rankScore`). Tidak ada bila
+   * tidak terdampak; informasi yang belum disetujui tidak pernah memengaruhi nilai ini.
+   */
+  advisoryImpact?: "delay" | "disruption" | "closure";
+  advisoryIds?: string[];
+  /** Dari `unmetNeeds`: jumlah yang PASTI tidak terpenuhi (data tercatat tidak ada atau rusak), bukan yang belum diketahui. */
+  unmetCertain?: number;
 }
 
 /** Satu pilihan rute (gaya TfL): rute, penilaian stasiun untuk rute itu, peringatan, dan ringkasan. */
@@ -610,6 +702,24 @@ export interface RouteOption {
   summary: RouteOptionSummary;
   notification: Notification;
   alternatives: Alternative[];
+  /** "llm" = pilihan ini dipilih agent navigasi LLM (menjadi pilihan pertama); `llmReason` alasannya (sudah divalidasi). */
+  pickedBy?: "llm";
+  llmReason?: string;
+}
+
+/** Pipeline yang diminta pengguna dan yang benar-benar dipakai. */
+export interface PipelineInfo {
+  requested: "default" | "llm";
+  /** "llm" bila minimal satu langkah LLM (agent navigasi atau narasi) berhasil dipakai. */
+  used: "default" | "llm";
+  navigation: "default" | "llm";
+  narration: "template" | "llm";
+  /** Mengapa permintaan LLM turun ke default (mode LLM dimatikan, klien belum ada, ...). */
+  reason?: string;
+  /** Catatan langkah LLM yang gagal atau ditolak pagar. */
+  notes: string[];
+  model?: string;
+  steps?: number;
 }
 
 export interface JourneyPlan {
@@ -634,8 +744,16 @@ export interface JourneyPlan {
   /**
    * Beberapa pilihan rute, urut: paling aksesibel (sama dengan `route`), moderat, tercepat, lalu rute lain (`kinds`
    * kosong). Pilihan yang sama digabung (`kinds` lebih dari satu). Field utama rencana (`route`, `assessments`, `warnings`, ...) = pilihan pertama.
+   * Pada pipeline LLM, pilihan agent navigasi menjadi yang pertama.
    */
   options?: RouteOption[];
+  /** Pipeline yang diminta dan yang dipakai. */
+  pipeline: PipelineInfo;
+  /**
+   * Informasi layanan operator (dari akun X atau input admin) yang relevan dengan rute. `status: "approved"` sudah diperiksa
+   * admin dan memengaruhi navigasi; `status: "pending"` hanya informasi dan belum diverifikasi.
+   */
+  serviceInfo: AdvisoryView[];
 }
 
 export type ErrorCode =

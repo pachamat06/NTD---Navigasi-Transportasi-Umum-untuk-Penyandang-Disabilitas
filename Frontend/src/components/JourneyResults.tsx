@@ -129,6 +129,12 @@ function JourneyCard({
         {total !== null && <Dur minutes={total} />}
       </div>
       <div className="mt-1 flex flex-wrap gap-1">
+        {o.pickedBy === "llm" && (
+          <span className="badge badge-ok">
+            <span aria-hidden>✨</span> Pilihan agen AI
+          </span>
+        )}
+        {s.advisoryImpact && <span className="badge badge-warn">Terdampak informasi layanan</span>}
         {o.kinds.map((k) => (
           <span key={k} className={`badge ${k === "aksesibel" ? "badge-ok" : "badge-unknown"}`}>
             {KIND_LABEL[k]}

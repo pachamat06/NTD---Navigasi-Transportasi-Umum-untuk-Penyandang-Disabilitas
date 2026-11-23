@@ -7,7 +7,7 @@
 
 import type { RequestContext } from "../context";
 import type { HubContent } from "./content";
-import type { Hub, HubWalk } from "./models";
+import type { Hub, HubGate, HubWalk } from "./models";
 
 /** Sumber isian hub admin (published, atau draft untuk pratinjau admin). */
 export type HubProvider = (ctx: RequestContext) => Promise<HubContent[]>;
@@ -50,7 +50,9 @@ export function applyHubs(base: Hub[], overrides: HubContent[], known?: Set<stri
       name: o.name,
       kind: o.kind,
       memberIds: [...new Set(o.memberIds)],
-      walks: o.walks.map((w) => ({ from: w.from, to: w.to, distanceM: w.distanceM, minutes: w.minutes ?? null, ...(w.notes ? { notes: w.notes } : {}) })),
+      walks: (o.walks ?? []).map((w) => ({ from: w.from, to: w.to, distanceM: w.distanceM, minutes: w.minutes ?? null, ...(w.notes ? { notes: w.notes } : {}) })),
+      // Isian lama (sebelum ada gate) tidak memuat `gates`.
+      ...(o.gates?.length ? { gates: o.gates.map((g) => ({ ...g, connectsTo: g.connectsTo ?? [], facilities: g.facilities ?? [], accessible: !!g.accessible })) } : {}),
       source: "admin",
     });
   }
@@ -59,9 +61,33 @@ export function applyHubs(base: Hub[], overrides: HubContent[], known?: Set<stri
     const memberIds = known ? h.memberIds.filter((id) => known.has(id)) : h.memberIds;
     if (memberIds.length < 2) continue;
     const inHub = new Set(memberIds);
-    list.push({ ...h, memberIds, walks: h.walks.filter((w) => inHub.has(w.from) && inHub.has(w.to) && w.from !== w.to) });
+    const gates = h.gates?.filter((g) => inHub.has(g.stationId)).map((g) => ({ ...g, connectsTo: g.connectsTo.filter((t) => inHub.has(t)) }));
+    list.push({ ...h, memberIds, walks: h.walks.filter((w) => inHub.has(w.from) && inHub.has(w.to) && w.from !== w.to), ...(gates?.length ? { gates } : {}) });
   }
   return list;
+}
+
+/**
+ * Gate di stasiun `at` yang dipakai berjalan ke anggota hub `toward`: gate yang `connectsTo`-nya memuat `toward`
+ * lebih dulu, lalu gate tanpa `connectsTo` (ke semua anggota). Bila ada beberapa, diutamakan gate aksesibel, lalu
+ * yang punya fasilitas `prefer` (mis. lift untuk pengguna kursi roda), lalu yang fasilitasnya paling banyak.
+ */
+export function gateToward(hubs: Hub[], at: string, toward: string, prefer: readonly string[] = []): HubGate | undefined {
+  for (const h of hubs) {
+    if (!h.gates?.length || !h.memberIds.includes(at) || !h.memberIds.includes(toward)) continue;
+    const mine = h.gates.filter((g) => g.stationId === at);
+    const named = mine.filter((g) => g.connectsTo.includes(toward));
+    const cands = named.length ? named : mine.filter((g) => !g.connectsTo.length);
+    if (!cands.length) continue;
+    return bestGate(cands, prefer);
+  }
+  return undefined;
+}
+
+/** Gate terbaik di antara beberapa calon: aksesibel dulu, lalu yang punya fasilitas `prefer`, lalu fasilitas terbanyak. */
+export function bestGate(cands: readonly HubGate[], prefer: readonly string[] = []): HubGate | undefined {
+  const score = (g: HubGate) => (g.accessible ? 100 : 0) + prefer.filter((p) => g.facilities.includes(p as HubGate["facilities"][number])).length * 10 + g.facilities.length;
+  return [...cands].sort((a, b) => score(b) - score(a))[0];
 }
 
 /** Hub tiap stasiun menurut daftar hub yang berlaku (stasiun pertama kali muncul menang). */

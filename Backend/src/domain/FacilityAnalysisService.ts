@@ -4,6 +4,7 @@
 import type { RequestContext } from "../context";
 import type { CommuteApiClient } from "../data/commute/CommuteApiClient";
 import type { ContentSnapshot } from "./content";
+import { applyConcourseAccess } from "./concourseAccess";
 import {
   CORE_AMENITIES,
   EXTRA_AMENITIES,
@@ -72,12 +73,19 @@ export class FacilityAnalysisService {
     const overrides = snap.facilityOverrides(stationId);
     for (const o of overrides) details.set(o.type, o);
     // Fasilitas yang diisi pada peron otomatis mengisi fasilitas umum stasiun (peron punya lift = stasiun punya lift).
-    const derived = fromPlatforms(snap.platformsOf(stationId), snap.legacyPlatformToilet(stationId));
+    const derived = fromPlatforms(applyConcourseAccess(snap.platformsOf(stationId), snap.concoursesOf(stationId)), snap.legacyPlatformToilet(stationId));
     for (const d of derived) {
       const cur = details.get(d.type);
       // Isian tim untuk stasiun yang menyatakan sedang tidak berfungsi tetap dipakai.
       if (cur?.source === "ntd" && cur.status === "out_of_service") continue;
       if (d.status === "available" ? cur?.status !== "available" : !cur || cur.status === "unknown") details.set(d.type, d);
+    }
+    // Lift/eskalator/ramp yang tercatat pada pintu (gate) juga fasilitas stasiun, tanpa diisi dua kali. Isian tim menang.
+    const fromGates = fromEntrances(snap.entrancesOf(stationId));
+    for (const d of fromGates) {
+      const cur = details.get(d.type);
+      if (cur?.source === "ntd" && cur.status !== "unknown") continue;
+      if (cur?.status !== "available") details.set(d.type, d);
     }
 
     const amenities = {} as Record<AmenityType, AmenityStatus>;
@@ -85,7 +93,7 @@ export class FacilityAnalysisService {
       const d = details.get(t);
       amenities[t] = !d ? "unknown" : d.status === "out_of_service" ? "absent" : d.status;
     }
-    const dataAvailable = !!dataset || [...overrides, ...derived].some((o) => (CORE_AMENITIES as readonly string[]).includes(o.type) && o.status !== "unknown");
+    const dataAvailable = !!dataset || [...overrides, ...derived, ...fromGates].some((o) => (CORE_AMENITIES as readonly string[]).includes(o.type) && o.status !== "unknown");
     return { amenities, amenityDetails: [...details.values()], dataAvailable };
   }
 
@@ -178,6 +186,36 @@ export function fromPlatforms(platforms: Platform[], legacyToilet: { code: strin
   return out;
 }
 
+/**
+ * Fasilitas umum stasiun dari isian pintu/gate: lift, eskalator, dan ramp yang tercatat tersedia pada pintu yang
+ * aksesibel berarti stasiun itu memilikinya. Hanya fakta tercatat yang diturunkan (pintu tanpa lift bukan bukti stasiun
+ * tanpa lift), dan lift/eskalator yang dicatat rusak atau berjumlah 0 tidak diturunkan.
+ */
+export function fromEntrances(entrances: Entrance[]): AmenityDetail[] {
+  const usable = entrances.filter((e) => e.accessible !== false);
+  const names = (list: Entrance[]) => list.map((e) => e.name).join(", ");
+  const out: AmenityDetail[] = [];
+  const add = (type: AmenityType, list: Entrance[]) => {
+    if (list.length) out.push({ type, status: "available", source: "ntd", note: `Dari data pintu ${names(list)}.` });
+  };
+  add(
+    "lift",
+    usable.filter((e) => (e.lift ? e.lift.count > 0 && (!e.lift.status || e.lift.status === "available") : e.features.includes("lift"))),
+  );
+  add(
+    "eskalator",
+    usable.filter((e) => {
+      const groups = e.escalators ?? [];
+      return groups.length ? groups.some((g) => !g.status || g.status === "available") : e.features.includes("eskalator");
+    }),
+  );
+  add(
+    "ramp",
+    usable.filter((e) => e.features.includes("ramp")),
+  );
+  return out;
+}
+
 /** Pintu dataset (/exits) yang belum dilengkapi tim ikut dipakai; yang sudah dilengkapi memakai isian tim. */
 export function mergeGates(dataset: Entrance[], ntd: Entrance[]): Entrance[] {
   const refOf = (e: Entrance) => e.id.slice(e.id.lastIndexOf(":") + 1);
@@ -218,10 +256,14 @@ export function applyPlatformExits(entrances: Entrance[], platforms: Platform[])
   });
 }
 
-/** Kebutuhan pengguna terpenuhi: fasilitasnya tersedia, atau lift/eskalator tidak dibutuhkan karena semua peron dicapai tanpa anak tangga. */
+/**
+ * Kebutuhan pengguna terpenuhi: fasilitasnya tersedia, atau lift/eskalator tidak dibutuhkan karena semua peron dicapai tanpa
+ * anak tangga. Lift menggantikan eskalator: stasiun yang hanya punya lift tetap memenuhi kebutuhan eskalator.
+ */
 export function needMet(need: AmenityType, amenities: Record<AmenityType, AmenityStatus>, layout?: LayoutAccess): boolean {
   if (layout?.level && VERTICAL.includes(need)) return true;
-  return (pathStatus(layout, need) ?? amenities[need]) === "available";
+  const available = (t: AmenityType) => (pathStatus(layout, t) ?? amenities[t]) === "available";
+  return available(need) || (need === "eskalator" && available("lift"));
 }
 
 /**

@@ -20,7 +20,7 @@ export interface CacheRepository {
  * hanya terlihat di mode pratinjau admin) dan "published" (terlihat oleh pengguna). Publikasi menyalin
  * draft ke published, sehingga perubahan dapat diuji coba lebih dulu sebelum sampai ke pengguna.
  */
-export type ContentKind = "facility" | "entrance" | "notice" | "station_info" | "settings" | "map_stop" | "map_track" | "platform" | "route_pattern" | "concourse" | "hub" | "station_status" | "station" | "line";
+export type ContentKind = "facility" | "entrance" | "notice" | "station_info" | "settings" | "map_stop" | "map_track" | "platform" | "route_pattern" | "concourse" | "hub" | "station_status" | "station" | "line" | "station_link";
 
 export interface ContentItem<T = unknown> {
   id: string;
@@ -132,6 +132,64 @@ export interface ServerConfigRepository {
   delete(key: string): Promise<boolean>;
 }
 
+/**
+ * Informasi layanan operator (gangguan, keterlambatan, penutupan, ...) yang dibaca agent pembaca dari akun X operator
+ * atau ditempel admin. Berstatus `pending` sampai admin menyetujui; hanya yang `approved` dan masih berlaku mengubah navigasi.
+ */
+export type AdvisoryStatus = "pending" | "approved" | "rejected";
+/** Dampak ke navigasi bila disetujui: info = tidak mengubah apa pun. */
+export type AdvisoryImpact = "info" | "delay" | "disruption" | "closure";
+export type AdvisoryCategory = "gangguan" | "keterlambatan" | "penutupan" | "perubahan_rute" | "pemeliharaan" | "normal" | "lainnya";
+
+export interface ServiceAdvisory {
+  id: string;
+  status: AdvisoryStatus;
+  source: {
+    type: "x" | "manual";
+    /** Akun X tanpa "@" (atau nama sumber untuk input manual). */
+    account: string;
+    postId: string | null;
+    url: string | null;
+    postedAt: string;
+    /** Potongan teks asli (untuk admin); tidak ditampilkan ke pengguna. */
+    text: string;
+  };
+  operator: string | null;
+  category: AdvisoryCategory;
+  impact: AdvisoryImpact;
+  summary: string;
+  stationIds: string[];
+  lineIds: string[];
+  validFrom: string | null;
+  expiresAt: string;
+  extraction: {
+    by: "llm" | "fallback" | "manual";
+    model?: string;
+    confidence?: "tinggi" | "sedang" | "rendah";
+    /** Nama yang disebut LLM tetapi tidak cocok dengan stasiun/lini yang dikenal. */
+    unmatched?: string[];
+    /** Dampak yang diusulkan LLM (admin dapat mengubahnya sebelum menyetujui). */
+    proposedImpact?: AdvisoryImpact;
+  };
+  reviewedBy: string | null;
+  reviewedAt: string | null;
+  reviewNote: string | null;
+  createdAt: Date;
+  updatedAt: Date;
+}
+
+export type NewServiceAdvisory = Omit<ServiceAdvisory, "id" | "createdAt" | "updatedAt">;
+export type ServiceAdvisoryPatch = Partial<Omit<ServiceAdvisory, "id" | "createdAt" | "updatedAt" | "source">>;
+
+export interface ServiceAdvisoryRepository {
+  /** Terbaru dulu (menurut waktu postingan). `activeAt`: hanya yang belum kedaluwarsa pada waktu itu dan tidak ditolak. */
+  list(filter?: { status?: AdvisoryStatus; activeAt?: Date; limit?: number }): Promise<ServiceAdvisory[]>;
+  get(id: string): Promise<ServiceAdvisory | null>;
+  findBySource(type: "x" | "manual", account: string, postId: string): Promise<ServiceAdvisory | null>;
+  create(a: NewServiceAdvisory): Promise<ServiceAdvisory>;
+  update(id: string, patch: ServiceAdvisoryPatch): Promise<ServiceAdvisory | null>;
+}
+
 export interface Store {
   readonly kind: "postgres" | "memory";
   cache: CacheRepository;
@@ -140,6 +198,7 @@ export interface Store {
   tests: TestRepository;
   audit: AuditRepository;
   serverConfig: ServerConfigRepository;
+  advisories: ServiceAdvisoryRepository;
   ping(): Promise<boolean>;
   close(): Promise<void>;
 }
