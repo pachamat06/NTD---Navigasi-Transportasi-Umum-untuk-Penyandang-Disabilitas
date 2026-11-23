@@ -80,13 +80,20 @@ export class FacilityAnalysisService {
       if (cur?.source === "ntd" && cur.status === "out_of_service") continue;
       if (d.status === "available" ? cur?.status !== "available" : !cur || cur.status === "unknown") details.set(d.type, d);
     }
+    // Lift/eskalator/ramp yang tercatat pada pintu (gate) juga fasilitas stasiun, tanpa diisi dua kali. Isian tim menang.
+    const fromGates = fromEntrances(snap.entrancesOf(stationId));
+    for (const d of fromGates) {
+      const cur = details.get(d.type);
+      if (cur?.source === "ntd" && cur.status !== "unknown") continue;
+      if (cur?.status !== "available") details.set(d.type, d);
+    }
 
     const amenities = {} as Record<AmenityType, AmenityStatus>;
     for (const t of CORE_AMENITIES) {
       const d = details.get(t);
       amenities[t] = !d ? "unknown" : d.status === "out_of_service" ? "absent" : d.status;
     }
-    const dataAvailable = !!dataset || [...overrides, ...derived].some((o) => (CORE_AMENITIES as readonly string[]).includes(o.type) && o.status !== "unknown");
+    const dataAvailable = !!dataset || [...overrides, ...derived, ...fromGates].some((o) => (CORE_AMENITIES as readonly string[]).includes(o.type) && o.status !== "unknown");
     return { amenities, amenityDetails: [...details.values()], dataAvailable };
   }
 
@@ -176,6 +183,36 @@ export function fromPlatforms(platforms: Platform[], legacyToilet: { code: strin
     const best = legacyToilet.reduce((a, b) => (STATUS_ORDER[b.status] > STATUS_ORDER[a.status] ? b : a));
     out.push({ type: "toilet", status: best.status, source: "ntd" });
   }
+  return out;
+}
+
+/**
+ * Fasilitas umum stasiun dari isian pintu/gate: lift, eskalator, dan ramp yang tercatat tersedia pada pintu yang
+ * aksesibel berarti stasiun itu memilikinya. Hanya fakta tercatat yang diturunkan (pintu tanpa lift bukan bukti stasiun
+ * tanpa lift), dan lift/eskalator yang dicatat rusak atau berjumlah 0 tidak diturunkan.
+ */
+export function fromEntrances(entrances: Entrance[]): AmenityDetail[] {
+  const usable = entrances.filter((e) => e.accessible !== false);
+  const names = (list: Entrance[]) => list.map((e) => e.name).join(", ");
+  const out: AmenityDetail[] = [];
+  const add = (type: AmenityType, list: Entrance[]) => {
+    if (list.length) out.push({ type, status: "available", source: "ntd", note: `Dari data pintu ${names(list)}.` });
+  };
+  add(
+    "lift",
+    usable.filter((e) => (e.lift ? e.lift.count > 0 && (!e.lift.status || e.lift.status === "available") : e.features.includes("lift"))),
+  );
+  add(
+    "eskalator",
+    usable.filter((e) => {
+      const groups = e.escalators ?? [];
+      return groups.length ? groups.some((g) => !g.status || g.status === "available") : e.features.includes("eskalator");
+    }),
+  );
+  add(
+    "ramp",
+    usable.filter((e) => e.features.includes("ramp")),
+  );
   return out;
 }
 
