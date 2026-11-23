@@ -228,7 +228,7 @@ export function factsForPrompt(f: PlanFacts): unknown {
         : l.platform
           ? { peronNaik: { nomor: l.platform } }
           : {}),
-      ...(l.link ? { jalanKaki: { aksesJalan: l.link.access.length ? l.link.access : "belum diketahui", ...(l.link.dedicated ? { khususDisabilitas: true } : {}) } } : {}),
+      ...(l.link ? { jalanKaki: { aksesJalan: l.link.access.length ? l.link.access : "belum diketahui", ...(l.link.dedicated ? { khususDisabilitas: true } : {}), ...(l.fromGate ? { pintuKeluar: l.fromGate.name } : {}), ...(l.toGate ? { pintuMasuk: l.toGate.name } : {}) } } : {}),
       ...(l.access?.length ? { aksesPindah: l.access.map((a) => ({ stasiun: st(a.stationId)?.name ?? a.stationId, ...(a.platform ? { peron: a.platform } : {}), fasilitas: AMENITY_LABEL[a.need], status: a.status, ...(a.notNeeded ? { tidakDibutuhkan: "peron dicapai tanpa anak tangga" } : {}), ...(a.substitute ? { digantiOleh: "lift (lift tersedia dan menggantikan eskalator)" } : {}) })) } : {}),
     })),
     totalTarif: f.route.totalFare,

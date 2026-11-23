@@ -13,6 +13,7 @@ Jenis konten admin baru `station_link` (migrasi `011_station_links.sql`, hanya m
 | `distanceM`, `minutes` | Jarak dan waktu jalan kaki. Kosong (`null`) = jarak garis lurus antar koordinat stasiun / waktu belum diketahui. |
 | `access` | Akses di jalan itu, boleh lebih dari satu: `datar`, `ramp`, `lift`, `eskalator`, `tangga`. Kosong = **belum diketahui** (bukan "tidak ada"). |
 | `dedicated` | Jalur khusus pengguna disabilitas. |
+| `gates` | Gate/pintu yang dilewati saat berpindah (opsional, boleh lebih dari satu per sisi), lihat bagian *Gate pada tautan*. Isian lama tanpa `gates` dianggap kosong. |
 | `source` | `manual` (diisi sendiri) atau `dataset` (usulan otomatis yang dikonfirmasi admin). |
 | `disabled` | Menonaktifkan tautan bawaan NTD yang keliru. |
 | `note` | Petunjuk jalan (maks. 300 karakter). |
@@ -27,6 +28,17 @@ Sumber tautan yang berlaku: tautan bawaan NTD (`CURATED_LINKS` di `Backend/src/d
 | BRT Matraman Baru ↔ Stasiun Matraman (KRL) | `tj:h00104p` ↔ `kci:mtr` |
 
 Akses keduanya **belum disurvei** (`access` kosong), jadi pengguna yang butuh lift/eskalator/ramp mendapat peringatan "akses belum tercatat" sampai tim melengkapinya di admin (Detail stasiun → *Terhubung ke stasiun lain* → *Lengkapi*, lalu publikasikan).
+
+## Gate pada tautan
+
+Seperti hub, tiap tautan bisa menyebut **gate/pintu di stasiun asal dan di stasiun tujuan** yang dilewati saat berpindah, supaya pengguna tahu harus keluar lewat pintu mana dan masuk lewat pintu mana. Bentuknya sama dengan gate hub (`hubGateSchema`): `id`, `stationId` (salah satu dari kedua stasiun tautan), `entranceId` (pintu yang sudah tercatat di detail stasiun, opsional), `name`, `facilities`, `accessible`, `openHours`, `note`. `connectsTo` otomatis stasiun di seberangnya (isian dengan `connectsTo` lain ditolak).
+
+- Validasi (400): gate harus milik salah satu stasiun tautan, id gate unik, fasilitas dari daftar yang sama dengan gate hub. Gate opsional: tautan tanpa gate tetap sah dan tampil seperti sebelumnya.
+- Disimpan lewat alur biasa: draf → publikasi (`PUT /content/:id` dengan `gates`). Gate ikut pada isian terbit, `GET /api/station-links`, dan `GET /api/stations/:id` (`links[].gates`, gate kedua sisi).
+- Rute: ruas pindah lewat tautan memuat `fromGate` (gate keluar di stasiun asal ruas) dan `toGate` (gate masuk di stasiun tujuan ruas), dan `link.gates` (semua gate tautan). Bila ada beberapa gate di satu sisi, dipilih yang aksesibel, lalu yang punya fasilitas yang dibutuhkan pengguna (lift/ramp), lalu fasilitas terbanyak (`bestGate` di `hubs.ts`, dipakai juga gate hub); `annotate` memilih ulang menurut kebutuhan pengguna. Gate hub (bila ruas ada di dalam hub) tetap diutamakan.
+- Frontend: langkah "Jalan kaki ke …" menampilkan "Keluar lewat …" / "Masuk lewat …" dan "Gate lain di …"; detail stasiun menampilkan gate tiap tautan.
+- Ringkasan fakta untuk LLM (`jalanKaki`) memuat `pintuKeluar`/`pintuMasuk`.
+- Gate tidak mengubah penilaian akses tautan (`access` tetap penentu kebutuhan lift/eskalator/ramp); gate hanya petunjuk jalur.
 
 ## Aturan akses terhadap kebutuhan pengguna
 
@@ -46,7 +58,7 @@ Kebutuhan yang dikenal: `lift`, `eskalator`, `ramp` (sama dengan pemeriksaan tit
 - **Variasi rute** menambah satu rencana dengan biaya pindah biasa bila ada tautan, supaya pindah lewat tautan ikut ditawarkan sebagai pilihan (aksesibel/moderat/tercepat dipilih seperti biasa).
 - **Rute dasar dari dataset**: ruas pindah antarstasiun yang kebetulan sama dengan sebuah tautan diberi keterangan tautan (`leg.link`), jarak/waktu/petunjuk dari tautan bila diisi.
 - **Pasangan yang tidak dirutekan dataset** (`/fares` tidak menemukan rute) tetap dicari lewat tautan, disusun dari urutan stasiun lini.
-- Ruas pindah membawa `link: { access, dedicated?, source }`. Frontend menampilkannya di langkah "Jalan kaki ke …" dan di detail stasiun (*Terhubung ke stasiun lain*).
+- Ruas pindah membawa `link: { access, dedicated?, gates?, source }`. Frontend menampilkannya di langkah "Jalan kaki ke …" dan di detail stasiun (*Terhubung ke stasiun lain*).
 
 Belum dicakup: Rekomendasi Alternatif (`cari_alternatif`) masih hanya memakai anggota hub, bukan tautan.
 
@@ -65,8 +77,10 @@ Admin (`/api/admin`):
 
 ## Admin
 
-Detail stasiun → kartu **Terhubung ke stasiun lain**: daftar tautan stasiun itu (akses, jarak, waktu, arah), tombol *Usulkan dari dataset*, *+ Tambah manual*, *Lengkapi* (untuk tautan bawaan), *Nonaktifkan*. Perubahan masuk ke draf dan terbit lewat halaman Publikasi seperti data lain.
+Detail stasiun → kartu **Terhubung ke stasiun lain**: daftar tautan stasiun itu (akses, gate, jarak, waktu, arah), tombol *Usulkan dari dataset*, *+ Tambah manual*, *Lengkapi* (untuk tautan bawaan), *Nonaktifkan*. Perubahan masuk ke draf dan terbit lewat halaman Publikasi seperti data lain.
 
 ## Tes
+
+`Backend/test/tautan-gate.test.ts` (9 tes): bentuk data gate, pemilihan gate (aksesibel/fasilitas), gate pada ruas pindah, alur admin tautan terbit tanpa gate → tambah gate → draf → terbit (gate tetap ada setelah diubah lagi), validasi, dan hasil rute Bendungan Hilir → Rasuna Said dengan gate.
 
 `Backend/test/tautan-stasiun.test.ts` (21 tes): contoh bawaan, penggantian/penonaktifan oleh admin, satu arah, aturan akses (lift menggantikan eskalator), usulan dari dataset, pencarian rute dan tautan satu arah, total rute, alur admin draf → publikasi (validasi dan konflik), serta rute Bendungan Hilir → Rasuna Said yang melewati tautan Setiabudi Astra ↔ Setiabudi LRT dengan berbagai akses dan kebutuhan.

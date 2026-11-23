@@ -167,6 +167,8 @@ export interface StationLink {
   access: SegmentMeans[];
   /** Jalur khusus pengguna disabilitas. */
   dedicated?: boolean;
+  /** Gate/pintu yang dilewati di kedua ujung (isian admin); `connectsTo` = stasiun di seberangnya. Boleh lebih dari satu per sisi. */
+  gates?: HubGate[];
   note?: string;
   /** "ntd" = bawaan NTD, "admin" = diisi/dikonfirmasi admin. */
   source: "ntd" | "admin";
@@ -176,6 +178,8 @@ export interface StationLink {
 export interface LegLink {
   access: SegmentMeans[];
   dedicated?: boolean;
+  /** Semua gate tautan di kedua ujung; yang dipilih untuk ruas ini ada di `fromGate`/`toGate` pada ruas. */
+  gates?: HubGate[];
   source: "ntd" | "admin";
 }
 

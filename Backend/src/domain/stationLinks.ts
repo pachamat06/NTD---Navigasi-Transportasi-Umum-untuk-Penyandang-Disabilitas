@@ -10,8 +10,8 @@
 
 import type { RequestContext } from "../context";
 import type { StationLinkContent } from "./content";
-import { hubOfStation, straightDistanceM } from "./hubs";
-import type { AmenityDetailStatus, Hub, LegLink, SegmentMeans, Station, StationLink, TransferNeed } from "./models";
+import { bestGate, hubOfStation, straightDistanceM } from "./hubs";
+import type { AmenityDetailStatus, Hub, HubGate, LegLink, SegmentMeans, Station, StationLink, TransferNeed } from "./models";
 
 /** Sumber isian tautan admin (published, atau draft untuk pratinjau admin). */
 export type LinkProvider = (ctx: RequestContext) => Promise<StationLinkContent[]>;
@@ -69,11 +69,27 @@ export function applyLinks(overrides: StationLinkContent[], known?: Set<string>)
       minutes: o.minutes ?? null,
       access: [...o.access],
       ...(o.dedicated ? { dedicated: true } : {}),
+      ...(o.gates?.length ? { gates: linkGates(o) } : {}),
       ...(o.note ? { note: o.note } : {}),
       source: "admin",
     });
   }
   return [...out.values()].filter((l) => !known || (known.has(l.fromId) && known.has(l.toId)));
+}
+
+/** Gate isian admin pada tautan: hanya milik kedua stasiun tautan, `connectsTo` = stasiun di seberangnya. Isian lama tanpa `gates` = kosong. */
+function linkGates(o: Pick<StationLinkContent, "fromId" | "toId" | "gates">): HubGate[] {
+  return (o.gates ?? [])
+    .filter((g) => g.stationId === o.fromId || g.stationId === o.toId)
+    .map((g) => ({ ...g, connectsTo: [g.stationId === o.fromId ? o.toId : o.fromId], facilities: g.facilities ?? [], accessible: !!g.accessible }));
+}
+
+/**
+ * Gate di stasiun `at` yang dilewati saat berjalan lewat tautan `link` ke stasiun di seberangnya. Bila ada beberapa,
+ * diutamakan gate aksesibel, lalu yang punya fasilitas `prefer` (mis. lift untuk pengguna kursi roda), lalu fasilitas terbanyak.
+ */
+export function linkGateAt(link: Pick<StationLink, "gates">, at: string, prefer: readonly string[] = []): HubGate | undefined {
+  return bestGate((link.gates ?? []).filter((g) => g.stationId === at), prefer);
 }
 
 /** Tautan yang bisa dipakai berjalan dari `a` ke `b` (arah mana pun, kecuali tautan satu arah). */
@@ -92,7 +108,7 @@ export function linksOf(links: readonly StationLink[], id: string): { link: Stat
 }
 
 /** Keterangan tautan yang dibawa ruas pindah pada rute. */
-export const legLink = (l: StationLink): LegLink => ({ access: [...l.access], ...(l.dedicated ? { dedicated: true } : {}), source: l.source });
+export const legLink = (l: StationLink): LegLink => ({ access: [...l.access], ...(l.dedicated ? { dedicated: true } : {}), ...(l.gates?.length ? { gates: l.gates } : {}), source: l.source });
 
 /**
  * Apakah kebutuhan pengguna terpenuhi oleh akses tautan:
@@ -169,6 +185,8 @@ export interface StationLinkView {
   minutes: number | null;
   access: SegmentMeans[];
   dedicated?: boolean;
+  /** Gate/pintu yang dilewati: `stationId` = stasiun ini atau stasiun seberang (`otherId`). */
+  gates?: HubGate[];
   note?: string;
   /** true = tautan satu arah dari stasiun ini ke seberang. */
   oneWay?: boolean;
@@ -189,6 +207,7 @@ export function linkViews(links: readonly StationLink[], id: string, byId: Map<s
         minutes: link.minutes,
         access: [...link.access],
         ...(link.dedicated ? { dedicated: true } : {}),
+        ...(link.gates?.length ? { gates: link.gates } : {}),
         ...(link.note ? { note: link.note } : {}),
         ...(link.oneWay ? { oneWay: true } : {}),
         source: link.source,

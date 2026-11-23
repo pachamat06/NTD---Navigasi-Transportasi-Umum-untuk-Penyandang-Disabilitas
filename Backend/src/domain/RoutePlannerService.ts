@@ -9,7 +9,7 @@ import { lineIdOf, lineRefOf, type StationIndex } from "../data/commute/station-
 import type { TjGtfs } from "../data/gtfs/TjGtfs";
 import type { Frequency, Hub, Line, Mode, RideOption, Route, RouteLeg, Station, StationLink, TransferNeed } from "./models";
 import { applyHubs, gateToward, straightDistanceM, walkBetween, type HubProvider } from "./hubs";
-import { applyLinks, legLink, linkBetween, linkFailsNeeds, type LinkProvider } from "./stationLinks";
+import { applyLinks, legLink, linkBetween, linkFailsNeeds, linkGateAt, type LinkProvider } from "./stationLinks";
 import { isLocal } from "./datasetOverlay";
 import { applyPatternsToSequences, patternMinutes, patternStops, type LineSequences, type PatternProvider } from "./routePatterns";
 import { jakartaDayHour } from "../data/commute/HttpCommuteSource";
@@ -523,8 +523,9 @@ export class RoutePlannerService {
           const [a, b] = [leg.stops[0], leg.stops[leg.stops.length - 1]];
           if (a === b) return leg;
           // Gate/pintu yang tersambung di kedua ujung (isian admin pada hub), beserta fasilitas aksesibelnya.
-          const fromGate = gateToward(hubs, a, b, opts.needs);
-          const toGate = gateToward(hubs, b, a, opts.needs);
+          // Tautan di luar hub: gate pada tautan itu, dipilih ulang menurut kebutuhan pengguna (lift/ramp).
+          const fromGate = gateToward(hubs, a, b, opts.needs) ?? (leg.link?.gates ? linkGateAt(leg.link, a, opts.needs) : undefined);
+          const toGate = gateToward(hubs, b, a, opts.needs) ?? (leg.link?.gates ? linkGateAt(leg.link, b, opts.needs) : undefined);
           const gated: RouteLeg = { ...leg, ...(fromGate ? { fromGate } : {}), ...(toGate ? { toGate } : {}) };
           const walk = await this.commute.getWalk(a, b, ctx).catch(() => undefined);
           if (!walk) return gated;
@@ -912,8 +913,13 @@ export function applyLinksToRoute(route: Route, links: readonly StationLink[]): 
     const link = linkBetween(links, a, b);
     if (!link) return leg;
     changed = true;
+    // Gate/pintu yang dilewati di kedua ujung (isian admin pada tautan); annotate memilih ulang menurut kebutuhan.
+    const fromGate = linkGateAt(link, a);
+    const toGate = linkGateAt(link, b);
     return {
       ...leg,
+      ...(fromGate ? { fromGate } : {}),
+      ...(toGate ? { toGate } : {}),
       ...(link.distanceM !== null ? { distanceM: link.distanceM } : {}),
       ...(link.minutes !== null ? { minutes: link.minutes } : {}),
       ...(link.note ? { notes: link.note } : {}),

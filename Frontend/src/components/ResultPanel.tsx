@@ -472,6 +472,7 @@ function TransferBody({ leg, name }: { leg: RouteLeg; name: (id: string) => stri
     leg.fromGate ? `Keluar lewat ${gateText(leg.fromGate)} di ${name(leg.stops[0])}.` : leg.fromExit && `Keluar lewat ${exitText(leg.fromExit)}.`,
     leg.notes && !leg.turnaround ? leg.notes : undefined,
     leg.toGate ? `Masuk lewat ${gateText(leg.toGate)} di ${name(leg.stops[leg.stops.length - 1])}.` : leg.toExit && `Masuk lewat ${exitText(leg.toExit)}.`,
+    ...otherLinkGates(leg, name),
   ].filter((x): x is string => !!x);
   const access = leg.access ?? [];
   const mins =
@@ -570,7 +571,15 @@ const GATE_FACILITY_LABEL: Record<HubGate["facilities"][number], string> = {
 };
 
 /** Gate hub dari admin, mis. "Gate Utara (bisa dilalui kursi roda; lift, ramp; buka 05.00–22.00)". */
-const gateText = (g: HubGate) => {
+/** Gate lain pada tautan transfer (selain yang dipilih untuk ruas ini), mis. "Gate lain di Setiabudi Astra: Gate Utara." */
+const otherLinkGates = (leg: RouteLeg, name: (id: string) => string): string[] => {
+  const chosen = new Set([leg.fromGate?.id, leg.toGate?.id]);
+  const byStation = new Map<string, string[]>();
+  for (const g of leg.link?.gates ?? []) if (!chosen.has(g.id)) byStation.set(g.stationId, [...(byStation.get(g.stationId) ?? []), g.name]);
+  return [...byStation].map(([id, names]) => `Gate lain di ${name(id)}: ${names.join(", ")}.`);
+};
+
+export const gateText = (g: HubGate) => {
   const parts = [
     g.accessible ? "bisa dilalui kursi roda" : "ada anak tangga",
     g.facilities.length ? g.facilities.map((f) => GATE_FACILITY_LABEL[f] ?? f).join(", ") : "",

@@ -6,7 +6,7 @@ import { AMENITY_LABEL, useNetwork } from "@/lib/network";
 import type { AmenityType, StationDetailData } from "@/lib/types";
 import { AccessBadge } from "./AccessBadge";
 import { PlatformList, segmentText, VIA_TEXT, verticalText } from "./PlatformInfo";
-import { NoticeBanner } from "./ResultPanel";
+import { gateText, NoticeBanner } from "./ResultPanel";
 
 /** Dialog modal berbasis <dialog> bawaan peramban (fokus terkunci, Esc menutup). */
 export function Modal({ open, title, onClose, children }: { open: boolean; title: string; onClose: () => void; children: ReactNode }) {
@@ -204,6 +204,11 @@ export function StationDetail({
                       {l.dedicated ? " (jalur khusus disabilitas)" : ""}
                       {l.oneWay ? " · satu arah" : ""}
                     </p>
+                    {l.gates?.map((g) => (
+                      <p key={g.id}>
+                        Gate di {g.stationId === stationId ? st?.name : l.otherName}: {gateText(g)}
+                      </p>
+                    ))}
                     {l.note && <p className="text-[var(--muted)]">{l.note}</p>}
                   </li>
                 ))}

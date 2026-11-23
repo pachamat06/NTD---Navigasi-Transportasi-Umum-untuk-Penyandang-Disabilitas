@@ -79,10 +79,15 @@ export function gateToward(hubs: Hub[], at: string, toward: string, prefer: read
     const named = mine.filter((g) => g.connectsTo.includes(toward));
     const cands = named.length ? named : mine.filter((g) => !g.connectsTo.length);
     if (!cands.length) continue;
-    const score = (g: HubGate) => (g.accessible ? 100 : 0) + prefer.filter((p) => g.facilities.includes(p as HubGate["facilities"][number])).length * 10 + g.facilities.length;
-    return [...cands].sort((a, b) => score(b) - score(a))[0];
+    return bestGate(cands, prefer);
   }
   return undefined;
+}
+
+/** Gate terbaik di antara beberapa calon: aksesibel dulu, lalu yang punya fasilitas `prefer`, lalu fasilitas terbanyak. */
+export function bestGate(cands: readonly HubGate[], prefer: readonly string[] = []): HubGate | undefined {
+  const score = (g: HubGate) => (g.accessible ? 100 : 0) + prefer.filter((p) => g.facilities.includes(p as HubGate["facilities"][number])).length * 10 + g.facilities.length;
+  return [...cands].sort((a, b) => score(b) - score(a))[0];
 }
 
 /** Hub tiap stasiun menurut daftar hub yang berlaku (stasiun pertama kali muncul menang). */

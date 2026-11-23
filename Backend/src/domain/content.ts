@@ -310,6 +310,11 @@ export const stationLinkSchema = z
     access: z.array(z.enum(SEGMENT_MEANS)).max(SEGMENT_MEANS.length).default([]),
     /** Jalur khusus pengguna disabilitas. */
     dedicated: z.boolean().optional(),
+    /**
+     * Gate/pintu yang dilewati saat berpindah: milik stasiun asal (`fromId`) atau tujuan (`toId`), bentuknya sama dengan
+     * gate hub (`hubGateSchema`; `connectsTo` kosong atau stasiun di seberangnya). Opsional, boleh lebih dari satu per sisi.
+     */
+    gates: z.array(hubGateSchema).max(20).default([]),
     /** Asal data: diisi sendiri, atau usulan otomatis dari dataset (kedekatan/Commute) yang dikonfirmasi admin. */
     source: z.enum(["manual", "dataset"]).default("manual"),
     syncedAt: isoDate.optional(),
@@ -317,7 +322,12 @@ export const stationLinkSchema = z
     note: z.string().max(300).optional(),
   })
   .refine((l) => l.fromId !== l.toId, { message: "kedua stasiun harus berbeda", path: ["toId"] })
-  .refine((l) => new Set(l.access).size === l.access.length, { message: "akses tidak boleh ganda", path: ["access"] });
+  .refine((l) => new Set(l.access).size === l.access.length, { message: "akses tidak boleh ganda", path: ["access"] })
+  .refine((l) => l.gates.every((g) => (g.stationId === l.fromId || g.stationId === l.toId) && g.connectsTo.every((t) => t !== g.stationId && (t === l.fromId || t === l.toId))), {
+    message: "gate harus milik salah satu dari kedua stasiun tautan",
+    path: ["gates"],
+  })
+  .refine((l) => new Set(l.gates.map((g) => g.id)).size === l.gates.length, { message: "id gate tidak boleh sama", path: ["gates"] });
 
 export type StationLinkContent = z.infer<typeof stationLinkSchema> & { id: string };
 

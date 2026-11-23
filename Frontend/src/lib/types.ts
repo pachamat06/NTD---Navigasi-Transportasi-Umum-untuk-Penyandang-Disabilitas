@@ -333,6 +333,8 @@ export interface StationLinkView {
   /** Akses di jalan itu (boleh lebih dari satu); kosong = belum diketahui. */
   access: SegmentMeans[];
   dedicated?: boolean;
+  /** Gate/pintu yang dilewati: milik stasiun ini atau stasiun seberang (`stationId`). */
+  gates?: HubGate[];
   note?: string;
   oneWay?: boolean;
   source: "ntd" | "admin";
@@ -400,7 +402,7 @@ export interface RouteLeg {
   /** Status fasilitas yang dibutuhkan pengguna di kedua ujung perpindahan. */
   access?: TransferAccess[];
   /** Ruas pindah antarstasiun lewat tautan transfer di luar hub: akses yang tersedia di jalan itu. */
-  link?: { access: SegmentMeans[]; dedicated?: boolean; source: "ntd" | "admin" };
+  link?: { access: SegmentMeans[]; dedicated?: boolean; gates?: HubGate[]; source: "ntd" | "admin" };
 }
 
 export type TransferNeed = "lift" | "eskalator" | "ramp";
